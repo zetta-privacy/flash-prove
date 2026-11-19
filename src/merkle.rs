@@ -9,8 +9,9 @@
 
 use p3_field::PrimeField64;
 use p3_goldilocks::Goldilocks as Fp;
+use rayon::prelude::*;
 use rs_merkle::{algorithms::Sha256 as MerkleSha, MerkleProof, MerkleTree};
-use sha2::{Digest as D, Sha256};
+use sha2::{Digest as _, Sha256};
 
 /// A 32-byte SHA-256 digest.
 pub type Digest = [u8; 32];
@@ -40,9 +41,11 @@ pub fn derive_salt(seed: &Salt, index: usize) -> Salt {
 /// Rows are the `2^v` table rows (Definition 4.2); columns are the `|D|`
 /// evaluation positions. A "column" `T[ϕ]` is one evaluation position `ϕ`
 /// across all rows.
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct Table {
     pub rows: usize,
     pub cols: usize,
+    #[serde(with = "crate::field::fp_vec")]
     pub data: Vec<Fp>,
 }
 
@@ -59,7 +62,7 @@ impl Table {
 pub fn commit(table: &Table, salt_seed: &Salt) -> (Digest, MerkleTree<MerkleSha>) {
     let leaves: Vec<Digest> = table
         .data
-        .iter()
+        .par_iter()
         .enumerate()
         .map(|(i, &e)| leaf_salted(e, &derive_salt(salt_seed, i)))
         .collect();

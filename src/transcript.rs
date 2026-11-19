@@ -6,19 +6,6 @@ use sha2::{Digest, Sha256};
 /// The underlying Fiat–Shamir transcript (merlin).
 pub use merlin::Transcript;
 
-/// Derive an OOD seed from a Merkle root by two queries (Construction D.11):
-/// the first query holds (rt, dg_Z, table sizes), the second the first answer's
-/// chaining value. `dg_Z` is the digest of the configuration.
-pub fn seed_from_root(rt: &[u8; 32], dg_z: &[u8; 32], sizes: &[u8]) -> [u8; 32] {
-    let mut t = Transcript::new(b"FlashProve-ood");
-    t.append_message(b"root", rt);
-    t.append_message(b"dg", dg_z);
-    t.append_message(b"sizes", sizes);
-    let mut seed = [0u8; 32];
-    t.challenge_bytes(b"ood-seed", &mut seed);
-    seed
-}
-
 /// Hash `a || b` with SHA-256.
 fn sha256_pair(a: &[u8], b: &[u8]) -> [u8; 32] {
     let mut h = Sha256::new();

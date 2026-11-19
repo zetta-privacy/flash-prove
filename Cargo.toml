@@ -4,9 +4,25 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-p3-goldilocks = "0.8"
-p3-dft = "0.8"
-p3-field = "0.8"
+# All Plonky3 crates pinned to the same 0.8.0 workspace rev (the published crates.io
+# 0.8 release lacks TranscriptField for Goldilocks and the succinct-verifier
+# crates gkr/sumcheck/multilinear-util/stir/whir, which live only in git).
+p3-goldilocks = { git = "https://github.com/Plonky3/Plonky3", rev = "0d80373" }
+p3-dft = { git = "https://github.com/Plonky3/Plonky3", rev = "0d80373" }
+p3-field = { git = "https://github.com/Plonky3/Plonky3", rev = "0d80373" }
+p3-commit = { git = "https://github.com/Plonky3/Plonky3", rev = "0d80373" }
+p3-fri = { git = "https://github.com/Plonky3/Plonky3", rev = "0d80373" }
+p3-keccak = { git = "https://github.com/Plonky3/Plonky3", rev = "0d80373" }
+p3-challenger = { git = "https://github.com/Plonky3/Plonky3", rev = "0d80373" }
+p3-gkr = { git = "https://github.com/Plonky3/Plonky3", rev = "0d80373" }
+p3-sumcheck = { git = "https://github.com/Plonky3/Plonky3", rev = "0d80373" }
+p3-multilinear-util = { git = "https://github.com/Plonky3/Plonky3", rev = "0d80373" }
+p3-merkle-tree = { git = "https://github.com/Plonky3/Plonky3", rev = "0d80373" }
+p3-poseidon2 = { git = "https://github.com/Plonky3/Plonky3", rev = "0d80373" }
+p3-symmetric = { git = "https://github.com/Plonky3/Plonky3", rev = "0d80373" }
+p3-mds = { git = "https://github.com/Plonky3/Plonky3", rev = "0d80373" }
+p3-matrix = { git = "https://github.com/Plonky3/Plonky3", rev = "0d80373" }
+p3-maybe-rayon = { git = "https://github.com/Plonky3/Plonky3", rev = "0d80373" }
 
 # hashing
 sha2 = "0.10"
@@ -23,9 +39,7 @@ candle-core = "0.8"
 candle-nn = "0.8"
 
 # randomness
-rand = "0.8"
-rand_core = "0.6"
-rand_chacha = "0.3"
+rand = { version = "0.10", features = ["std_rng"] }
 
 # serialization
 serde = { version = "1", features = ["derive"] }

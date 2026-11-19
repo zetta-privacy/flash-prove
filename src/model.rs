@@ -215,7 +215,7 @@ impl ModelParams {
 
 // --- Acceptance policies (Definition 3.4) -----------------------------------
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Policy {
     /// clip C (sum bound)
     pub clip: u64,
@@ -304,7 +304,7 @@ pub fn admissible(pol: &Policy) -> bool {
 
 // --- Encoded request (Definition 4.7) ---------------------------------------
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct EncodedRequest {
     /// window of exactly `WINDOW_LEN` tokens
     pub window: Vec<usize>,
@@ -317,8 +317,8 @@ pub struct EncodedRequest {
 }
 
 /// Number of counted tokens: min(|y|, L − |x|) (Definition 3.4).
-pub fn counted(x_len: usize, y_len: usize) -> usize {
-    y_len.min(WINDOW_LEN - x_len)
+pub fn counted(x_len: usize, y_len: usize, window_len: usize) -> usize {
+    y_len.min(window_len - x_len)
 }
 
 /// Build an encoded request (Definition 4.7).
@@ -329,8 +329,13 @@ pub fn counted(x_len: usize, y_len: usize) -> usize {
 /// The exact `i₀`/`i₁` numeric convention was an image; the fields below encode
 /// the *semantics* (which output tokens are gap-checked, and the full-window
 /// `y⁺` condition). Verify the byte serialization against the release spec.
-pub fn build(x: &[usize], y: &[usize], fill: &[usize]) -> Option<EncodedRequest> {
-    if x.is_empty() || y.is_empty() || x.len() + y.len() > WINDOW_LEN + 1 {
+pub fn build(
+    x: &[usize],
+    y: &[usize],
+    fill: &[usize],
+    window_len: usize,
+) -> Option<EncodedRequest> {
+    if x.is_empty() || y.is_empty() || x.len() + y.len() > window_len + 1 {
         return None;
     }
     let all_tokens = || x.iter().chain(y).chain(fill).all(|&t| in_vocab(t));
@@ -338,18 +343,18 @@ pub fn build(x: &[usize], y: &[usize], fill: &[usize]) -> Option<EncodedRequest>
         return None;
     }
 
-    let mut window = Vec::with_capacity(WINDOW_LEN);
+    let mut window = Vec::with_capacity(window_len);
     window.extend_from_slice(x);
     window.extend_from_slice(y);
     window.extend_from_slice(fill);
-    window.resize(WINDOW_LEN, 0); // 0-pad to length L
+    window.resize(window_len, 0); // 0-pad to length L
 
-    let n_ct = counted(x.len(), y.len());
-    let full = x.len() + y.len() == WINDOW_LEN + 1;
+    let n_ct = counted(x.len(), y.len(), window_len);
+    let full = x.len() + y.len() == window_len + 1;
     Some(EncodedRequest {
         window,
         i0: x.len() - 1,
-        i1: if full { WINDOW_LEN } else { x.len() + n_ct - 1 },
+        i1: if full { window_len } else { x.len() + n_ct - 1 },
         y_plus: if full { *y.last().unwrap() } else { 0 },
     })
 }
@@ -359,26 +364,26 @@ pub fn build(x: &[usize], y: &[usize], fill: &[usize]) -> Option<EncodedRequest>
 /// The digit matrix `A`: `d` rows × `2^n` columns of signed digits, laid out
 /// row-major. This is the matrix the protocol commits to; the decoder
 /// (`protocol::decode_exact`) recovers it, and the key IOP checks it is in range.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DigitMatrix {
     pub d: usize,
     pub n: usize,
-    /// `d * 2^n` entries, each in `[-2^7, 2^7)`.
-    pub entries: Vec<i64>,
+    /// `d * 2^n` entries, each a signed 8-bit digit in `[-2^7, 2^7)`.
+    pub entries: Vec<i8>,
 }
 
 impl DigitMatrix {
-    pub fn new(d: usize, n: usize, entries: Vec<i64>) -> Self {
+    pub fn new(d: usize, n: usize, entries: Vec<i8>) -> Self {
         assert_eq!(entries.len(), d * (1 << n), "digit matrix length");
         Self { d, n, entries }
     }
 
-    pub fn entry(&self, i: usize, j: usize) -> i64 {
+    pub fn entry(&self, i: usize, j: usize) -> i8 {
         self.entries[i * (1 << self.n) + j]
     }
 
     pub fn in_range(&self) -> bool {
-        self.entries.iter().all(|&x| digit_in_range(x))
+        self.entries.iter().all(|&x| digit_in_range(x as i64))
     }
 }
 
@@ -436,15 +441,88 @@ pub fn save_trace(trace: &Trace) -> anyhow::Result<Vec<u8>> {
     Ok(bincode::serialize(trace)?)
 }
 
-// --- Arithmetization (Definition 4.8) ----------------------------------------
+/// Ingest a trace emitted as JSON by the Python extractor.
+pub fn load_trace_json(bytes: &[u8]) -> anyhow::Result<Trace> {
+    Ok(serde_json::from_slice(bytes)?)
+}
 
-/// The arithmetization: the identities and lookups that constrain the trace
-/// against the committed weights, together with the placement rule `wt`
-/// (Definition 4.1). Deferred by the paper (Remark D.10) to the release's
-/// `docs/model.md`; an integrator supplies a concrete implementation (or a
-/// reduced reference).
-pub trait Arithmetization {
-    /// Check that every identity is 0 and every lookup key is in its table, for
-    /// the digit matrix `a`, the encoded request `ξ`, and the trace.
-    fn check(&self, a: &DigitMatrix, xi: &EncodedRequest, trace: &Trace) -> bool;
+/// Serialize a trace as JSON (readable by the Python extractor).
+pub fn save_trace_json(trace: &Trace) -> anyhow::Result<Vec<u8>> {
+    Ok(serde_json::to_vec(trace)?)
+}
+
+// --- Weights (the model's integer tensors) ----------------------------------
+
+/// One named integer weight tensor.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WeightMatrix {
+    pub name: String,
+    pub rows: usize,
+    pub cols: usize,
+    /// Row-major values, len = `rows * cols`. Each entry is an 8-bit weight.
+    pub values: Vec<i8>,
+}
+
+impl WeightMatrix {
+    pub fn new(name: &str, rows: usize, cols: usize, values: Vec<i8>) -> Self {
+        assert_eq!(values.len(), rows * cols, "weight matrix length");
+        Self {
+            name: name.to_string(),
+            rows,
+            cols,
+            values,
+        }
+    }
+}
+
+/// The model's weights as a flat set of named tensors. A Mixture-of-Experts
+/// model has an embedding, per-layer attention (Q/K/V/O) and FFN (gate/up/down),
+/// and in MoE layers a router plus expert tensors, and an output matrix.
+pub type Weights = Vec<WeightMatrix>;
+
+/// Split an integer into `n` signed base-2^8 digits (least significant first),
+/// each in `[-2^7, 2^7)`, with `value = Σ digit_i · 256^i` (Definition 4.1).
+pub fn to_digits(mut value: i64, n: usize) -> Vec<i8> {
+    let mut digits = Vec::with_capacity(n);
+    for _ in 0..n {
+        let mut d = value & 0xff;
+        value >>= 8; // arithmetic shift carries the sign
+        if d >= 128 {
+            d -= 256; // reinterpret as signed
+            value += 1; // carry
+        }
+        digits.push(d as i8);
+    }
+    digits
+}
+
+/// Reconstruct an integer from signed base-2^8 digits (inverse of `to_digits`).
+pub fn from_digits(digits: &[i8]) -> i64 {
+    digits
+        .iter()
+        .rev()
+        .fold(0i64, |acc, &d| acc * 256 + d as i64)
+}
+
+// --- Model spec (Definition 4.1 + 4.8) --------------------------------------
+
+/// A model's spec: the two model-specific pieces the protocol needs. Any MoE
+/// model implements this; the rest of the protocol is model-agnostic.
+pub trait Model {
+    /// Number of weight segments the commit splits the model into (each committed
+    /// separately, so peak memory is bounded by the largest segment).
+    fn num_segments(&self) -> usize;
+
+    /// Placement rule (Definition 4.1): the weights of one segment → digit matrix,
+    /// with every entry in `[-2^7, 2^7)` (use [`to_digits`] for wider weights).
+    ///
+    /// The returned `DigitMatrix { d, n, .. }` must be consistent with the
+    /// `TableParams` the protocol uses for that segment (`TableParams.d == d`,
+    /// `n0 + v == n`).
+    fn to_digit_matrix(&self, weights: &Weights, segment: usize) -> DigitMatrix;
+
+    /// Arithmetization (Definition 4.8): check the trace against the committed
+    /// weights `a` (one digit matrix per segment, in segment order) and the
+    /// request `ξ`.
+    fn check(&self, a: &[DigitMatrix], xi: &EncodedRequest, trace: &Trace) -> bool;
 }

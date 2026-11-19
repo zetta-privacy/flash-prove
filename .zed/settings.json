@@ -1,0 +1,13 @@
+{
+  "lsp": {
+    "pyright": {
+      "settings": {
+        "python": {
+          "pythonPath": "/Users/lazovicff/Projects/flash-prove/.venv/bin/python",
+          "venvPath": ".",
+          "venv": ".venv"
+        }
+      }
+    }
+  }
+}

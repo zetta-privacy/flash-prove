@@ -1,0 +1,27 @@
+{
+  "dims": {
+    "hidden": 8,
+    "vocab": 64,
+    "layers": 1,
+    "heads": 1,
+    "head_dim": 8,
+    "experts": 1,
+    "active": 1,
+    "intermediate": 16
+  },
+  "weights": [
+    { "name": "embed_tokens", "rows": 64, "cols": 8 },
+    { "name": "w1", "rows": 16, "cols": 8 },
+    { "name": "w2", "rows": 8, "cols": 16 },
+    { "name": "lm_head", "rows": 64, "cols": 8 }
+  ],
+  "ops": [
+    { "op": "embed", "weight": "embed_tokens", "output": "embedding" },
+    { "op": "matmul", "input": "embedding", "weight": "w1", "output": "h1", "shift": 4 },
+    { "op": "silu", "input": "h1", "output": "act" },
+    { "op": "matmul", "input": "act", "weight": "w2", "output": "h2", "shift": 4 },
+    { "op": "add", "inputs": ["h2", "embedding"], "output": "residual" },
+    { "op": "matmul", "input": "residual", "weight": "lm_head", "output": "logits", "shift": 4 }
+  ],
+  "cells": ["embedding", "h1", "act", "h2", "residual", "logits"]
+}

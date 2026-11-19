@@ -4,7 +4,7 @@ use p3_dft::{Radix2Dit, TwoAdicSubgroupDft};
 use p3_goldilocks::Goldilocks as Fp;
 
 /// Parameters of a single encoded row.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
 pub struct RowParams {
     /// Number of message entries (ℓ).
     pub message_len: usize,
