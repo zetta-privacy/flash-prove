@@ -8,9 +8,10 @@
 //! committed linear claim at a shared random `r`.
 
 use crate::field::{Ext, Fp};
-use crate::fri::{self, Challenger, Pcs};
+use crate::fri::{self, Challenger, Prover};
 use crate::zk::{
     prove_inner_product_committed_given, verify_inner_product_committed, InnerProductProof,
+    Openings,
 };
 use p3_field::{BasedVectorSpace, PrimeCharacteristicRing};
 
@@ -51,8 +52,7 @@ fn beta_coeff(beta: Ext, k: usize, c: usize) -> Fp {
 
 /// Prove `fp[i] = α + Σ_k β^{k+1}·q_k[i]` for the committed columns `q_k`.
 pub fn prove_fingerprint(
-    pcs: &Pcs,
-    challenger: &Challenger,
+    ctx: &mut Prover,
     cols: &[&[Fp]],
     alpha: Ext,
     beta: Ext,
@@ -86,16 +86,16 @@ pub fn prove_fingerprint(
     let mut pd_cols = Vec::with_capacity(w);
     for k in 0..w {
         let padded = pad(cols[k].to_vec(), n);
-        let (c, pd, d) = fri::commit_vec(pcs, &padded);
+        let (c, pd, d) = fri::commit_vec(&ctx.pcs, &padded);
         com_cols.push(c);
         pd_cols.push(pd);
         dom_cols.push(d);
     }
-    let (com_fp0, pd_fp0, dom_fp0) = fri::commit_vec(pcs, &fp0);
-    let (com_fp1, pd_fp1, dom_fp1) = fri::commit_vec(pcs, &fp1);
-    let (com_fp2, pd_fp2, dom_fp2) = fri::commit_vec(pcs, &fp2);
+    let (com_fp0, pd_fp0, dom_fp0) = fri::commit_vec(&ctx.pcs, &fp0);
+    let (com_fp1, pd_fp1, dom_fp1) = fri::commit_vec(&ctx.pcs, &fp1);
+    let (com_fp2, pd_fp2, dom_fp2) = fri::commit_vec(&ctx.pcs, &fp2);
 
-    let mut tr = fri::Transcript::new(challenger);
+    let mut tr = fri::Transcript::new(&ctx.challenger);
     for k in 0..w {
         tr.observe(&com_cols[k]);
     }
@@ -119,8 +119,7 @@ pub fn prove_fingerprint(
     for k in 0..w {
         let padded = pad(cols[k].to_vec(), n);
         claim_cols.push(prove_inner_product_committed_given(
-            pcs,
-            challenger,
+            ctx,
             &com_cols[k],
             &pd_cols[k],
             dom_cols[k],
@@ -129,9 +128,9 @@ pub fn prove_fingerprint(
         ));
     }
     let claim_fp = [
-        prove_inner_product_committed_given(pcs, challenger, &com_fp0, &pd_fp0, dom_fp0, &fp0, &r),
-        prove_inner_product_committed_given(pcs, challenger, &com_fp1, &pd_fp1, dom_fp1, &fp1, &r),
-        prove_inner_product_committed_given(pcs, challenger, &com_fp2, &pd_fp2, dom_fp2, &fp2, &r),
+        prove_inner_product_committed_given(ctx, &com_fp0, &pd_fp0, dom_fp0, &fp0, &r),
+        prove_inner_product_committed_given(ctx, &com_fp1, &pd_fp1, dom_fp1, &fp1, &r),
+        prove_inner_product_committed_given(ctx, &com_fp2, &pd_fp2, dom_fp2, &fp2, &r),
     ];
 
     FingerprintProof {
@@ -152,7 +151,12 @@ pub fn prove_fingerprint(
 }
 
 /// Verify `fp[i] = α + Σ_k β^{k+1}·q_k[i]` from commitments alone.
-pub fn verify_fingerprint(pcs: &Pcs, challenger: &Challenger, proof: &FingerprintProof) -> bool {
+pub fn verify_fingerprint(
+    challenger: &Challenger,
+    proof: &FingerprintProof,
+    values: &[Ext],
+    acc: &mut Openings,
+) -> bool {
     let w = proof.w;
     let n = proof.n;
 
@@ -168,26 +172,28 @@ pub fn verify_fingerprint(pcs: &Pcs, challenger: &Challenger, proof: &Fingerprin
 
     for k in 0..w {
         if !verify_inner_product_committed(
-            pcs,
             challenger,
             &proof.com_cols[k],
             proof.dom_cols[k],
             &r,
             proof.b_cols[k],
             &proof.claim_cols[k],
+            values,
+            acc,
         ) {
             return false;
         }
     }
     for c in 0..3 {
         if !verify_inner_product_committed(
-            pcs,
             challenger,
             &proof.com_fp[c],
             proof.dom_fp[c],
             &r,
             proof.b_fp[c],
             &proof.claim_fp[c],
+            values,
+            acc,
         ) {
             return false;
         }
@@ -217,26 +223,48 @@ mod tests {
 
     #[test]
     fn fingerprint_honest() {
-        let (pcs, challenger) = fri::new_pcs(1, 10);
+        let mut ctx = fri::Prover::new(1, 10);
         // 2 columns: in = [1,2,3,4], out = [5,6,7,8]. α = 7, β = 3.
         let col0 = [f(1), f(2), f(3), f(4)];
         let col1 = [f(5), f(6), f(7), f(8)];
         let alpha = Ext::from(f(7));
         let beta = Ext::from(f(3));
-        let proof = prove_fingerprint(&pcs, &challenger, &[&col0, &col1], alpha, beta);
-        assert!(verify_fingerprint(&pcs, &challenger, &proof));
+        let proof = prove_fingerprint(&mut ctx, &[&col0, &col1], alpha, beta);
+        let fri_proof = ctx.open_all();
+        let values = ctx.values.clone();
+        let mut acc = crate::zk::Openings::new();
+        assert!(verify_fingerprint(
+            &ctx.challenger,
+            &proof,
+            &values,
+            &mut acc,
+        ));
+        assert!(fri::open_many_verify(
+            &ctx.pcs,
+            &ctx.challenger,
+            &acc,
+            &fri_proof
+        ));
     }
 
     #[test]
     fn fingerprint_rejects_wrong() {
-        let (pcs, challenger) = fri::new_pcs(1, 10);
+        let mut ctx = fri::Prover::new(1, 10);
         let col0 = [f(1), f(2), f(3), f(4)];
         let col1 = [f(5), f(6), f(7), f(8)];
         let alpha = Ext::from(f(7));
         let beta = Ext::from(f(3));
-        let mut proof = prove_fingerprint(&pcs, &challenger, &[&col0, &col1], alpha, beta);
+        let mut proof = prove_fingerprint(&mut ctx, &[&col0, &col1], alpha, beta);
         // Tamper the claimed ⟨r, fp_0⟩: the scalar relation must reject.
         proof.b_fp[0] += f(1);
-        assert!(!verify_fingerprint(&pcs, &challenger, &proof));
+        ctx.open_all();
+        let values = ctx.values.clone();
+        let mut acc = crate::zk::Openings::new();
+        assert!(!verify_fingerprint(
+            &ctx.challenger,
+            &proof,
+            &values,
+            &mut acc,
+        ));
     }
 }

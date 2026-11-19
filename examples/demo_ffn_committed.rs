@@ -5,14 +5,14 @@
 
 use flashprove::committed::{prove_matmul_committed, verify_matmul_committed, MatmulProof};
 use flashprove::field::Fp;
-use flashprove::fri::{self, Challenger, Pcs};
+use flashprove::fri::{self, Challenger, Prover};
 use flashprove::lookup_committed::{
     prove_lookup2_committed, verify_lookup2_committed, Lookup2Proof,
 };
 use flashprove::zk::{
     prove_inner_product_committed_given, verify_inner_product_committed, InnerProductProof,
+    Openings,
 };
-use p3_field::PrimeCharacteristicRing;
 
 fn f(x: i64) -> Fp {
     if x < 0 {
@@ -20,19 +20,6 @@ fn f(x: i64) -> Fp {
     } else {
         Fp::new(x as u64)
     }
-}
-
-fn multiplicities(inp: &[i64], out: &[i64], ft: impl Fn(i64) -> i64, lo: i64, hi: i64) -> Vec<Fp> {
-    let mut m = vec![Fp::ZERO; (hi - lo + 1) as usize];
-    for i in 0..inp.len() {
-        for (j, x) in (lo..=hi).enumerate() {
-            if inp[i] == x && out[i] == ft(x) {
-                m[j] += Fp::ONE;
-                break;
-            }
-        }
-    }
-    m
 }
 
 struct DemoFfnProof {
@@ -58,12 +45,14 @@ struct DemoFfnProof {
     claim_res: InnerProductProof,
     mm3: MatmulProof,   // acc3 = lm_head·residual
     req3: Lookup2Proof, // logits = requant(acc3)
+    // public table parameters (shared requant/silu lookups are evaluated directly).
+    req_lo: i64,
+    silu_lo: i64,
 }
 
 #[allow(clippy::too_many_arguments)]
 fn prove_demo_ffn_committed(
-    pcs: &Pcs,
-    challenger: &Challenger,
+    ctx: &mut Prover,
     embedding: &[i64],
     acc1: &[i64],
     h1: &[i64],
@@ -81,80 +70,31 @@ fn prove_demo_ffn_committed(
     out2: usize,
     vocab: usize,
     req_lo: i64,
-    req_hi: i64,
     silu_lo: i64,
-    silu_hi: i64,
     alpha: Fp,
     beta: Fp,
 ) -> DemoFfnProof {
     let emb_fp: Vec<Fp> = embedding.iter().map(|&x| f(x)).collect();
     let acc1_fp: Vec<Fp> = acc1.iter().map(|&x| f(x)).collect();
-    let h1_fp: Vec<Fp> = h1.iter().map(|&x| f(x)).collect();
     let act_fp: Vec<Fp> = act.iter().map(|&x| f(x)).collect();
     let acc2_fp: Vec<Fp> = acc2.iter().map(|&x| f(x)).collect();
     let h2_fp: Vec<Fp> = h2.iter().map(|&x| f(x)).collect();
     let res_fp: Vec<Fp> = residual.iter().map(|&x| f(x)).collect();
     let acc3_fp: Vec<Fp> = acc3.iter().map(|&x| f(x)).collect();
-    let logits_fp: Vec<Fp> = logits.iter().map(|&x| f(x)).collect();
     let w1_fp: Vec<Fp> = w1.iter().map(|&x| f(x as i64)).collect();
     let w2_fp: Vec<Fp> = w2.iter().map(|&x| f(x as i64)).collect();
     let lm_fp: Vec<Fp> = lm_head.iter().map(|&x| f(x as i64)).collect();
 
-    let mm1 = prove_matmul_committed(pcs, challenger, &w1_fp, &emb_fp, &acc1_fp, out1, in_);
-    let req1 = prove_lookup2_committed(
-        pcs,
-        challenger,
-        &acc1_fp,
-        &h1_fp,
-        |x| flashprove::spec::requant(x, 4),
-        req_lo,
-        req_hi,
-        &multiplicities(
-            acc1,
-            h1,
-            |x| flashprove::spec::requant(x, 4),
-            req_lo,
-            req_hi,
-        ),
-        alpha,
-        beta,
-    );
-    let silu = prove_lookup2_committed(
-        pcs,
-        challenger,
-        &h1_fp,
-        &act_fp,
-        flashprove::spec::silu,
-        silu_lo,
-        silu_hi,
-        &multiplicities(h1, act, flashprove::spec::silu, silu_lo, silu_hi),
-        alpha,
-        beta,
-    );
-    let mm2 = prove_matmul_committed(pcs, challenger, &w2_fp, &act_fp, &acc2_fp, out2, out1);
-    let req2 = prove_lookup2_committed(
-        pcs,
-        challenger,
-        &acc2_fp,
-        &h2_fp,
-        |x| flashprove::spec::requant(x, 4),
-        req_lo,
-        req_hi,
-        &multiplicities(
-            acc2,
-            h2,
-            |x| flashprove::spec::requant(x, 4),
-            req_lo,
-            req_hi,
-        ),
-        alpha,
-        beta,
-    );
+    let mm1 = prove_matmul_committed(ctx, &w1_fp, &emb_fp, &acc1_fp, out1, in_);
+    let req1 = prove_lookup2_committed(ctx, acc1, h1, req_lo, alpha, beta);
+    let silu = prove_lookup2_committed(ctx, h1, act, silu_lo, alpha, beta);
+    let mm2 = prove_matmul_committed(ctx, &w2_fp, &act_fp, &acc2_fp, out2, out1);
+    let req2 = prove_lookup2_committed(ctx, acc2, h2, req_lo, alpha, beta);
 
-    let (com_h2, pd_h2, dom_h2) = fri::commit_vec(pcs, &h2_fp);
-    let (com_emb, pd_emb, dom_emb) = fri::commit_vec(pcs, &emb_fp);
-    let (com_res, pd_res, dom_res) = fri::commit_vec(pcs, &res_fp);
-    let mut tr = fri::Transcript::new(challenger);
+    let (com_h2, pd_h2, dom_h2) = fri::commit_vec(&ctx.pcs, &h2_fp);
+    let (com_emb, pd_emb, dom_emb) = fri::commit_vec(&ctx.pcs, &emb_fp);
+    let (com_res, pd_res, dom_res) = fri::commit_vec(&ctx.pcs, &res_fp);
+    let mut tr = fri::Transcript::new(&ctx.challenger);
     tr.observe(&com_h2);
     tr.observe(&com_emb);
     tr.observe(&com_res);
@@ -162,34 +102,14 @@ fn prove_demo_ffn_committed(
     let b_h2: Fp = r.iter().zip(&h2_fp).map(|(&ri, &vi)| ri * vi).sum();
     let b_emb: Fp = r.iter().zip(&emb_fp).map(|(&ri, &vi)| ri * vi).sum();
     let b_res: Fp = r.iter().zip(&res_fp).map(|(&ri, &vi)| ri * vi).sum();
-    let claim_h2 =
-        prove_inner_product_committed_given(pcs, challenger, &com_h2, &pd_h2, dom_h2, &h2_fp, &r);
-    let claim_emb = prove_inner_product_committed_given(
-        pcs, challenger, &com_emb, &pd_emb, dom_emb, &emb_fp, &r,
-    );
-    let claim_res = prove_inner_product_committed_given(
-        pcs, challenger, &com_res, &pd_res, dom_res, &res_fp, &r,
-    );
+    let claim_h2 = prove_inner_product_committed_given(ctx, &com_h2, &pd_h2, dom_h2, &h2_fp, &r);
+    let claim_emb =
+        prove_inner_product_committed_given(ctx, &com_emb, &pd_emb, dom_emb, &emb_fp, &r);
+    let claim_res =
+        prove_inner_product_committed_given(ctx, &com_res, &pd_res, dom_res, &res_fp, &r);
 
-    let mm3 = prove_matmul_committed(pcs, challenger, &lm_fp, &res_fp, &acc3_fp, vocab, in_);
-    let req3 = prove_lookup2_committed(
-        pcs,
-        challenger,
-        &acc3_fp,
-        &logits_fp,
-        |x| flashprove::spec::requant(x, 4),
-        req_lo,
-        req_hi,
-        &multiplicities(
-            acc3,
-            logits,
-            |x| flashprove::spec::requant(x, 4),
-            req_lo,
-            req_hi,
-        ),
-        alpha,
-        beta,
-    );
+    let mm3 = prove_matmul_committed(ctx, &lm_fp, &res_fp, &acc3_fp, vocab, in_);
+    let req3 = prove_lookup2_committed(ctx, acc3, logits, req_lo, alpha, beta);
 
     DemoFfnProof {
         mm1,
@@ -212,31 +132,61 @@ fn prove_demo_ffn_committed(
         claim_res,
         mm3,
         req3,
+        req_lo,
+        silu_lo,
     }
 }
 
 fn verify_demo_ffn_committed(
-    pcs: &Pcs,
     challenger: &Challenger,
     out1: usize,
     in_: usize,
     out2: usize,
     vocab: usize,
     proof: &DemoFfnProof,
+    values: &[flashprove::field::Ext],
+    acc: &mut Openings,
 ) -> bool {
-    if !verify_matmul_committed(pcs, challenger, out1, in_, &proof.mm1) {
+    if !verify_matmul_committed(challenger, out1, in_, &proof.mm1, values, acc) {
         return false;
     }
-    if !verify_lookup2_committed(pcs, challenger, &proof.req1) {
+    if !verify_lookup2_committed(
+        challenger,
+        |x| flashprove::spec::requant(x, 4),
+        proof.req_lo,
+        proof.req1.alpha,
+        proof.req1.beta,
+        &proof.req1,
+        values,
+        acc,
+    ) {
         return false;
     }
-    if !verify_lookup2_committed(pcs, challenger, &proof.silu) {
+    if !verify_lookup2_committed(
+        challenger,
+        flashprove::spec::silu,
+        proof.silu_lo,
+        proof.silu.alpha,
+        proof.silu.beta,
+        &proof.silu,
+        values,
+        acc,
+    ) {
         return false;
     }
-    if !verify_matmul_committed(pcs, challenger, out2, out1, &proof.mm2) {
+    if !verify_matmul_committed(challenger, out2, out1, &proof.mm2, values, acc) {
         return false;
     }
-    if !verify_lookup2_committed(pcs, challenger, &proof.req2) {
+    if !verify_lookup2_committed(
+        challenger,
+        |x| flashprove::spec::requant(x, 4),
+        proof.req_lo,
+        proof.req2.alpha,
+        proof.req2.beta,
+        &proof.req2,
+        values,
+        acc,
+    ) {
         return false;
     }
     let mut tr = fri::Transcript::new(challenger);
@@ -245,49 +195,61 @@ fn verify_demo_ffn_committed(
     tr.observe(&proof.com_res);
     let r: Vec<Fp> = (0..in_).map(|_| tr.sample_val()).collect();
     if !verify_inner_product_committed(
-        pcs,
         challenger,
         &proof.com_h2,
         proof.dom_h2,
         &r,
         proof.b_h2,
         &proof.claim_h2,
+        values,
+        acc,
     ) {
         return false;
     }
     if !verify_inner_product_committed(
-        pcs,
         challenger,
         &proof.com_emb,
         proof.dom_emb,
         &r,
         proof.b_emb,
         &proof.claim_emb,
+        values,
+        acc,
     ) {
         return false;
     }
     if !verify_inner_product_committed(
-        pcs,
         challenger,
         &proof.com_res,
         proof.dom_res,
         &r,
         proof.b_res,
         &proof.claim_res,
+        values,
+        acc,
     ) {
         return false;
     }
     if proof.b_res != proof.b_h2 + proof.b_emb {
         return false;
     }
-    if !verify_matmul_committed(pcs, challenger, vocab, in_, &proof.mm3) {
+    if !verify_matmul_committed(challenger, vocab, in_, &proof.mm3, values, acc) {
         return false;
     }
-    verify_lookup2_committed(pcs, challenger, &proof.req3)
+    verify_lookup2_committed(
+        challenger,
+        |x| flashprove::spec::requant(x, 4),
+        proof.req_lo,
+        proof.req3.alpha,
+        proof.req3.beta,
+        &proof.req3,
+        values,
+        acc,
+    )
 }
 
 fn main() {
-    let (pcs, challenger) = fri::new_pcs(1, 10);
+    let mut ctx = fri::Prover::new(1, 10);
     // Small dims: in=2, out1=2, out2=2, vocab=4.
     let (in_, out1, out2, vocab) = (2usize, 2usize, 2usize, 4usize);
     let embedding = [3i64, -2];
@@ -315,32 +277,22 @@ fn main() {
     let beta = f(5);
 
     let proof = prove_demo_ffn_committed(
-        &pcs,
-        &challenger,
-        &embedding,
-        &acc1,
-        &h1,
-        &act,
-        &acc2,
-        &h2,
-        &residual,
-        &acc3,
-        &logits,
-        &w1,
-        &w2,
-        &lm_head,
+        &mut ctx, &embedding, &acc1, &h1, &act, &acc2, &h2, &residual, &acc3, &logits, &w1, &w2,
+        &lm_head, out1, in_, out2, vocab, -64, -64, alpha, beta,
+    );
+    let fri_proof = ctx.open_all();
+    let values = ctx.values.clone();
+    let mut acc = Openings::new();
+    let ok = verify_demo_ffn_committed(
+        &ctx.challenger,
         out1,
         in_,
         out2,
         vocab,
-        -64,
-        64,
-        -64,
-        64,
-        alpha,
-        beta,
-    );
-    let ok = verify_demo_ffn_committed(&pcs, &challenger, out1, in_, out2, vocab, &proof);
+        &proof,
+        &values,
+        &mut acc,
+    ) && fri::open_many_verify(&ctx.pcs, &ctx.challenger, &acc, &fri_proof);
     println!("committed demo FFN: {}", if ok { "OK" } else { "REJECTED" });
     assert!(ok);
 }

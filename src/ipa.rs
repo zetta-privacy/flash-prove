@@ -7,10 +7,11 @@
 //! verifier samples `x` and folds `a' = a_lo·x + a_hi·x⁻¹`, `b' = b_lo·x⁻¹ +
 //! b_hi·x`, with the new claim `c' = c + x²·L + x⁻²·R`.
 
-use crate::field::Fp;
-use crate::fri::{self, Challenger, Pcs};
+use crate::field::{Ext, Fp};
+use crate::fri::{self, Challenger, Pcs, Prover};
 use crate::zk::{
     prove_inner_product_committed_given, verify_inner_product_committed, InnerProductProof,
+    Openings,
 };
 use p3_field::{Field, PrimeCharacteristicRing};
 
@@ -84,38 +85,39 @@ pub struct CommittedIpa {
 /// and open at them (reusing the caller's `com_v`/`pd_v`).
 #[allow(clippy::too_many_arguments)]
 fn prove_base_case(
-    pcs: &Pcs,
-    challenger: &Challenger,
+    ctx: &mut Prover,
     com_v: &fri::Commitment,
     pd_v: &fri::ProverData,
     dom: fri::Domain,
     v: &[Fp],
     h: &[Fp],
 ) -> InnerProductProof {
-    prove_inner_product_committed_given(pcs, challenger, com_v, pd_v, dom, v, h)
+    prove_inner_product_committed_given(ctx, com_v, pd_v, dom, v, h)
 }
 
-/// Prove `⟨a, b⟩ = c` with both vectors committed: fold via the IPA (sending
-/// `L_j`, `R_j`), sampling each folding challenge `x_j` from the Fiat–Shamir
-/// transcript (interleaved with the rounds), and commit the two base-case linear
-/// claims.
-pub fn prove_ipa_committed(
-    pcs: &Pcs,
-    challenger: &Challenger,
+/// Prove `⟨a, b⟩ = c` with both vectors *already committed* (the caller supplies
+/// the commitments and prover data). See [`prove_ipa_committed`] for the form that
+/// commits them itself. `a` and `b` must share a power-of-two length (hence a
+/// domain).
+pub fn prove_ipa_committed_given(
+    ctx: &mut Prover,
+    com_a: &fri::Commitment,
+    pd_a: &fri::ProverData,
+    dom_a: fri::Domain,
+    com_b: &fri::Commitment,
+    pd_b: &fri::ProverData,
+    dom_b: fri::Domain,
     a: &[Fp],
     b: &[Fp],
     c: Fp,
 ) -> CommittedIpa {
-    let (com_a, pd_a, dom) = fri::commit_vec(pcs, a);
-    let (com_b, pd_b, _) = fri::commit_vec(pcs, b);
-
     let log_n = a.len().trailing_zeros() as usize;
     assert_eq!(b.len(), a.len());
     assert!(a.len().is_power_of_two());
 
-    let mut tr = fri::Transcript::new(challenger);
-    tr.observe(&com_a);
-    tr.observe(&com_b);
+    let mut tr = fri::Transcript::new(&ctx.challenger);
+    tr.observe(com_a);
+    tr.observe(com_b);
 
     let mut a_cur = a.to_vec();
     let mut b_cur = b.to_vec();
@@ -152,13 +154,13 @@ pub fn prove_ipa_committed(
 
     let coeff = fold_coeffs(log_n, &x);
     let coeff_inv: Vec<Fp> = coeff.iter().map(|&v| v.inverse()).collect();
-    let a_claim = prove_base_case(pcs, challenger, &com_a, &pd_a, dom, a, &coeff);
-    let b_claim = prove_base_case(pcs, challenger, &com_b, &pd_b, dom, b, &coeff_inv);
+    let a_claim = prove_base_case(ctx, com_a, pd_a, dom_a, a, &coeff);
+    let b_claim = prove_base_case(ctx, com_b, pd_b, dom_b, b, &coeff_inv);
 
     CommittedIpa {
-        com_a,
-        com_b,
-        dom,
+        com_a: com_a.clone(),
+        com_b: com_b.clone(),
+        dom: dom_a,
         rounds,
         a_prime,
         b_prime,
@@ -167,15 +169,26 @@ pub fn prove_ipa_committed(
     }
 }
 
+/// Prove `⟨a, b⟩ = c` with both vectors committed: fold via the IPA (sending
+/// `L_j`, `R_j`), sampling each folding challenge `x_j` from the Fiat–Shamir
+/// transcript (interleaved with the rounds), and commit the two base-case linear
+/// claims.
+pub fn prove_ipa_committed(ctx: &mut Prover, a: &[Fp], b: &[Fp], c: Fp) -> CommittedIpa {
+    let (com_a, pd_a, dom) = fri::commit_vec(&ctx.pcs, a);
+    let (com_b, pd_b, _) = fri::commit_vec(&ctx.pcs, b);
+    prove_ipa_committed_given(ctx, &com_a, &pd_a, dom, &com_b, &pd_b, dom, a, b, c)
+}
+
 /// Verify `⟨a, b⟩ = c` from the committed IPA proof: replay the Fiat–Shamir
 /// challenges from the transcript (interleaved with the rounds), fold the claim,
 /// check the base case `a'·b' = c'`, and discharge the two linear claims via the
 /// O(log n) committed inner-product argument.
 pub fn verify_ipa_committed(
-    pcs: &Pcs,
     challenger: &Challenger,
     c: Fp,
     proof: &CommittedIpa,
+    values: &[Ext],
+    acc: &mut Openings,
 ) -> bool {
     let log_n = proof.rounds.len();
     let mut tr = fri::Transcript::new(challenger);
@@ -199,21 +212,23 @@ pub fn verify_ipa_committed(
     let coeff = fold_coeffs(log_n, &x);
     let coeff_inv: Vec<Fp> = coeff.iter().map(|&v| v.inverse()).collect();
     verify_inner_product_committed(
-        pcs,
         challenger,
         &proof.com_a,
         proof.dom,
         &coeff,
         proof.a_prime,
         &proof.a_claim,
+        values,
+        acc,
     ) && verify_inner_product_committed(
-        pcs,
         challenger,
         &proof.com_b,
         proof.dom,
         &coeff_inv,
         proof.b_prime,
         &proof.b_claim,
+        values,
+        acc,
     )
 }
 
@@ -286,22 +301,46 @@ mod tests {
 
     #[test]
     fn committed_ipa_honest() {
-        let (pcs, challenger) = crate::fri::new_pcs(1, 10);
+        let mut ctx = crate::fri::Prover::new(1, 10);
         // a = [1,2,3,4], b = [5,6,7,8], ⟨a,b⟩ = 70.
         let a = [f(1), f(2), f(3), f(4)];
         let b = [f(5), f(6), f(7), f(8)];
         let c = f(70);
-        let proof = prove_ipa_committed(&pcs, &challenger, &a, &b, c);
-        assert!(verify_ipa_committed(&pcs, &challenger, c, &proof));
+        let proof = prove_ipa_committed(&mut ctx, &a, &b, c);
+        let fri_proof = ctx.open_all();
+        let values = ctx.values.clone();
+        let mut acc = Openings::new();
+        assert!(verify_ipa_committed(
+            &ctx.challenger,
+            c,
+            &proof,
+            &values,
+            &mut acc
+        ));
+        assert!(fri::open_many_verify(
+            &ctx.pcs,
+            &ctx.challenger,
+            &acc,
+            &fri_proof
+        ));
     }
 
     #[test]
     fn committed_ipa_rejects_wrong_c() {
-        let (pcs, challenger) = crate::fri::new_pcs(1, 10);
+        let mut ctx = crate::fri::Prover::new(1, 10);
         let a = [f(1), f(2), f(3), f(4)];
         let b = [f(5), f(6), f(7), f(8)];
         let c = f(70);
-        let proof = prove_ipa_committed(&pcs, &challenger, &a, &b, c);
-        assert!(!verify_ipa_committed(&pcs, &challenger, f(71), &proof));
+        let proof = prove_ipa_committed(&mut ctx, &a, &b, c);
+        let fri_proof = ctx.open_all();
+        let values = ctx.values.clone();
+        let mut acc = Openings::new();
+        assert!(!verify_ipa_committed(
+            &ctx.challenger,
+            f(71),
+            &proof,
+            &values,
+            &mut acc
+        ));
     }
 }

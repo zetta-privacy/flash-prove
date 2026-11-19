@@ -1,15 +1,20 @@
-//! Committed 2-column lookup: wire the fingerprint folding + the committed LogUp
-//! into one lookup check for `(in[i], out[i]) ∈ {(x, f(x))}` (SiLU, requant, …).
+//! Committed 2-column lookup via fingerprint folding + **sparse membership**.
 //!
-//!  1. fold the committed `in`/`out` into a single base-field fingerprint
-//!     `fp[i] = α + β·in[i] + β²·out[i]` (three linear claims at a shared `r`),
-//!  2. run the committed LogUp `fp ⊆ fp_table` against the public table.
+//! For a function table `f` (silu/requant/exp — distinct values), the lookup
+//! `out[i] = f(in[i])` is exactly the membership check `fp[i] = ft[idx[i]]`, where
+//! `fp[i] = α + β·in[i] + β²·out[i]` is the committed fingerprint and `idx[i] =
+//! in[i] − lo` is the *revealed* table index. This is O(n) in the number of queries,
+//! with **no** O(N) table commitment or dense multiplicity — the table is public
+//! and the verifier evaluates `ft[idx[i]]` directly.
+//!
+//!  1. fold `in`/`out` into `fp` (three linear claims at a shared `r`),
+//!  2. membership: `⟨r_mem, fp⟩ = Σ_i r_mem[i]·ft[idx[i]]` (one linear claim).
 
-use crate::field::Fp;
-use crate::fri::{self, Challenger, Pcs};
-use crate::logup::{prove_logup_committed, verify_logup_committed, LogUpProof};
+use crate::field::{Ext, Fp};
+use crate::fri::{self, Challenger, Prover};
 use crate::zk::{
     prove_inner_product_committed_given, verify_inner_product_committed, InnerProductProof,
+    Openings,
 };
 use p3_field::PrimeCharacteristicRing;
 
@@ -22,7 +27,7 @@ fn pad(mut v: Vec<Fp>, n: usize) -> Vec<Fp> {
     v
 }
 
-fn i64_to_fp(x: i64) -> Fp {
+fn f(x: i64) -> Fp {
     if x < 0 {
         -Fp::new(x.unsigned_abs())
     } else {
@@ -47,20 +52,31 @@ pub struct Lookup2Proof {
     pub claim_fp: InnerProductProof,
     pub alpha: Fp,
     pub beta: Fp,
-    pub logup: LogUpProof,
+    // membership: fp[i] = ft[idx[i]].
+    pub idx: Vec<usize>,
+    pub r_mem: Vec<Fp>,
+    pub b_mem: Fp,
+    pub claim_mem: InnerProductProof,
 }
 
-/// Prove `(in[i], out[i]) ∈ {(x, f(x)) : x ∈ [lo, hi]}`. `m` are the multiplicities
-/// of the table entries. `f` is the public table function (e.g. `silu`).
-pub fn prove_lookup2_committed(
-    pcs: &Pcs,
-    challenger: &Challenger,
-    inp: &[Fp],
-    out: &[Fp],
-    f: impl Fn(i64) -> i64,
+/// Prove `out[i] = f(in[i])` for all `i` using *already-committed* `in`/`out`.
+///
+/// This is the shared-commitment form: the caller supplies the commitments (and
+/// prover data) for the query `in` and `out`, so a single committed vector can
+/// back several claims (e.g. `δ` appears in both the linear relation and the sign
+/// lookup) without committing it twice. Only the derived fingerprint `fp` is
+/// committed here.
+pub fn prove_lookup2_committed_given(
+    ctx: &mut Prover,
+    com_in: &fri::Commitment,
+    pd_in: &fri::ProverData,
+    dom_in: fri::Domain,
+    com_out: &fri::Commitment,
+    pd_out: &fri::ProverData,
+    dom_out: fri::Domain,
+    inp: &[i64],
+    out: &[i64],
     lo: i64,
-    hi: i64,
-    m: &[Fp],
     alpha: Fp,
     beta: Fp,
 ) -> Lookup2Proof {
@@ -69,50 +85,42 @@ pub fn prove_lookup2_committed(
 
     // Query fingerprint fp[i] = α + β·in[i] + β²·out[i].
     let fp: Vec<Fp> = (0..n)
-        .map(|i| alpha + beta * inp[i] + beta * beta * out[i])
+        .map(|i| alpha + beta * f(inp[i]) + beta * beta * f(out[i]))
         .collect();
 
-    let inp = pad(inp.to_vec(), n);
-    let out = pad(out.to_vec(), n);
+    let inp_fp: Vec<Fp> = pad(inp.iter().map(|&x| f(x)).collect(), n);
+    let out_fp: Vec<Fp> = pad(out.iter().map(|&x| f(x)).collect(), n);
     let fp = pad(fp, n);
 
-    let (com_in, pd_in, dom_in) = fri::commit_vec(pcs, &inp);
-    let (com_out, pd_out, dom_out) = fri::commit_vec(pcs, &out);
-    let (com_fp, pd_fp, dom_fp) = fri::commit_vec(pcs, &fp);
+    let (com_fp, pd_fp, dom_fp) = fri::commit_vec(&ctx.pcs, &fp);
 
-    let mut tr = fri::Transcript::new(challenger);
-    tr.observe(&com_in);
-    tr.observe(&com_out);
+    let mut tr = fri::Transcript::new(&ctx.challenger);
+    tr.observe(com_in);
+    tr.observe(com_out);
     tr.observe(&com_fp);
     let mut r: Vec<Fp> = (0..n).map(|_| tr.sample_val()).collect();
     r.resize(next_pow2(n), Fp::ZERO);
 
-    let b_in: Fp = r.iter().zip(&inp).map(|(&ri, &vi)| ri * vi).sum();
-    let b_out: Fp = r.iter().zip(&out).map(|(&ri, &vi)| ri * vi).sum();
+    let b_in: Fp = r.iter().zip(&inp_fp).map(|(&ri, &vi)| ri * vi).sum();
+    let b_out: Fp = r.iter().zip(&out_fp).map(|(&ri, &vi)| ri * vi).sum();
     let b_fp: Fp = r.iter().zip(&fp).map(|(&ri, &vi)| ri * vi).sum();
 
-    let claim_in =
-        prove_inner_product_committed_given(pcs, challenger, &com_in, &pd_in, dom_in, &inp, &r);
-    let claim_out =
-        prove_inner_product_committed_given(pcs, challenger, &com_out, &pd_out, dom_out, &out, &r);
-    let claim_fp =
-        prove_inner_product_committed_given(pcs, challenger, &com_fp, &pd_fp, dom_fp, &fp, &r);
+    let claim_in = prove_inner_product_committed_given(ctx, com_in, pd_in, dom_in, &inp_fp, &r);
+    let claim_out = prove_inner_product_committed_given(ctx, com_out, pd_out, dom_out, &out_fp, &r);
+    let claim_fp = prove_inner_product_committed_given(ctx, &com_fp, &pd_fp, dom_fp, &fp, &r);
 
-    // Table fingerprints (public): ft[j] = α + β·x + β²·f(x), with multiplicities m.
-    let ft: Vec<Fp> = (lo..=hi)
-        .map(|x| {
-            let fx = f(x);
-            alpha + beta * i64_to_fp(x) + beta * beta * i64_to_fp(fx)
-        })
-        .collect();
-
-    let logup = prove_logup_committed(pcs, challenger, &fp[..n], &ft, m);
+    // Membership: idx[i] = in[i] − lo, and fp[i] = ft[idx[i]].
+    let idx: Vec<usize> = inp.iter().map(|&x| (x - lo) as usize).collect();
+    let mut r_mem: Vec<Fp> = (0..n).map(|_| tr.sample_val()).collect();
+    r_mem.resize(next_pow2(n), Fp::ZERO);
+    let b_mem: Fp = r_mem.iter().zip(&fp).map(|(&ri, &vi)| ri * vi).sum();
+    let claim_mem = prove_inner_product_committed_given(ctx, &com_fp, &pd_fp, dom_fp, &fp, &r_mem);
 
     Lookup2Proof {
         n,
-        com_in,
+        com_in: com_in.clone(),
         dom_in,
-        com_out,
+        com_out: com_out.clone(),
         dom_out,
         com_fp,
         dom_fp,
@@ -125,11 +133,43 @@ pub fn prove_lookup2_committed(
         claim_fp,
         alpha,
         beta,
-        logup,
+        idx,
+        r_mem,
+        b_mem,
+        claim_mem,
     }
 }
 
-pub fn verify_lookup2_committed(pcs: &Pcs, challenger: &Challenger, proof: &Lookup2Proof) -> bool {
+/// Prove `out[i] = f(in[i])` for all `i`, committing `in`/`out` first. See
+/// [`prove_lookup2_committed_given`] for the shared-commitment form.
+pub fn prove_lookup2_committed(
+    ctx: &mut Prover,
+    inp: &[i64],
+    out: &[i64],
+    lo: i64,
+    alpha: Fp,
+    beta: Fp,
+) -> Lookup2Proof {
+    let n = inp.len();
+    let inp_fp: Vec<Fp> = pad(inp.iter().map(|&x| f(x)).collect(), n);
+    let out_fp: Vec<Fp> = pad(out.iter().map(|&x| f(x)).collect(), n);
+    let (com_in, pd_in, dom_in) = fri::commit_vec(&ctx.pcs, &inp_fp);
+    let (com_out, pd_out, dom_out) = fri::commit_vec(&ctx.pcs, &out_fp);
+    prove_lookup2_committed_given(
+        ctx, &com_in, &pd_in, dom_in, &com_out, &pd_out, dom_out, inp, out, lo, alpha, beta,
+    )
+}
+
+pub fn verify_lookup2_committed(
+    challenger: &Challenger,
+    ftbl: impl Fn(i64) -> i64,
+    lo: i64,
+    alpha: Fp,
+    beta: Fp,
+    proof: &Lookup2Proof,
+    values: &[Ext],
+    acc: &mut Openings,
+) -> bool {
     let n = proof.n;
 
     let mut tr = fri::Transcript::new(challenger);
@@ -141,47 +181,73 @@ pub fn verify_lookup2_committed(pcs: &Pcs, challenger: &Challenger, proof: &Look
 
     // Folding checks.
     if !verify_inner_product_committed(
-        pcs,
         challenger,
         &proof.com_in,
         proof.dom_in,
         &r,
         proof.b_in,
         &proof.claim_in,
+        values,
+        acc,
     ) {
         return false;
     }
     if !verify_inner_product_committed(
-        pcs,
         challenger,
         &proof.com_out,
         proof.dom_out,
         &r,
         proof.b_out,
         &proof.claim_out,
+        values,
+        acc,
     ) {
         return false;
     }
     if !verify_inner_product_committed(
-        pcs,
         challenger,
         &proof.com_fp,
         proof.dom_fp,
         &r,
         proof.b_fp,
         &proof.claim_fp,
+        values,
+        acc,
     ) {
         return false;
     }
-    // fp = α + β·in + β²·out → ⟨r, fp⟩ = α·Σr + β·⟨r, in⟩ + β²·⟨r, out⟩.
     let sum_r: Fp = r.iter().copied().sum();
     if proof.b_fp
         != proof.alpha * sum_r + proof.beta * proof.b_in + proof.beta * proof.beta * proof.b_out
     {
         return false;
     }
-    // LogUp fp ⊆ fp_table.
-    verify_logup_committed(pcs, challenger, &proof.logup)
+
+    // Membership: ⟨r_mem, fp⟩ = Σ_i r_mem[i]·ft[idx[i]].
+    let mut r_mem: Vec<Fp> = (0..n).map(|_| tr.sample_val()).collect();
+    r_mem.resize(next_pow2(n), Fp::ZERO);
+    if !verify_inner_product_committed(
+        challenger,
+        &proof.com_fp,
+        proof.dom_fp,
+        &r_mem,
+        proof.b_mem,
+        &proof.claim_mem,
+        values,
+        acc,
+    ) {
+        return false;
+    }
+    let rhs: Fp = r_mem
+        .iter()
+        .zip(&proof.idx)
+        .map(|(&ri, &idx)| {
+            let x = lo + idx as i64;
+            let fx = ftbl(x);
+            ri * (alpha + beta * f(x) + beta * beta * f(fx))
+        })
+        .sum();
+    proof.b_mem == rhs
 }
 
 #[cfg(test)]
@@ -194,49 +260,55 @@ mod tests {
 
     #[test]
     fn lookup2_committed_honest() {
-        let (pcs, challenger) = fri::new_pcs(1, 10);
-        // f(x) = x² over x ∈ 0..4; queries (1,1),(3,9),(1,1) with m = [0,2,0,1,0].
-        let inp = [f(1), f(3), f(1)];
-        let out = [f(1), f(9), f(1)];
-        let m = [f(0), f(2), f(0), f(1), f(0)]; // table {0,1,2,3,4}
+        let mut ctx = fri::Prover::new(1, 10);
+        // f(x) = x² over x ∈ 0..4; queries (1,1),(3,9),(1,1).
+        let inp = [1i64, 3, 1];
+        let out = [1i64, 9, 1];
         let alpha = f(11);
         let beta = f(5);
-        let proof = prove_lookup2_committed(
-            &pcs,
-            &challenger,
-            &inp,
-            &out,
+        let proof = prove_lookup2_committed(&mut ctx, &inp, &out, 0, alpha, beta);
+        let fri_proof = ctx.open_all();
+        let values = ctx.values.clone();
+        let mut acc = crate::zk::Openings::new();
+        assert!(verify_lookup2_committed(
+            &ctx.challenger,
             |x| x * x,
             0,
-            4,
-            &m,
             alpha,
             beta,
-        );
-        assert!(verify_lookup2_committed(&pcs, &challenger, &proof));
+            &proof,
+            &values,
+            &mut acc,
+        ));
+        assert!(fri::open_many_verify(
+            &ctx.pcs,
+            &ctx.challenger,
+            &acc,
+            &fri_proof,
+        ));
     }
 
     #[test]
     fn lookup2_committed_rejects_wrong_out() {
-        let (pcs, challenger) = fri::new_pcs(1, 10);
+        let mut ctx = fri::Prover::new(1, 10);
         // (3, 10) is wrong: f(3) = 9.
-        let inp = [f(1), f(3), f(1)];
-        let out = [f(1), f(10), f(1)];
-        let m = [f(0), f(2), f(0), f(1), f(0)];
+        let inp = [1i64, 3, 1];
+        let out = [1i64, 10, 1];
         let alpha = f(11);
         let beta = f(5);
-        let proof = prove_lookup2_committed(
-            &pcs,
-            &challenger,
-            &inp,
-            &out,
+        let proof = prove_lookup2_committed(&mut ctx, &inp, &out, 0, alpha, beta);
+        ctx.open_all();
+        let values = ctx.values.clone();
+        let mut acc = crate::zk::Openings::new();
+        assert!(!verify_lookup2_committed(
+            &ctx.challenger,
             |x| x * x,
             0,
-            4,
-            &m,
             alpha,
             beta,
-        );
-        assert!(!verify_lookup2_committed(&pcs, &challenger, &proof));
+            &proof,
+            &values,
+            &mut acc,
+        ));
     }
 }

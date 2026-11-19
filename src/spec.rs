@@ -19,10 +19,17 @@ pub fn requant(x: i64, k: u32) -> i64 {
     }
 }
 
-/// `round(x / scale)` — the attention-scores rounding (`f64::round`, half away
-/// from zero), used by the `scores` op.
+/// Fixed-point bits for the quantized reciprocal (`1/scale`, `1/√(·+eps)`). Chosen
+/// so every input `|x| < 2^RECIP_Q` (the scores dot and norm `x·γ` stay well below
+/// this), making the integer `requant(x·inv_q, RECIP_Q)` bit-consistent with the
+/// f64 `round(x/divisor)`.
+pub const RECIP_Q: u32 = 24;
+
+/// `round(x / scale)` — the attention-scores rounding, now a quantized reciprocal
+/// so it is a clean shift (arith: `requant(x · round(2^Q/scale), Q)`).
 pub fn round_div(x: i64, scale: f64) -> i64 {
-    (x as f64 / scale).round() as i64
+    let inv_q = ((1i64 << RECIP_Q) as f64 / scale).round() as i64;
+    requant(x * inv_q, RECIP_Q)
 }
 
 pub fn silu(x: i64) -> i64 {
@@ -49,14 +56,14 @@ pub fn rope_apply(q: &mut [i64], pos: usize, theta: f64) {
     }
 }
 
-/// Integer RMSNorm of one vector.
+/// Integer RMSNorm of one vector, via the quantized reciprocal.
 pub fn rmsnorm_vec(x: &[i64], gamma: &[i8], eps: f64) -> Vec<i64> {
     let d = x.len() as f64;
     let mean_sq = x.iter().map(|&v| (v as f64) * (v as f64)).sum::<f64>() / d;
-    let inv = 1.0 / (mean_sq + eps).sqrt();
+    let inv_q = ((1i64 << RECIP_Q) as f64 / (mean_sq + eps).sqrt()).round() as i64;
     x.iter()
         .zip(gamma)
-        .map(|(&v, &g)| (v as f64 * inv * g as f64).round() as i64)
+        .map(|(&v, &g)| requant(v * (g as i64) * inv_q, RECIP_Q))
         .collect()
 }
 
@@ -158,7 +165,7 @@ fn scores(q: &Tensor, k: &Tensor, scale: f64) -> Tensor {
                 for j in 0..d {
                     dot += q.data[qbase + j] * k.data[kbase + j];
                 }
-                data.push((dot as f64 / scale).round() as i64);
+                data.push(round_div(dot, scale));
             }
         }
     }
@@ -176,9 +183,15 @@ fn causal_softmax(s: &Tensor) -> Tensor {
             let max = row[..=li].iter().copied().max().unwrap_or(0);
             let exps: Vec<i64> = (0..=li).map(|t| exp_q15(row[t] - max)).collect();
             let sum: i64 = exps.iter().sum();
+            // Quantized reciprocal of S: nrm = requant(e·inv_q, RECIP_Q) ≈ e·2^15/S.
+            let inv_q = if sum != 0 {
+                ((1i64 << (RECIP_Q + 15)) as f64 / sum as f64).round() as i64
+            } else {
+                0
+            };
             for t in 0..l {
                 let w = if t <= li && sum != 0 {
-                    exps[t] * (1i64 << 15) / sum
+                    requant(exps[t] * inv_q, RECIP_Q)
                 } else {
                     0
                 };

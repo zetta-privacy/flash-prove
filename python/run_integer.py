@@ -27,6 +27,10 @@ def round_half_away(x):
     return np.where(x >= 0, np.floor(x + 0.5), np.ceil(x - 0.5)).astype(np.int64)
 
 
+# Fixed-point bits for the quantized reciprocal (matches `src/spec.rs::RECIP_Q`).
+RECIP_Q = 24
+
+
 def exp_f64(x):
     # Rust f64::exp returns +inf on overflow (IEEE 754); math.exp raises instead.
     try:
@@ -99,19 +103,19 @@ def rope_tables(L, d, theta):
 
 
 def rmsnorm(x, gamma, eps):
-    gamma = np.asarray(gamma, dtype=np.float64).reshape(-1)
+    gamma = np.asarray(gamma, dtype=np.int64).reshape(-1)
     d = x.shape[-1]
     flat = x.reshape(-1, d)
     out = np.empty(flat.shape, dtype=np.int64)
     for b in range(flat.shape[0]):
         row = flat[b]
-        # sequential f64 sum, matching Rust's `Iterator::sum::<f64>()`.
-        mean_sq = 0.0
+        # sequential integer sum, matching Rust's `Iterator::sum::<i64>()`.
+        sum_sq = 0
         for v in row:
-            mean_sq += float(v) * float(v)
-        mean_sq /= d
-        inv = 1.0 / math.sqrt(mean_sq + eps)
-        out[b] = round_half_away(row.astype(np.float64) * inv * gamma)
+            sum_sq += int(v) * int(v)
+        mean_sq = sum_sq / d
+        inv_q = round_half_away_scalar((1 << RECIP_Q) / math.sqrt(mean_sq + eps))
+        out[b] = requant(row.astype(np.int64) * gamma * inv_q, RECIP_Q)
     return out.reshape(x.shape)
 
 
@@ -160,9 +164,9 @@ def run(spec, weights, window, output_pos=None) -> dict:
         elif kind == "scores":
             q = get(op["q"])  # [L, H, d]
             k = get(op["k"])
-            env[op["output"]] = round_half_away(
-                np.einsum("lhd,thd->lht", q.astype(np.float64), k.astype(np.float64)) / op["scale"]
-            )
+            dot = np.einsum("lhd,thd->lht", q.astype(np.float64), k.astype(np.float64))
+            inv_q = round_half_away_scalar((1 << RECIP_Q) / op["scale"])
+            env[op["output"]] = requant(dot.astype(np.int64) * inv_q, RECIP_Q)
         elif kind == "causal_softmax":
             s = get(op["input"]).astype(np.int64)  # [L, H, L]
             L = s.shape[0]
@@ -173,8 +177,11 @@ def run(spec, weights, window, output_pos=None) -> dict:
             mask = np.tril(np.ones((L, L), dtype=bool))
             exps = np.where(mask[:, None, :], exps, 0)
             total = exps.sum(axis=-1)  # [L, H]
-            safe = np.where(total[..., None] != 0, total[..., None], 1)
-            out = exps * (1 << 15) // safe
+            inv_q = round_half_away(
+                (1 << (RECIP_Q + 15)) / np.where(total != 0, total, 1).astype(np.float64)
+            )
+            inv_q = np.where(total != 0, inv_q, 0)
+            out = requant(exps * inv_q[..., None], RECIP_Q)
             out = np.where(total[..., None] != 0, out, 0)
             env[op["output"]] = out.astype(np.int64)
         elif kind == "weighted_v":

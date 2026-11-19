@@ -8,11 +8,12 @@
 //!
 //! checked by one IPA (`⟨g, b⟩ = c`) and one linear claim (`⟨r, out⟩ = c`).
 
-use crate::field::Fp;
-use crate::fri::{self, Challenger, Pcs};
-use crate::ipa::{prove_ipa_committed, verify_ipa_committed, CommittedIpa};
+use crate::field::{Ext, Fp};
+use crate::fri::{self, Challenger, Prover};
+use crate::ipa::{prove_ipa_committed_given, verify_ipa_committed, CommittedIpa};
 use crate::zk::{
     prove_inner_product_committed_given, verify_inner_product_committed, InnerProductProof,
+    Openings,
 };
 use p3_field::PrimeCharacteristicRing;
 
@@ -46,13 +47,7 @@ pub struct MulProof {
     pub c: Fp,
 }
 
-pub fn prove_mul_committed(
-    pcs: &Pcs,
-    challenger: &Challenger,
-    a: &[Fp],
-    b: &[Fp],
-    out: &[Fp],
-) -> MulProof {
+pub fn prove_mul_committed(ctx: &mut Prover, a: &[Fp], b: &[Fp], out: &[Fp]) -> MulProof {
     let n = a.len();
     assert_eq!(b.len(), n);
     assert_eq!(out.len(), n);
@@ -61,39 +56,64 @@ pub fn prove_mul_committed(
     let b = pad(b.to_vec(), n);
     let out = pad(out.to_vec(), n);
 
-    let (com_a, pd_a, dom_a) = fri::commit_vec(pcs, &a);
-    let (com_b, _pd_b, dom_b) = fri::commit_vec(pcs, &b);
-    let (com_out, pd_out, dom_out) = fri::commit_vec(pcs, &out);
+    let (com_a, pd_a, dom_a) = fri::commit_vec(&ctx.pcs, &a);
+    let (com_b, pd_b, dom_b) = fri::commit_vec(&ctx.pcs, &b);
+    let (com_out, pd_out, dom_out) = fri::commit_vec(&ctx.pcs, &out);
 
-    let mut tr = fri::Transcript::new(challenger);
-    tr.observe(&com_a);
-    tr.observe(&com_b);
-    tr.observe(&com_out);
+    prove_mul_committed_given(
+        ctx, &com_a, &pd_a, dom_a, &com_b, &pd_b, dom_b, &com_out, &pd_out, dom_out, &a, &b, &out,
+    )
+}
+
+/// Prove `out = a ⊙ b` on *already-committed* `a`, `b`, `out`. The derived `g = r⊙a`
+/// and the IPA's folded operand are committed fresh; `b` is reused via the IPA's
+/// shared-commitment form.
+pub fn prove_mul_committed_given(
+    ctx: &mut Prover,
+    com_a: &fri::Commitment,
+    pd_a: &fri::ProverData,
+    dom_a: fri::Domain,
+    com_b: &fri::Commitment,
+    pd_b: &fri::ProverData,
+    dom_b: fri::Domain,
+    com_out: &fri::Commitment,
+    pd_out: &fri::ProverData,
+    dom_out: fri::Domain,
+    a: &[Fp],
+    b: &[Fp],
+    out: &[Fp],
+) -> MulProof {
+    let n = a.len();
+    assert_eq!(b.len(), n);
+    assert_eq!(out.len(), n);
+
+    let mut tr = fri::Transcript::new(&ctx.challenger);
+    tr.observe(com_a);
+    tr.observe(com_b);
+    tr.observe(com_out);
     let mut r: Vec<Fp> = (0..n).map(|_| tr.sample_val()).collect();
     r.resize(next_pow2(n), Fp::ZERO);
     let mut s: Vec<Fp> = (0..n).map(|_| tr.sample_val()).collect();
     s.resize(next_pow2(n), Fp::ZERO);
 
     let g: Vec<Fp> = (0..next_pow2(n)).map(|i| r[i] * a[i]).collect();
-    let (com_g, pd_g, dom_g) = fri::commit_vec(pcs, &g);
+    let (com_g, pd_g, dom_g) = fri::commit_vec(&ctx.pcs, &g);
     let b_s: Fp = s.iter().zip(&g).map(|(&sj, &gj)| sj * gj).sum();
     let sr: Vec<Fp> = (0..next_pow2(n)).map(|i| s[i] * r[i]).collect();
-    let c: Fp = g.iter().zip(&b).map(|(&gk, &bk)| gk * bk).sum();
+    let c: Fp = g.iter().zip(b).map(|(&gk, &bk)| gk * bk).sum();
 
-    let diag_g = prove_inner_product_committed_given(pcs, challenger, &com_g, &pd_g, dom_g, &g, &s);
-    let diag_a =
-        prove_inner_product_committed_given(pcs, challenger, &com_a, &pd_a, dom_a, &a, &sr);
-    let out_claim =
-        prove_inner_product_committed_given(pcs, challenger, &com_out, &pd_out, dom_out, &out, &r);
-    let ipa = prove_ipa_committed(pcs, challenger, &g, &b, c);
+    let diag_g = prove_inner_product_committed_given(ctx, &com_g, &pd_g, dom_g, &g, &s);
+    let diag_a = prove_inner_product_committed_given(ctx, com_a, pd_a, dom_a, a, &sr);
+    let out_claim = prove_inner_product_committed_given(ctx, com_out, pd_out, dom_out, out, &r);
+    let ipa = prove_ipa_committed_given(ctx, &com_g, &pd_g, dom_g, com_b, pd_b, dom_b, &g, b, c);
 
     MulProof {
         n,
-        com_a,
+        com_a: com_a.clone(),
         dom_a,
-        com_b,
+        com_b: com_b.clone(),
         dom_b,
-        com_out,
+        com_out: com_out.clone(),
         dom_out,
         com_g,
         dom_g,
@@ -106,7 +126,12 @@ pub fn prove_mul_committed(
     }
 }
 
-pub fn verify_mul_committed(pcs: &Pcs, challenger: &Challenger, proof: &MulProof) -> bool {
+pub fn verify_mul_committed(
+    challenger: &Challenger,
+    proof: &MulProof,
+    values: &[Ext],
+    acc: &mut Openings,
+) -> bool {
     let n = proof.n;
 
     let mut tr = fri::Transcript::new(challenger);
@@ -119,43 +144,43 @@ pub fn verify_mul_committed(pcs: &Pcs, challenger: &Challenger, proof: &MulProof
     s.resize(next_pow2(n), Fp::ZERO);
     let sr: Vec<Fp> = (0..next_pow2(n)).map(|i| s[i] * r[i]).collect();
 
-    // g = r ⊙ a (diagonal).
     if !verify_inner_product_committed(
-        pcs,
         challenger,
         &proof.com_g,
         proof.dom_g,
         &s,
         proof.b_s,
         &proof.diag_g,
+        values,
+        acc,
     ) {
         return false;
     }
     if !verify_inner_product_committed(
-        pcs,
         challenger,
         &proof.com_a,
         proof.dom_a,
         &sr,
         proof.b_s,
         &proof.diag_a,
+        values,
+        acc,
     ) {
         return false;
     }
-    // ⟨r, out⟩ = c.
     if !verify_inner_product_committed(
-        pcs,
         challenger,
         &proof.com_out,
         proof.dom_out,
         &r,
         proof.c,
         &proof.out_claim,
+        values,
+        acc,
     ) {
         return false;
     }
-    // ⟨g, b⟩ = c.
-    verify_ipa_committed(pcs, challenger, proof.c, &proof.ipa)
+    verify_ipa_committed(challenger, proof.c, &proof.ipa, values, acc)
 }
 
 #[cfg(test)]
@@ -168,22 +193,44 @@ mod tests {
 
     #[test]
     fn mul_committed_honest() {
-        let (pcs, challenger) = fri::new_pcs(1, 10);
+        let mut ctx = fri::Prover::new(1, 10);
         // a = [1,2,3,4], b = [5,6,7,8], out = a⊙b = [5,12,21,32].
         let a = [f(1), f(2), f(3), f(4)];
         let b = [f(5), f(6), f(7), f(8)];
         let out = [f(5), f(12), f(21), f(32)];
-        let proof = prove_mul_committed(&pcs, &challenger, &a, &b, &out);
-        assert!(verify_mul_committed(&pcs, &challenger, &proof));
+        let proof = prove_mul_committed(&mut ctx, &a, &b, &out);
+        let fri_proof = ctx.open_all();
+        let values = ctx.values.clone();
+        let mut acc = crate::zk::Openings::new();
+        assert!(verify_mul_committed(
+            &ctx.challenger,
+            &proof,
+            &values,
+            &mut acc
+        ));
+        assert!(fri::open_many_verify(
+            &ctx.pcs,
+            &ctx.challenger,
+            &acc,
+            &fri_proof
+        ));
     }
 
     #[test]
     fn mul_committed_rejects_wrong() {
-        let (pcs, challenger) = fri::new_pcs(1, 10);
+        let mut ctx = fri::Prover::new(1, 10);
         let a = [f(1), f(2), f(3), f(4)];
         let b = [f(5), f(6), f(7), f(8)];
         let out = [f(5), f(12), f(21), f(33)]; // out[3] should be 32
-        let proof = prove_mul_committed(&pcs, &challenger, &a, &b, &out);
-        assert!(!verify_mul_committed(&pcs, &challenger, &proof));
+        let proof = prove_mul_committed(&mut ctx, &a, &b, &out);
+        ctx.open_all();
+        let values = ctx.values.clone();
+        let mut acc = crate::zk::Openings::new();
+        assert!(!verify_mul_committed(
+            &ctx.challenger,
+            &proof,
+            &values,
+            &mut acc
+        ));
     }
 }

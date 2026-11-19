@@ -297,6 +297,101 @@ pub fn open_at_verify(
     <Pcs as PcsTrait<Challenge, Challenger>>::verify(pcs, vec![claim], proof, &mut ch).is_ok()
 }
 
+/// Batch-open many polynomials at many points with a **single** FRI proof. Each
+/// entry is `(commitment, prover_data, point)`; the prover observes every
+/// commitment into one challenger before a single `open`, so the resulting FRI
+/// proof covers all of them (no per-opening proof).
+pub fn open_many_prove(
+    pcs: &Pcs,
+    challenger: &Challenger,
+    openings: &[(Commitment, ProverData, Challenge)],
+) -> (Vec<Challenge>, Proof) {
+    let mut ch = challenger.clone();
+    for (c, _, _) in openings {
+        ch.observe(c.clone());
+    }
+    let requests: Vec<_> = openings
+        .iter()
+        .map(|(_, pd, point)| p3_commit::OpeningRequest {
+            prover_data: pd,
+            points: vec![vec![*point]],
+        })
+        .collect();
+    let (opened, proof) =
+        <Pcs as PcsTrait<Challenge, Challenger>>::open(pcs, requests, &mut ch).expect("open");
+    let values: Vec<Challenge> = opened.iter().map(|m| m[0][0][0]).collect();
+    (values, proof)
+}
+
+/// Verify a batch of openings with a **single** FRI proof. Each entry is
+/// `(commitment, domain, point, value)`; the verifier observes every commitment
+/// into one challenger (matching the prover) before a single `verify`.
+pub fn open_many_verify(
+    pcs: &Pcs,
+    challenger: &Challenger,
+    openings: &[(Commitment, Domain, Challenge, Challenge)],
+    proof: &Proof,
+) -> bool {
+    let mut ch = challenger.clone();
+    for (c, _, _, _) in openings {
+        ch.observe(c.clone());
+    }
+    let claims: Vec<_> = openings
+        .iter()
+        .map(|(c, dom, point, value)| p3_commit::CommitmentOpening {
+            commitment: c.clone(),
+            matrices: vec![p3_commit::MatrixOpening {
+                domain: *dom,
+                points: vec![p3_commit::PointOpening {
+                    point: *point,
+                    values: vec![*value],
+                }],
+            }],
+        })
+        .collect();
+    <Pcs as PcsTrait<Challenge, Challenger>>::verify(pcs, claims, proof, &mut ch).is_ok()
+}
+
+/// Prover context that accumulates FRI opening requests and opens them all in a
+/// single FRI proof at the end. This is the spine for cross-claim batching: every
+/// primitive records `(commitment, prover_data, point)` here instead of producing
+/// its own per-claim proof, and the top-level calls [`Prover::open_all`] once.
+pub struct Prover {
+    pub pcs: Pcs,
+    pub challenger: Challenger,
+    pub openings: Vec<(Commitment, ProverData, Challenge)>,
+    pub values: Vec<Challenge>,
+}
+
+impl Prover {
+    pub fn new(log_blowup: usize, num_queries: usize) -> Self {
+        let (pcs, challenger) = new_pcs(log_blowup, num_queries);
+        Prover {
+            pcs,
+            challenger,
+            openings: Vec::new(),
+            values: Vec::new(),
+        }
+    }
+
+    /// Record one opening request and return its value index (the position in the
+    /// flattened value vector returned by [`Prover::open_all`]).
+    pub fn record(&mut self, com: Commitment, pd: ProverData, point: Challenge) -> usize {
+        let idx = self.openings.len();
+        self.openings.push((com, pd, point));
+        idx
+    }
+
+    /// Open every recorded request in one FRI proof, filling `self.values` (in
+    /// record order) and returning the single shared proof.
+    pub fn open_all(&mut self) -> Proof {
+        let (values, proof) = open_many_prove(&self.pcs, &self.challenger, &self.openings);
+        self.values = values;
+        self.openings.clear();
+        proof
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -328,5 +423,50 @@ mod tests {
         // (the exact value is the committed polynomial's evaluation there).
         let point = Challenge::from(Val::new(3));
         let _ = open_at(&pcs, &challenger, &commitment, &prover_data, domain, point);
+    }
+
+    #[test]
+    fn batch_open_verify_roundtrip() {
+        let (pcs, challenger) = new_pcs(1, 10);
+        let a = digits_to_field(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        let b = digits_to_field(&[9, 10, 11, 12, 13, 14, 15, 16]);
+        let (ca, pda, da) = commit_vec(&pcs, &a);
+        let (cb, pdb, db) = commit_vec(&pcs, &b);
+        let p1 = Challenge::from(Val::new(2));
+        let p2 = Challenge::from(Val::new(5));
+        let (values, proof) = open_many_prove(
+            &pcs,
+            &challenger,
+            &[(ca.clone(), pda, p1), (cb.clone(), pdb, p2)],
+        );
+        assert_eq!(values.len(), 2);
+        assert!(open_many_verify(
+            &pcs,
+            &challenger,
+            &[(ca, da, p1, values[0]), (cb, db, p2, values[1])],
+            &proof,
+        ));
+    }
+
+    #[test]
+    fn prover_context_open_all() {
+        let mut prover = Prover::new(1, 10);
+        let a = digits_to_field(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        let b = digits_to_field(&[9, 10, 11, 12, 13, 14, 15, 16]);
+        let (ca, pda, da) = commit_vec(&prover.pcs, &a);
+        let (cb, pdb, db) = commit_vec(&prover.pcs, &b);
+        let p1 = Challenge::from(Val::new(2));
+        let p2 = Challenge::from(Val::new(5));
+        prover.record(ca.clone(), pda, p1);
+        prover.record(cb.clone(), pdb, p2);
+        let proof = prover.open_all();
+        let values = prover.values.clone();
+        assert_eq!(values.len(), 2);
+        assert!(open_many_verify(
+            &prover.pcs,
+            &prover.challenger,
+            &[(ca, da, p1, values[0]), (cb, db, p2, values[1])],
+            &proof,
+        ));
     }
 }
