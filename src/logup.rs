@@ -70,6 +70,7 @@ fn pad(mut v: Vec<Fp>, n: usize) -> Vec<Fp> {
 /// A committed public lookup table (the `ft` fingerprints). Committed once and
 /// shared across every lookup of that table, so the O(N) FRI commit happens a
 /// single time instead of per lookup.
+#[derive(Clone)]
 pub struct TableCommitment {
     pub n: usize,
     pub com_ft: fri::Commitment,

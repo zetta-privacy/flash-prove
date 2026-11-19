@@ -1,0 +1,23 @@
+{
+  "dims": {
+    "hidden": 4,
+    "vocab": 8,
+    "layers": 1,
+    "heads": 1,
+    "head_dim": 4,
+    "experts": 1,
+    "active": 1,
+    "intermediate": 8
+  },
+  "weights": [
+    { "name": "embed_tokens", "rows": 8, "cols": 4 },
+    { "name": "norm_gamma", "rows": 1, "cols": 4 },
+    { "name": "lm_head", "rows": 8, "cols": 4 }
+  ],
+  "ops": [
+    { "op": "embed", "weight": "embed_tokens", "output": "embedding" },
+    { "op": "norm", "input": "embedding", "weight": "norm_gamma", "output": "normed", "eps": 1e-6 },
+    { "op": "matmul", "input": "normed", "weight": "lm_head", "output": "logits", "shift": 4 }
+  ],
+  "cells": ["embedding", "normed", "logits"]
+}

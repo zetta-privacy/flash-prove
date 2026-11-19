@@ -56,6 +56,26 @@ pub struct Transcript {
     ch: Challenger,
 }
 
+/// Serde support for the Plonky3 FRI `Domain` (`TwoAdicMultiplicativeCoset`),
+/// which does not derive `serde`. It round-trips through `(shift, log_size)`.
+pub mod serde {
+    pub mod domain {
+        use crate::field::Fp;
+        use crate::fri::Domain;
+        use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+        pub fn serialize<S: Serializer>(d: &Domain, s: S) -> Result<S::Ok, S::Error> {
+            (d.shift(), d.log_size()).serialize(s)
+        }
+
+        pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Domain, D::Error> {
+            let (shift, log_size): (Fp, usize) = <(Fp, usize)>::deserialize(d)?;
+            Domain::new(shift, log_size)
+                .ok_or_else(|| serde::de::Error::custom("invalid FRI domain"))
+        }
+    }
+}
+
 impl Transcript {
     pub fn new(challenger: &Challenger) -> Self {
         Transcript {
@@ -73,6 +93,16 @@ impl Transcript {
         self.ch.observe(v);
     }
 
+    /// Absorb a challenge-field (extension) element, e.g. a sumcheck round
+    /// polynomial coefficient (decomposed into its base-field coordinates).
+    pub fn observe_ext(&mut self, e: Challenge) {
+        let coeffs =
+            <Challenge as p3_field::BasedVectorSpace<Val>>::as_basis_coefficients_slice(&e);
+        for &c in coeffs {
+            self.ch.observe(c);
+        }
+    }
+
     /// Sample a challenge-field element (the linear-claim point `α`).
     pub fn sample_ext(&mut self) -> Challenge {
         self.ch.sample_algebra_element()
@@ -87,6 +117,16 @@ impl Transcript {
     pub fn sample_index(&mut self, n: usize) -> usize {
         self.ch.sample_bits(n.trailing_zeros() as usize)
     }
+}
+
+/// Build a fresh challenger for the verifier, deterministically identical to the
+/// one `new_pcs`/`Prover::new` produce (same seed). The verifier needs this so it
+/// can absorb its own Fiat–Shamir inputs (e.g. the head token) without inheriting
+/// the prover's mutated challenger state.
+pub fn new_challenger() -> Challenger {
+    let mut rng = StdRng::seed_from_u64(0);
+    let perm = Perm::new_from_rng_128(&mut rng);
+    Challenger::new(perm)
 }
 
 /// Build a deterministic PCS + challenger for `log_blowup` and `num_queries`.

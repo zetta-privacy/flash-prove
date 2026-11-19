@@ -39,9 +39,10 @@ use crate::selection_committed::{
 };
 use crate::spec::{exp_q15, requant, silu, ModelSpec, Op, RECIP_Q};
 use crate::zk::{
-    prove_inner_product_committed_given, verify_inner_product_committed, InnerProductProof,
-    Openings,
+    prove_inner_product_committed_given, prove_mle_committed, verify_inner_product_committed,
+    verify_mle_committed, InnerProductProof, Openings,
 };
+use p3_challenger::CanObserve;
 use p3_field::PrimeCharacteristicRing;
 
 fn next_pow2(n: usize) -> usize {
@@ -65,6 +66,7 @@ fn f(x: i64) -> Fp {
 /// committed once over `[lo, hi]` and checked via the succinct LogUp; the
 /// parameterized lookups (norm `1/sqrt`, softmax normalize) still use the sparse
 /// O(n) form.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct CommittedConfig {
     pub requant_digits: usize,
     pub silu_lo: i64,
@@ -72,6 +74,106 @@ pub struct CommittedConfig {
     pub exp_lo: i64,
     pub sign_lo: i64,
     pub sign_hi: i64,
+    /// Bounds of the logits (the score domain of the argmax range check).
+    pub score_lo: i64,
+    pub score_hi: i64,
+}
+
+impl CommittedConfig {
+    /// Derive the lookup/range-check bounds from the actual trace, so the fixed
+    /// function tables cover exactly the values this model produces.
+    ///
+    /// * `silu_lo/hi` — the raw gate-projection inputs to `silu` (unclamped).
+    /// * `exp_lo` — the most negative `score − max` seen by causal softmax.
+    /// * `sign_lo/hi` — the MoE routing delta `score·experts − i − tau`.
+    /// * `score_lo/hi` — the head logits range.
+    ///
+    /// Both prover and verifier build the same tables from these (public) bounds, so
+    /// a bound that fails to cover the trace only ever breaks the prover's own proof.
+    pub fn derive(spec: &ModelSpec, trace: &Trace) -> Self {
+        let cells: HashMap<&str, &crate::model::Cell> = trace
+            .segments
+            .iter()
+            .flat_map(|s| s.cells.iter())
+            .map(|c| (c.name.as_str(), c))
+            .collect();
+
+        let mut silu_lo = i64::MAX;
+        let mut silu_hi = i64::MIN;
+        let mut exp_lo = 0i64;
+        let mut sign_lo = i64::MAX;
+        let mut sign_hi = i64::MIN;
+        let mut score_lo = i64::MAX;
+        let mut score_hi = i64::MIN;
+
+        if let Some(c) = cells.get("logits") {
+            for &v in &c.values {
+                score_lo = score_lo.min(v);
+                score_hi = score_hi.max(v);
+            }
+        }
+
+        for op in &spec.ops {
+            match op {
+                Op::Silu { input, .. } => {
+                    if let Some(c) = cells.get(input.as_str()) {
+                        for &v in &c.values {
+                            silu_lo = silu_lo.min(v);
+                            silu_hi = silu_hi.max(v);
+                        }
+                    }
+                }
+                Op::CausalSoftmax { input, .. } => {
+                    if let Some(c) = cells.get(input.as_str()) {
+                        let (mut mn, mut mx) = (i64::MAX, i64::MIN);
+                        for &v in &c.values {
+                            mn = mn.min(v);
+                            mx = mx.max(v);
+                        }
+                        exp_lo = exp_lo.min(mn - mx);
+                    }
+                }
+                Op::TopK { input, .. } => {
+                    if let Some(c) = cells.get(input.as_str()) {
+                        let (mut mn, mut mx) = (i64::MAX, i64::MIN);
+                        for &v in &c.values {
+                            mn = mn.min(v);
+                            mx = mx.max(v);
+                        }
+                        let e = c.cols as i64;
+                        sign_lo = sign_lo.min(-(mx - mn) * e - e);
+                        sign_hi = sign_hi.max((mx - mn) * e + e);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Fallbacks for models that omit a nonlinearity (empty table domain).
+        if silu_hi < silu_lo {
+            silu_lo = -1;
+            silu_hi = 1;
+        }
+        if sign_hi < sign_lo {
+            sign_lo = -1;
+            sign_hi = 1;
+        }
+        if score_hi < score_lo {
+            score_lo = -1;
+            score_hi = 1;
+        }
+
+        Self {
+            requant_digits: 4,
+            silu_lo,
+            silu_hi,
+            exp_lo,
+            sign_lo,
+            sign_hi,
+            score_lo,
+            score_hi,
+        }
+    }
 }
 
 /// The committed function tables (fixed-table lookups: silu / exp / sign), built
@@ -342,12 +444,14 @@ pub struct SuccinctCommittedProof {
     /// Fiat–Shamir lookup challenges α, β, so the prover cannot adapt committed data
     /// to the challenges.
     pub binding: Vec<fri::Commitment>,
-    pub head_logits: Vec<i64>,
-    pub head_r: Vec<Fp>,
-    pub head_b: Fp,
-    pub head_claim: InnerProductProof,
-    pub head_com: fri::Commitment,
-    pub head_dom: fri::Domain,
+    /// Succinct argmax: a top-1 selection over the last logits row, tied to the
+    /// committed logits, plus a `choice[head_token] == 1` point check. No full
+    /// logits row is revealed.
+    pub head_range: Lookup2LogUpProof,
+    pub head_count: InnerProductProof,
+    pub head_tie: RowTie,
+    pub head_mle: [InnerProductProof; 3],
+    pub head_max: i64,
     pub values: Vec<Ext>,
     pub fri_proof: fri::Proof,
 }
@@ -482,7 +586,7 @@ pub struct RowTie {
     pub full_dom: fri::Domain,
 }
 
-fn tie_row(ctx: &mut Prover, row: &CellCommit, full: &CellCommit, idx: &[usize]) -> RowTie {
+pub fn tie_row(ctx: &mut Prover, row: &CellCommit, full: &CellCommit, idx: &[usize]) -> RowTie {
     let d = idx.len();
     let mut tr = fri::Transcript::new(&ctx.challenger);
     tr.observe(&row.com);
@@ -519,7 +623,7 @@ fn tie_row(ctx: &mut Prover, row: &CellCommit, full: &CellCommit, idx: &[usize])
     }
 }
 
-fn verify_tie(
+pub fn verify_tie(
     challenger: &Challenger,
     idx: &[usize],
     tie: &RowTie,
@@ -564,6 +668,16 @@ pub fn prove_succinct_committed(
     assert_eq!(trace.segments.len(), 1, "single-segment trace only");
     let (cells, wmap) = commit_cells(&ctx.pcs, weights, trace);
     let l = window.len();
+
+    // Compute the head token (argmax of the last logits row) and bind it into the
+    // Fiat–Shamir transcript, so a mismatched head_token changes every downstream
+    // challenge and is rejected soundly.
+    let logits_cell = &cells["logits"];
+    let hcols = logits_cell.cols;
+    let hlast = logits_cell.rows - 1;
+    let head_scores: Vec<i64> = logits_cell.values[hlast * hcols..(hlast + 1) * hcols].to_vec();
+    let head_token = (0..hcols).max_by_key(|&j| head_scores[j]).unwrap();
+    ctx.challenger.observe(Fp::new(head_token as u64));
 
     // Bind α, β to every committed weight and cell (canonical order) so the prover
     // cannot adapt committed data to the lookup challenges.
@@ -1295,28 +1409,66 @@ pub fn prove_succinct_committed(
         }
     }
 
-    // Head check: reveal the last logits row, tied to the committed logits.
+    // Head check: prove `head_token` is the argmax of the last logits row via a
+    // succinct range check (`scores ≤ max`) + point evaluation. No full logits row is
+    // revealed, and the sign table no longer scales by vocab.
     let logits = &cells["logits"];
     let last = logits.rows - 1;
     let cols = logits.cols;
-    let head_logits: Vec<i64> = logits.values[last * cols..(last + 1) * cols].to_vec();
-    let mut tr = fri::Transcript::new(&ctx.challenger);
-    tr.observe(&logits.com);
-    let mut head_r: Vec<Fp> = (0..cols).map(|_| tr.sample_val()).collect();
-    head_r.resize(next_pow2(cols), Fp::ZERO);
-    let mut hrow = vec![Fp::ZERO; next_pow2(logits.values.len())];
-    for j in 0..cols {
-        hrow[last * cols + j] = head_r[j];
-    }
-    let head_b: Fp = hrow.iter().zip(&logits.fp).map(|(&hi, &vi)| hi * vi).sum();
-    let head_claim = prove_inner_product_committed_given(
-        ctx,
-        &logits.com,
-        &logits.pd,
-        logits.dom,
-        &logits.fp,
-        &hrow,
+    let head_scores: Vec<i64> = logits.values[last * cols..(last + 1) * cols].to_vec();
+    let head_token = (0..cols).max_by_key(|&j| head_scores[j]).unwrap();
+    let head_max = head_scores[head_token];
+
+    let srow = commit_one(&ctx.pcs, "__head_scores", 1, cols, head_scores.clone());
+    let s_idx: Vec<usize> = (last * cols..(last + 1) * cols).collect();
+    let head_tie = tie_row(ctx, &srow, logits, &s_idx);
+
+    // Range check: `ones[j] = sign(head_max − scores[j])` for all j, so every score
+    // is ≤ head_max. The sign table is over the *score* range (O(|score|)), not the
+    // vocab-scaled top-k delta (O(vocab·|score|)).
+    let ones_i64 = vec![1i64; cols];
+    let orow = commit_one(&ctx.pcs, "__head_ones", 1, cols, ones_i64.clone());
+    let range_table = commit_function_table(
+        &ctx.pcs,
+        |x| if head_max - x >= 0 { 1 } else { 0 },
+        cfg.score_lo,
+        cfg.score_hi,
+        alpha,
+        beta,
     );
+    let head_range = prove_lookup2_logup_given(
+        ctx,
+        &srow.com,
+        &srow.pd,
+        srow.dom,
+        &orow.com,
+        &orow.pd,
+        orow.dom,
+        &head_scores,
+        &ones_i64,
+        &range_table,
+        alpha,
+        beta,
+    );
+    // `⟨1, ones⟩ = cols` — every score passed the sign check (all ones).
+    let ones_fp = pad(vec![Fp::ONE; cols], cols);
+    let orow_fp = pad(ones_i64.iter().map(|&x| f(x)).collect(), cols);
+    let head_count =
+        prove_inner_product_committed_given(ctx, &orow.com, &orow.pd, orow.dom, &orow_fp, &ones_fp);
+
+    // scores[head_token] == head_max (point evaluation at the bound token).
+    let scores_fp = pad(head_scores.iter().map(|&x| f(x)).collect(), cols);
+    let log_cols = next_pow2(cols).trailing_zeros() as usize;
+    let point: Vec<Ext> = (0..log_cols)
+        .map(|k| {
+            if (head_token >> k) & 1 == 1 {
+                Ext::ONE
+            } else {
+                Ext::ZERO
+            }
+        })
+        .collect();
+    let head_mle = prove_mle_committed(ctx, &srow.com, &srow.pd, srow.dom, &scores_fp, &point);
 
     let fri_proof = ctx.open_all();
     let values = ctx.values.clone();
@@ -1324,12 +1476,11 @@ pub fn prove_succinct_committed(
     SuccinctCommittedProof {
         ops,
         binding,
-        head_logits,
-        head_r,
-        head_b,
-        head_claim,
-        head_com: logits.com.clone(),
-        head_dom: logits.dom,
+        head_range,
+        head_count,
+        head_tie,
+        head_mle,
+        head_max,
         values,
         fri_proof,
     }
@@ -1339,7 +1490,6 @@ pub fn prove_succinct_committed(
 
 pub fn verify_succinct_committed(
     pcs: &Pcs,
-    challenger: &Challenger,
     spec: &ModelSpec,
     window: &[usize],
     head_token: Option<usize>,
@@ -1350,6 +1500,16 @@ pub fn verify_succinct_committed(
     let fri_proof = &proof.fri_proof;
     let mut acc = crate::zk::Openings::new();
     let l = window.len();
+
+    // Bind the head token into a fresh transcript (matching the prover): a
+    // mismatched token shifts every Fiat–Shamir challenge and is rejected soundly.
+    let mut ch = fri::new_challenger();
+    match head_token {
+        Some(h) => ch.observe(Fp::new(h as u64)),
+        None => return false,
+    }
+    let challenger = &ch;
+
     let (alpha, beta) = sample_ab(challenger, &proof.binding);
     let tables = build_tables(pcs, cfg, alpha, beta, spec);
     let digit_table = commit_digit_table(pcs);
@@ -1939,43 +2099,78 @@ pub fn verify_succinct_committed(
         }
     }
 
-    // Head check: the revealed last-logits row is tied to the committed logits and
-    // head_token is its argmax.
-    let cols = proof.head_logits.len();
-    let logits_len = l * cols;
-    let mut hrow = vec![Fp::ZERO; next_pow2(logits_len)];
-    for j in 0..cols {
-        hrow[(l - 1) * cols + j] = proof.head_r[j];
+    // Head check: `head_token` is the argmax of the last logits row, via a succinct
+    // range check (`scores ≤ max`) + point evaluation.
+    let cols = proof.head_range.n;
+    // Opening order must match the prover: tie first, then range check, count, MLE.
+    let s_idx: Vec<usize> = ((l - 1) * cols..l * cols).collect();
+    if !verify_tie(challenger, &s_idx, &proof.head_tie, values, &mut acc) {
+        return false;
     }
-    let expected: Fp = proof
-        .head_r
-        .iter()
-        .zip(&proof.head_logits)
-        .map(|(&ri, &v)| ri * f(v))
-        .sum();
-    if !verify_inner_product_committed(
+    let range_table = commit_function_table(
+        pcs,
+        |x| if proof.head_max - x >= 0 { 1 } else { 0 },
+        cfg.score_lo,
+        cfg.score_hi,
+        alpha,
+        beta,
+    );
+    if !verify_lookup2_logup(
         challenger,
-        &proof.head_com,
-        proof.head_dom,
-        &hrow,
-        proof.head_b,
-        &proof.head_claim,
+        &range_table.table.com_ft,
+        range_table.table.dom_ft,
+        &proof.head_range,
         values,
         &mut acc,
-    ) || proof.head_b != expected
-    {
+    ) {
         return false;
+    }
+    let ones_fp = pad(vec![Fp::ONE; cols], cols);
+    if !verify_inner_product_committed(
+        challenger,
+        &proof.head_range.com_out,
+        proof.head_range.dom_out,
+        &ones_fp,
+        Fp::new(cols as u64),
+        &proof.head_count,
+        values,
+        &mut acc,
+    ) {
+        return false;
+    }
+    // scores[head_token] == head_max (point evaluation at the bound token).
+    match head_token {
+        Some(h) if h < cols => {
+            let log_cols = next_pow2(cols).trailing_zeros() as usize;
+            let point: Vec<Ext> = (0..log_cols)
+                .map(|k| {
+                    if (h >> k) & 1 == 1 {
+                        Ext::ONE
+                    } else {
+                        Ext::ZERO
+                    }
+                })
+                .collect();
+            if !verify_mle_committed(
+                challenger,
+                &proof.head_range.com_in,
+                proof.head_range.dom_in,
+                next_pow2(cols),
+                &point,
+                Ext::from(f(proof.head_max)),
+                &proof.head_mle,
+                values,
+                &mut acc,
+            ) {
+                return false;
+            }
+        }
+        _ => return false,
     }
     if !fri::open_many_verify(pcs, challenger, &acc, fri_proof) {
         return false;
     }
-    match head_token {
-        Some(h) => {
-            h < proof.head_logits.len()
-                && proof.head_logits[h] == *proof.head_logits.iter().max().unwrap()
-        }
-        None => false,
-    }
+    true
 }
 
 #[cfg(test)]
@@ -1989,8 +2184,12 @@ mod tests {
             silu_lo: -100,
             silu_hi: 100,
             exp_lo: -100,
+            // Sign table now only covers the MoE routing delta (`score·experts − i − tau`);
+            // the head argmax no longer scales by vocab.
             sign_lo: -100,
             sign_hi: 100,
+            score_lo: -128,
+            score_hi: 127,
         }
     }
 
@@ -2084,7 +2283,6 @@ mod tests {
         let proof = prove_succinct_committed(&mut ctx, &spec, &weights, &trace, &window, &cfg());
         assert!(verify_succinct_committed(
             &ctx.pcs,
-            &ctx.challenger,
             &spec,
             &window,
             Some(head_token),
@@ -2111,7 +2309,6 @@ mod tests {
         let wrong = (head_token + 1) % 64;
         assert!(!verify_succinct_committed(
             &ctx.pcs,
-            &ctx.challenger,
             &spec,
             &window,
             Some(wrong),
@@ -2270,7 +2467,6 @@ mod tests {
         let proof = prove_succinct_committed(&mut ctx, &spec, &weights, &trace, &window, &cfg());
         assert!(verify_succinct_committed(
             &ctx.pcs,
-            &ctx.challenger,
             &spec,
             &window,
             Some(head_token),
@@ -2401,7 +2597,6 @@ mod tests {
         let proof = prove_succinct_committed(&mut ctx, &spec, &weights, &trace, &window, &cfg());
         assert!(verify_succinct_committed(
             &ctx.pcs,
-            &ctx.challenger,
             &spec,
             &window,
             Some(head_token),

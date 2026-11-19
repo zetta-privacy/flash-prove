@@ -26,6 +26,7 @@ use crate::zk::{
     Openings,
 };
 use p3_field::PrimeCharacteristicRing;
+use std::sync::OnceLock;
 
 fn next_pow2(n: usize) -> usize {
     n.next_power_of_two()
@@ -49,10 +50,19 @@ pub fn requant(x: i64, k: u32) -> i64 {
 }
 
 /// The `{0,1}` bit table shifted `+1` → `{1,2}` (avoids the fraction-LogUp zero
-/// inverse), committed once.
-pub fn commit_bit_table(pcs: &Pcs) -> TableCommitment {
-    let ft: Vec<Fp> = (1i64..=2).map(f).collect();
-    logup::commit_table(pcs, &ft)
+/// inverse). Fixed, so its FRI commitment is precomputed and reused — the verifier
+/// no longer re-commits it.
+fn bit_table() -> &'static TableCommitment {
+    static T: OnceLock<TableCommitment> = OnceLock::new();
+    T.get_or_init(|| {
+        let (pcs, _) = crate::fri::new_pcs(1, 10);
+        let ft: Vec<Fp> = (1i64..=2).map(f).collect();
+        logup::commit_table(&pcs, &ft)
+    })
+}
+
+pub fn commit_bit_table(_pcs: &Pcs) -> TableCommitment {
+    bit_table().clone()
 }
 
 /// Bit-decomposition range check: `rem[i] ∈ [0, 2^k)` for all `i`.

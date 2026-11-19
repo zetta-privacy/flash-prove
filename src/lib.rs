@@ -7,6 +7,8 @@ pub mod ffn;
 pub mod field;
 pub mod fingerprint;
 pub mod fri;
+pub mod gkr;
+pub mod gkr_succinct;
 pub mod ipa;
 pub mod linear_code;
 pub mod logup;

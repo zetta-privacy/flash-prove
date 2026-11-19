@@ -21,6 +21,7 @@ use crate::zk::{
     Openings,
 };
 use p3_field::PrimeCharacteristicRing;
+use std::sync::OnceLock;
 
 fn next_pow2(n: usize) -> usize {
     n.next_power_of_two()
@@ -58,10 +59,20 @@ fn to_digits(mut value: i64, n: usize) -> Vec<i8> {
 
 /// The digit table `[1, 256]` (the digit range `[-128, 127]` shifted by `+129` so
 /// no entry is zero — the fraction LogUp inverts table values), committed once and
-/// shared.
-pub fn commit_digit_table(pcs: &Pcs) -> TableCommitment {
-    let ft: Vec<Fp> = (1i64..=256).map(f).collect();
-    logup::commit_table(pcs, &ft)
+/// shared. The table is fixed, so its FRI commitment is precomputed (deterministic
+/// given the fixed PCS params) and reused by both prover and verifier — the verifier
+/// no longer re-commits it.
+fn digit_table() -> &'static TableCommitment {
+    static T: OnceLock<TableCommitment> = OnceLock::new();
+    T.get_or_init(|| {
+        let (pcs, _) = crate::fri::new_pcs(1, 10);
+        let ft: Vec<Fp> = (1i64..=256).map(f).collect();
+        logup::commit_table(&pcs, &ft)
+    })
+}
+
+pub fn commit_digit_table(_pcs: &Pcs) -> TableCommitment {
+    digit_table().clone()
 }
 
 pub struct RangeCheckProof {
