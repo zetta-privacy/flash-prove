@@ -35,14 +35,14 @@
 //! `exp_q15(exp_lo) = 0` for a sufficiently negative `exp_lo`.
 
 use crate::field::{Ext, Fp};
-use crate::fri::{self, Challenger, Prover};
-use crate::logup::TableCommitment;
-use crate::lookup_logup::{
+use crate::pcs::fri::{self, Challenger, Prover};
+use crate::lookup::logup::TableCommitment;
+use crate::lookup::lookup_logup::{
     prove_lookup2_logup_given, verify_lookup2_logup, FunctionTable, Lookup2LogUpProof,
 };
-use crate::requant::{prove_requant_given, verify_requant, RequantProof};
-use crate::spec::RECIP_Q;
-use crate::zk::{
+use crate::lookup::requant::{prove_requant_given, verify_requant, RequantProof};
+use crate::model::spec::RECIP_Q;
+use crate::pcs::zk::{
     prove_inner_product_committed_given, verify_inner_product_committed, InnerProductProof,
     Openings,
 };
@@ -67,15 +67,19 @@ fn f(x: i64) -> Fp {
 
 // --- top_k ---------------------------------------------------------------------
 
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct TopKProof {
     pub n: usize, // e = number of experts
     pub k: usize,
     pub tau: i64,
     pub com_scores: fri::Commitment,
+    #[serde(with = "crate::pcs::fri::serde::domain")]
     pub dom_scores: fri::Domain,
     pub com_choice: fri::Commitment,
+    #[serde(with = "crate::pcs::fri::serde::domain")]
     pub dom_choice: fri::Domain,
     pub com_delta: fri::Commitment,
+    #[serde(with = "crate::pcs::fri::serde::domain")]
     pub dom_delta: fri::Domain,
     /// count: ⟨1, choice⟩ = k.
     pub count_claim: InnerProductProof,
@@ -88,6 +92,7 @@ pub struct TopKProof {
     /// choice = sign(δ).
     pub sign: Lookup2LogUpProof,
     pub sign_com_ft: fri::Commitment,
+    #[serde(with = "crate::pcs::fri::serde::domain")]
     pub sign_dom_ft: fri::Domain,
     pub alpha: Fp,
     pub beta: Fp,
@@ -108,7 +113,7 @@ pub fn prove_topk_committed(
     let choice_fp = pad(choice.iter().map(|&x| f(x)).collect(), n);
     let (com_scores, pd_scores, dom_scores) = fri::commit_vec(&ctx.pcs, &scores_fp);
     let (com_choice, pd_choice, dom_choice) = fri::commit_vec(&ctx.pcs, &choice_fp);
-    let sign_table = crate::lookup_logup::commit_function_table(
+    let sign_table = crate::lookup::lookup_logup::commit_function_table(
         &ctx.pcs,
         |x| if x >= 0 { 1 } else { 0 },
         sign_lo,
@@ -289,6 +294,7 @@ pub fn verify_topk_committed(
 
 // --- causal softmax ------------------------------------------------------------
 
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct CausalSoftmaxProof {
     pub n: usize, // sequence length (window)
     pub l: usize, // causal position
@@ -297,14 +303,19 @@ pub struct CausalSoftmaxProof {
     pub s: i64, // sum of exponentials
     pub exp_lo: i64,
     pub com_scores: fri::Commitment,
+    #[serde(with = "crate::pcs::fri::serde::domain")]
     pub dom_scores: fri::Domain,
     pub com_d: fri::Commitment,
+    #[serde(with = "crate::pcs::fri::serde::domain")]
     pub dom_d: fri::Domain,
     pub com_e: fri::Commitment,
+    #[serde(with = "crate::pcs::fri::serde::domain")]
     pub dom_e: fri::Domain,
     pub com_nrm: fri::Commitment,
+    #[serde(with = "crate::pcs::fri::serde::domain")]
     pub dom_nrm: fri::Domain,
     pub com_probs: fri::Commitment,
+    #[serde(with = "crate::pcs::fri::serde::domain")]
     pub dom_probs: fri::Domain,
     /// d = mask⊙scores + pub (linear).
     pub r1: Vec<Fp>,
@@ -315,12 +326,14 @@ pub struct CausalSoftmaxProof {
     /// e = exp_q15(d).
     pub exp_lk: Lookup2LogUpProof,
     pub exp_com_ft: fri::Commitment,
+    #[serde(with = "crate::pcs::fri::serde::domain")]
     pub exp_dom_ft: fri::Domain,
     /// S = ⟨mask, e⟩.
     pub sum_claim: InnerProductProof,
     /// nrm = requant(e·inv_q, Q), inv_q = round(2^(15+Q)/S).
     pub inv_q: i64,
     pub com_y: fri::Commitment, // y = e·inv_q
+    #[serde(with = "crate::pcs::fri::serde::domain")]
     pub dom_y: fri::Domain,
     pub r_y: Vec<Fp>,
     pub b_y: Fp,
@@ -354,16 +367,16 @@ pub fn prove_causal_softmax_committed(
     let probs_fp = pad(probs.iter().map(|&x| f(x)).collect(), n);
     let (com_scores, pd_scores, dom_scores) = fri::commit_vec(&ctx.pcs, &scores_fp);
     let (com_probs, pd_probs, dom_probs) = fri::commit_vec(&ctx.pcs, &probs_fp);
-    let exp_table = crate::lookup_logup::commit_function_table(
+    let exp_table = crate::lookup::lookup_logup::commit_function_table(
         &ctx.pcs,
-        crate::spec::exp_q15,
+        crate::model::spec::exp_q15,
         exp_lo,
         0,
         alpha,
         beta,
     );
-    let digit_table = crate::range_check::commit_digit_table(&ctx.pcs);
-    let bit_table = crate::requant::commit_bit_table(&ctx.pcs);
+    let digit_table = crate::lookup::range_check::commit_digit_table(&ctx.pcs);
+    let bit_table = crate::lookup::requant::commit_bit_table(&ctx.pcs);
     prove_causal_softmax_committed_given(
         ctx,
         &com_scores,
@@ -414,14 +427,14 @@ pub fn prove_causal_softmax_committed_given(
     let mut e = vec![0i64; n];
     for i in 0..n {
         d[i] = if i <= l { scores[i] - m } else { exp_table.lo };
-        e[i] = crate::spec::exp_q15(d[i]);
+        e[i] = crate::model::spec::exp_q15(d[i]);
     }
     let s: i64 = (0..=l).map(|t| e[t]).sum();
     let inv_q = ((1i64 << (RECIP_Q + 15)) as f64 / s as f64).round() as i64;
     let y_vals: Vec<i64> = e.iter().map(|&x| x * inv_q).collect();
     let nrm: Vec<i64> = y_vals
         .iter()
-        .map(|&y| crate::spec::requant(y, RECIP_Q))
+        .map(|&y| crate::model::spec::requant(y, RECIP_Q))
         .collect();
 
     let scores_fp = pad(scores.iter().map(|&x| f(x)).collect(), n);
@@ -740,7 +753,7 @@ mod tests {
         let proof = prove_topk_committed(&mut ctx, &scores, &choice, 2, tau, -1000, f(11), f(5));
         let fri_proof = ctx.open_all();
         let values = ctx.values.clone();
-        let mut acc = crate::zk::Openings::new();
+        let mut acc = crate::pcs::zk::Openings::new();
         assert!(verify_topk_committed(
             &ctx.challenger,
             &proof,
@@ -763,7 +776,7 @@ mod tests {
         let proof = prove_topk_committed(&mut ctx, &scores, &choice, 2, 80, -1000, f(11), f(5));
         ctx.open_all();
         let values = ctx.values.clone();
-        let mut acc = crate::zk::Openings::new();
+        let mut acc = crate::pcs::zk::Openings::new();
         assert!(!verify_topk_committed(
             &ctx.challenger,
             &proof,
@@ -780,7 +793,7 @@ mod tests {
         let proof = prove_topk_committed(&mut ctx, &scores, &choice, 2, 80, -1000, f(11), f(5));
         ctx.open_all();
         let values = ctx.values.clone();
-        let mut acc = crate::zk::Openings::new();
+        let mut acc = crate::pcs::zk::Openings::new();
         assert!(!verify_topk_committed(
             &ctx.challenger,
             &proof,
@@ -797,24 +810,24 @@ mod tests {
         let l = 2;
         let m = 5i64;
         let e: Vec<i64> = (0..=l)
-            .map(|t| crate::spec::exp_q15(scores[t] - m))
+            .map(|t| crate::model::spec::exp_q15(scores[t] - m))
             .collect();
         let sum: i64 = e.iter().sum();
         let mut probs = vec![0i64; 4];
         for t in 0..=l {
-            probs[t] = crate::spec::requant(
-                e[t] * ((1i64 << (crate::spec::RECIP_Q + 15)) as f64 / sum as f64).round() as i64,
-                crate::spec::RECIP_Q,
+            probs[t] = crate::model::spec::requant(
+                e[t] * ((1i64 << (crate::model::spec::RECIP_Q + 15)) as f64 / sum as f64).round() as i64,
+                crate::model::spec::RECIP_Q,
             );
         }
         let proof = prove_causal_softmax_committed(&mut ctx, &scores, &probs, l, -100, f(11), f(5));
         let fri_proof = ctx.open_all();
         let values = ctx.values.clone();
-        let mut acc = crate::zk::Openings::new();
+        let mut acc = crate::pcs::zk::Openings::new();
         assert!(verify_causal_softmax_committed(
             &ctx.challenger,
-            &crate::range_check::commit_digit_table(&ctx.pcs),
-            &crate::requant::commit_bit_table(&ctx.pcs),
+            &crate::lookup::range_check::commit_digit_table(&ctx.pcs),
+            &crate::lookup::requant::commit_bit_table(&ctx.pcs),
             &proof,
             &values,
             &mut acc,
@@ -834,25 +847,25 @@ mod tests {
         let l = 2;
         let m = 5i64;
         let e: Vec<i64> = (0..=l)
-            .map(|t| crate::spec::exp_q15(scores[t] - m))
+            .map(|t| crate::model::spec::exp_q15(scores[t] - m))
             .collect();
         let sum: i64 = e.iter().sum();
         let mut probs = vec![0i64; 4];
         for t in 0..=l {
-            probs[t] = crate::spec::requant(
-                e[t] * ((1i64 << (crate::spec::RECIP_Q + 15)) as f64 / sum as f64).round() as i64,
-                crate::spec::RECIP_Q,
+            probs[t] = crate::model::spec::requant(
+                e[t] * ((1i64 << (crate::model::spec::RECIP_Q + 15)) as f64 / sum as f64).round() as i64,
+                crate::model::spec::RECIP_Q,
             );
         }
         probs[1] += 1; // tamper
         let proof = prove_causal_softmax_committed(&mut ctx, &scores, &probs, l, -100, f(11), f(5));
         ctx.open_all();
         let values = ctx.values.clone();
-        let mut acc = crate::zk::Openings::new();
+        let mut acc = crate::pcs::zk::Openings::new();
         assert!(!verify_causal_softmax_committed(
             &ctx.challenger,
-            &crate::range_check::commit_digit_table(&ctx.pcs),
-            &crate::requant::commit_bit_table(&ctx.pcs),
+            &crate::lookup::range_check::commit_digit_table(&ctx.pcs),
+            &crate::lookup::requant::commit_bit_table(&ctx.pcs),
             &proof,
             &values,
             &mut acc,
@@ -866,25 +879,25 @@ mod tests {
         let l = 1;
         let m = *scores[..=l].iter().max().unwrap();
         let e: Vec<i64> = (0..=l)
-            .map(|t| crate::spec::exp_q15(scores[t] - m))
+            .map(|t| crate::model::spec::exp_q15(scores[t] - m))
             .collect();
         let sum: i64 = e.iter().sum();
         let mut probs = vec![0i64; 4];
         for t in 0..=l {
-            probs[t] = crate::spec::requant(
-                e[t] * ((1i64 << (crate::spec::RECIP_Q + 15)) as f64 / sum as f64).round() as i64,
-                crate::spec::RECIP_Q,
+            probs[t] = crate::model::spec::requant(
+                e[t] * ((1i64 << (crate::model::spec::RECIP_Q + 15)) as f64 / sum as f64).round() as i64,
+                crate::model::spec::RECIP_Q,
             );
         }
         probs[3] = 1; // t=3 > l should be 0
         let proof = prove_causal_softmax_committed(&mut ctx, &scores, &probs, l, -100, f(11), f(5));
         ctx.open_all();
         let values = ctx.values.clone();
-        let mut acc = crate::zk::Openings::new();
+        let mut acc = crate::pcs::zk::Openings::new();
         assert!(!verify_causal_softmax_committed(
             &ctx.challenger,
-            &crate::range_check::commit_digit_table(&ctx.pcs),
-            &crate::requant::commit_bit_table(&ctx.pcs),
+            &crate::lookup::range_check::commit_digit_table(&ctx.pcs),
+            &crate::lookup::requant::commit_bit_table(&ctx.pcs),
             &proof,
             &values,
             &mut acc,

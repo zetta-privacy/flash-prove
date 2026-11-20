@@ -1,11 +1,11 @@
 //! Succinct 2-column *function* lookup via fingerprint folding + **LogUp**.
 //!
-//! This is the O(log n) replacement for [`crate::lookup_committed`]'s sparse
+//! This is the O(log n) replacement for [`crate::lookup::lookup_committed`]'s sparse
 //! membership: it proves `out[i] = f(in[i])` for a public table `f` without
 //! revealing the `n` query indices to the verifier. Instead the verifier checks
 //!  1. the fingerprint `fp[i] = α + β·in[i] + β²·out[i]` is the fold of the
 //!     committed `in`/`out` (three linear claims), and
-//!  2. `{fp} ⊆ {ft}` via the committed LogUp ([`crate::logup`]), where `ft` is the
+//!  2. `{fp} ⊆ {ft}` via the committed LogUp ([`crate::lookup::logup`]), where `ft` is the
 //!     committed graph table `ft[j] = α + β·(lo+j) + β²·f(lo+j)`.
 //!
 //! By Schwartz–Zippel over the random `α, β`, `fp[i] ∈ {ft}` forces `out[i] =
@@ -16,9 +16,9 @@
 //! and, crucially, keep `ft[j]` nonzero so the LogUp inverses are defined.
 
 use crate::field::{Ext, Fp};
-use crate::fri::{self, Challenger, Pcs, Prover};
-use crate::logup::{self, LogUpProof, TableCommitment};
-use crate::zk::{
+use crate::pcs::fri::{self, Challenger, Pcs, Prover};
+use crate::lookup::logup::{self, LogUpProof, TableCommitment};
+use crate::pcs::zk::{
     prove_inner_product_committed_given, verify_inner_product_committed, InnerProductProof,
     Openings,
 };
@@ -65,13 +65,17 @@ pub fn commit_function_table(
     FunctionTable { lo, hi, table }
 }
 
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Lookup2LogUpProof {
     pub n: usize,
     pub com_in: fri::Commitment,
+    #[serde(with = "crate::pcs::fri::serde::domain")]
     pub dom_in: fri::Domain,
     pub com_out: fri::Commitment,
+    #[serde(with = "crate::pcs::fri::serde::domain")]
     pub dom_out: fri::Domain,
     pub com_fp: fri::Commitment,
+    #[serde(with = "crate::pcs::fri::serde::domain")]
     pub dom_fp: fri::Domain,
     pub r: Vec<Fp>,
     pub b_in: Fp,
@@ -248,7 +252,7 @@ mod tests {
         );
         let fri_proof = ctx.open_all();
         let values = ctx.values.clone();
-        let mut acc = crate::zk::Openings::new();
+        let mut acc = crate::pcs::zk::Openings::new();
         assert!(verify_lookup2_logup(
             &ctx.challenger,
             &table.table.com_ft,
@@ -283,7 +287,7 @@ mod tests {
         );
         ctx.open_all();
         let values = ctx.values.clone();
-        let mut acc = crate::zk::Openings::new();
+        let mut acc = crate::pcs::zk::Openings::new();
         assert!(!verify_lookup2_logup(
             &ctx.challenger,
             &table.table.com_ft,

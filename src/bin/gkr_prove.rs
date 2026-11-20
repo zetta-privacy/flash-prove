@@ -15,11 +15,11 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::Parser;
-use flashprove::committed_succinct::CommittedConfig;
-use flashprove::fri;
-use flashprove::gkr_succinct::{prove_gkr_succinct, verify_gkr_succinct};
+use flashprove::gkr::commit::CommittedConfig;
+use flashprove::pcs::fri;
+use flashprove::gkr::succinct::{prove_gkr_succinct, verify_gkr_succinct};
 use flashprove::model::Trace;
-use flashprove::spec::ModelSpec;
+use flashprove::model::spec::ModelSpec;
 
 #[derive(Parser)]
 struct Args {

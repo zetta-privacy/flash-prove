@@ -1,6 +1,6 @@
 //! GKR-based op-graph verifier (model-agnostic, driven by `ModelSpec`).
 //!
-//! GKR counterpart of [`crate::committed_succinct`]: walks a model's op graph and
+//! GKR counterpart of [`crate::gkr::commit`]: walks a model's op graph and
 //! checks every op against FRI-committed weights + trace, but the linear layers use
 //! the GKR/sumcheck reduction (O(depth·log n) verifier) instead of IPA.
 //!
@@ -9,35 +9,36 @@
 
 use std::collections::HashMap;
 
-use crate::committed_succinct::{
-    commit_cells, tie_row, verify_tie, CellCommit, CommittedConfig, RowTie,
-};
+use crate::field::sumcheck::mle_eval;
 use crate::field::{Ext, Fp};
-use crate::fri::{self, Challenger, Pcs, Prover};
-use crate::gkr::{
+use crate::gkr::commit::{
+    chunk_name, chunk_row_range, commit_cells, num_chunks, tie_row, verify_tie, CellCommit,
+    CommittedConfig, RowTie, TiedClaim,
+};
+use crate::gkr::protocol::{
     prove_gkr_matmul, prove_gkr_norm, verify_gkr_matmul, verify_gkr_norm, GkrMatmulProof,
     GkrNormProof,
 };
-use crate::lookup_logup::{
+use crate::lookup::lookup_logup::{
     commit_function_table, prove_lookup2_logup_given, verify_lookup2_logup, FunctionTable,
     Lookup2LogUpProof,
 };
-use crate::model::{Trace, Weights};
-use crate::mul_committed::{prove_mul_committed_given, verify_mul_committed, MulProof};
-use crate::norm_rope_committed::{prove_rope_committed, verify_rope_committed, RopeProof};
-use crate::requant::{commit_bit_table, prove_requant_given, verify_requant, RequantProof};
-use crate::selection_committed::{
+use crate::lookup::mul_committed::{prove_mul_committed_given, verify_mul_committed, MulProof};
+use crate::lookup::norm_rope_committed::{prove_rope_committed, verify_rope_committed, RopeProof};
+use crate::lookup::requant::{commit_bit_table, prove_requant_given, verify_requant, RequantProof};
+use crate::lookup::selection_committed::{
     prove_causal_softmax_committed_given, prove_topk_committed_given,
     verify_causal_softmax_committed, verify_topk_committed, CausalSoftmaxProof, TopKProof,
 };
-use crate::spec::{exp_q15, requant, silu, ModelSpec, Op};
-use crate::sumcheck::mle_eval;
-use crate::zk::{
+use crate::model::spec::{exp_q15, requant, silu, ModelSpec, Op};
+use crate::model::{Trace, Weights};
+use crate::pcs::fri::{self, Challenger, Pcs, Prover};
+use crate::pcs::zk::{
     prove_inner_product_committed_given, prove_mle_committed, verify_inner_product_committed,
     verify_mle_committed, InnerProductProof, Openings,
 };
 use p3_challenger::CanObserve;
-use p3_field::{Field, PrimeCharacteristicRing};
+use p3_field::PrimeCharacteristicRing;
 
 fn next_pow2(n: usize) -> usize {
     n.next_power_of_two()
@@ -60,31 +61,39 @@ fn log2(x: usize) -> usize {
     x.trailing_zeros() as usize
 }
 
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct EmbedProof {
     pub r: Vec<Fp>,
     pub b_out: Fp,
-    pub b_emb: Fp,
+    pub b_emb: Vec<Fp>,
     pub claim_out: InnerProductProof,
-    pub claim_emb: InnerProductProof,
+    pub claim_emb: Vec<InnerProductProof>,
     pub com_out: fri::Commitment,
+    #[serde(with = "crate::pcs::fri::serde::domain")]
     pub dom_out: fri::Domain,
-    pub com_emb: fri::Commitment,
-    pub dom_emb: fri::Domain,
+    pub com_emb: Vec<fri::Commitment>,
+    #[serde(with = "crate::pcs::fri::serde::domain_vec")]
+    pub dom_emb: Vec<fri::Domain>,
     pub l: usize,
     pub hidden: usize,
     pub vocab: usize,
 }
 
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct MatmulOpProof {
     pub mm: GkrMatmulProof,
     pub req: RequantProof,
     pub com_w: fri::Commitment,
+    #[serde(with = "crate::pcs::fri::serde::domain")]
     pub dom_w: fri::Domain,
     pub com_wb: fri::Commitment,
+    #[serde(with = "crate::pcs::fri::serde::domain")]
     pub dom_wb: fri::Domain,
     pub com_x: fri::Commitment,
+    #[serde(with = "crate::pcs::fri::serde::domain")]
     pub dom_x: fri::Domain,
     pub com_acc: fri::Commitment,
+    #[serde(with = "crate::pcs::fri::serde::domain")]
     pub dom_acc: fri::Domain,
     pub bd_u: Vec<Fp>,
     pub bd_b_wb: Fp,
@@ -94,30 +103,37 @@ pub struct MatmulOpProof {
     pub shift: u32,
 }
 
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct SiluProof {
     pub lk: Lookup2LogUpProof,
 }
 
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct AddProof {
     pub r: Vec<Fp>,
     pub b_out: Fp,
     pub claim_out: InnerProductProof,
     pub com_out: fri::Commitment,
+    #[serde(with = "crate::pcs::fri::serde::domain")]
     pub dom_out: fri::Domain,
-    pub inputs: Vec<(fri::Commitment, fri::Domain, Fp, InnerProductProof)>,
+    pub inputs: Vec<TiedClaim>,
 }
 
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct NormOpProof {
     pub np: GkrNormProof,
     pub tie_x: RowTie,
     pub com_gamma: fri::Commitment,
+    #[serde(with = "crate::pcs::fri::serde::domain")]
     pub dom_gamma: fri::Domain,
 }
 
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct RopeOpProof {
     pub rp: RopeProof,
 }
 
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ScoresOpProof {
     pub mm: GkrMatmulProof,
     pub req: RequantProof,
@@ -126,14 +142,17 @@ pub struct ScoresOpProof {
     pub mle_y: [InnerProductProof; 3],
     pub mle_dot: [InnerProductProof; 3],
     pub com_y: fri::Commitment,
+    #[serde(with = "crate::pcs::fri::serde::domain")]
     pub dom_y: fri::Domain,
     pub com_dot: fri::Commitment,
+    #[serde(with = "crate::pcs::fri::serde::domain")]
     pub dom_dot: fri::Domain,
     pub tie_q: RowTie,
     pub tie_k: RowTie,
     pub tie_out: RowTie,
 }
 
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ReshapeProof {
     pub r: Vec<Fp>,
     pub b_in: Fp,
@@ -141,37 +160,45 @@ pub struct ReshapeProof {
     pub claim_in: InnerProductProof,
     pub claim_out: InnerProductProof,
     pub com_in: fri::Commitment,
+    #[serde(with = "crate::pcs::fri::serde::domain")]
     pub dom_in: fri::Domain,
     pub com_out: fri::Commitment,
+    #[serde(with = "crate::pcs::fri::serde::domain")]
     pub dom_out: fri::Domain,
 }
 
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct CausalSoftmaxOpProof {
     pub cp: CausalSoftmaxProof,
     pub tie_in: RowTie,
     pub tie_out: RowTie,
 }
 
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct WeightedVOpProof {
     pub mm: GkrMatmulProof,
     pub req: RequantProof,
     pub com_acc: fri::Commitment,
+    #[serde(with = "crate::pcs::fri::serde::domain")]
     pub dom_acc: fri::Domain,
     pub tie_v: RowTie,
     pub tie_w: RowTie,
     pub tie_out: RowTie,
 }
 
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct MulOpProof {
     pub mul: MulProof,
 }
 
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct TopKOpProof {
     pub tp: TopKProof,
     pub tie_in: RowTie,
     pub tie_choice: RowTie,
 }
 
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct WeightedSumOpProof {
     pub r: Vec<Fp>,
     pub b_out: Fp,
@@ -185,6 +212,7 @@ pub struct WeightedSumOpProof {
     pub tie_terms: Vec<RowTie>,
 }
 
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub enum GkrOpProof {
     Embed(EmbedProof),
     Matmul(MatmulOpProof),
@@ -201,9 +229,14 @@ pub enum GkrOpProof {
     WeightedSum(WeightedSumOpProof),
 }
 
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct SuccinctGkrProof {
     pub ops: Vec<GkrOpProof>,
-    pub head_tp: TopKProof,
+    /// The committed weights (name → commitment), so the verifier can bind the
+    /// proof to the pre-shared weight commitments produced by the commit phase.
+    pub weight_coms: HashMap<String, fri::Commitment>,
+    pub head_range: Lookup2LogUpProof,
+    pub head_count: InnerProductProof,
     pub head_tie: RowTie,
     pub head_mle: [InnerProductProof; 3],
     pub head_max: i64,
@@ -388,6 +421,10 @@ pub fn prove_gkr_succinct(
 ) -> SuccinctGkrProof {
     assert_eq!(trace.segments.len(), 1, "single-segment trace only");
     let (cells, wmap) = commit_cells(&ctx.pcs, weights, trace);
+    let weight_coms: HashMap<String, fri::Commitment> = wmap
+        .iter()
+        .map(|(name, c)| (name.clone(), c.com.clone()))
+        .collect();
     let l = window.len();
 
     // Bind the head token into the transcript (matching the verifier) so a
@@ -405,7 +442,7 @@ pub fn prove_gkr_succinct(
     let alpha = Fp::new(11);
     let beta = Fp::new(5);
     let tables = build_tables(&ctx.pcs, cfg, alpha, beta);
-    let digit_table = crate::range_check::commit_digit_table(&ctx.pcs);
+    let digit_table = crate::lookup::range_check::commit_digit_table(&ctx.pcs);
     let bit_table = commit_bit_table(&ctx.pcs);
 
     let wdims: HashMap<&str, (usize, usize)> = spec
@@ -419,13 +456,15 @@ pub fn prove_gkr_succinct(
     for op in &spec.ops {
         match op {
             Op::Embed { weight, output } => {
-                let emb = &wmap[weight.as_str()];
                 let out = &cells[output.as_str()];
-                let (vocab, hidden) = (emb.rows, emb.cols);
+                let (vocab, hidden) = wdims[weight.as_str()];
                 let n = l * hidden;
+                let n_chunks = num_chunks(vocab);
                 let mut tr = fri::Transcript::new(&ctx.challenger);
                 tr.observe(&out.com);
-                tr.observe(&emb.com);
+                for i in 0..n_chunks {
+                    tr.observe(&wmap[&chunk_name(weight, vocab, i)].com);
+                }
                 let mut r: Vec<Fp> = (0..n).map(|_| tr.sample_val()).collect();
                 r.resize(next_pow2(n), Fp::ZERO);
                 let b_out: Fp = r.iter().zip(&out.fp).map(|(&ri, &vi)| ri * vi).sum();
@@ -435,23 +474,37 @@ pub fn prove_gkr_succinct(
                         h_emb[window[b] * hidden + j] += r[b * hidden + j];
                     }
                 }
-                let b_emb: Fp = h_emb.iter().zip(&emb.fp).map(|(&hi, &vi)| hi * vi).sum();
                 let claim_out = prove_inner_product_committed_given(
                     ctx, &out.com, &out.pd, out.dom, &out.fp, &r,
                 );
-                let claim_emb = prove_inner_product_committed_given(
-                    ctx, &emb.com, &emb.pd, emb.dom, &emb.fp, &h_emb,
-                );
+                let mut b_embs = Vec::with_capacity(n_chunks);
+                let mut claim_embs = Vec::with_capacity(n_chunks);
+                let mut com_embs = Vec::with_capacity(n_chunks);
+                let mut dom_embs = Vec::with_capacity(n_chunks);
+                for i in 0..n_chunks {
+                    let (r0, r1) = chunk_row_range(vocab, i);
+                    let emb = &wmap[&chunk_name(weight, vocab, i)];
+                    let mut hc: Vec<Fp> = h_emb[r0 * hidden..r1 * hidden].to_vec();
+                    hc.resize(next_pow2((r1 - r0) * hidden), Fp::ZERO);
+                    let b_emb = hc.iter().zip(&emb.fp).map(|(&hi, &vi)| hi * vi).sum();
+                    let claim_emb = prove_inner_product_committed_given(
+                        ctx, &emb.com, &emb.pd, emb.dom, &emb.fp, &hc,
+                    );
+                    b_embs.push(b_emb);
+                    claim_embs.push(claim_emb);
+                    com_embs.push(emb.com.clone());
+                    dom_embs.push(emb.dom);
+                }
                 ops.push(GkrOpProof::Embed(EmbedProof {
                     r,
                     b_out,
-                    b_emb,
+                    b_emb: b_embs,
                     claim_out,
-                    claim_emb,
+                    claim_emb: claim_embs,
                     com_out: out.com.clone(),
                     dom_out: out.dom,
-                    com_emb: emb.com.clone(),
-                    dom_emb: emb.dom,
+                    com_emb: com_embs,
+                    dom_emb: dom_embs,
                     l,
                     hidden,
                     vocab,
@@ -464,60 +517,59 @@ pub fn prove_gkr_succinct(
                 output,
                 shift,
             } => {
-                let w = &wmap[weight.as_str()];
-                let out_dim = w.rows;
-                let in_dim = w.cols;
+                let (out_dim, in_dim) = wdims[weight.as_str()];
                 let x = &cells[input.as_str()];
-                let out = &cells[output.as_str()];
                 let batch = x.rows;
                 assert_eq!(x.cols, in_dim);
-
-                let mut acc = vec![0i64; batch * out_dim];
-                for b in 0..batch {
-                    for r in 0..out_dim {
-                        let a: i64 = (0..in_dim)
-                            .map(|c| w.values[r * in_dim + c] as i64 * x.values[b * in_dim + c])
-                            .sum();
-                        acc[b * out_dim + r] = a;
+                let n_chunks = num_chunks(out_dim);
+                for ci in 0..n_chunks {
+                    let (r0, r1) = chunk_row_range(out_dim, ci);
+                    let chunk_rows = r1 - r0;
+                    let w = &wmap[&chunk_name(weight, out_dim, ci)];
+                    let mut acc = vec![0i64; batch * chunk_rows];
+                    for b in 0..batch {
+                        for r in 0..chunk_rows {
+                            let a: i64 = (0..in_dim)
+                                .map(|c| w.values[r * in_dim + c] as i64 * x.values[b * in_dim + c])
+                                .sum();
+                            acc[b * chunk_rows + r] = a;
+                        }
                     }
+                    let acc_cell = commit_one(&ctx.pcs, "__acc", batch, chunk_rows, acc.clone());
+                    let (mm, com_wb, dom_wb, u, bd_b_wb, bd_b_w, bd_claim_wb, bd_claim_w) =
+                        prove_gkr_batched_matmul(ctx, w, x, &acc_cell, batch, chunk_rows, in_dim);
+                    let out_vals: Vec<i64> = acc.iter().map(|&a| requant(a, *shift)).collect();
+                    let req = prove_requant_given(
+                        ctx,
+                        &acc_cell.com,
+                        &acc_cell.pd,
+                        acc_cell.dom,
+                        &acc,
+                        &out_vals,
+                        *shift,
+                        cfg.requant_digits,
+                        &digit_table,
+                        &bit_table,
+                    );
+                    ops.push(GkrOpProof::Matmul(MatmulOpProof {
+                        mm,
+                        req,
+                        com_w: w.com.clone(),
+                        dom_w: w.dom,
+                        com_wb,
+                        dom_wb,
+                        com_x: x.com.clone(),
+                        dom_x: x.dom,
+                        com_acc: acc_cell.com.clone(),
+                        dom_acc: acc_cell.dom,
+                        bd_u: u,
+                        bd_b_wb,
+                        bd_b_w,
+                        bd_claim_wb,
+                        bd_claim_w,
+                        shift: *shift,
+                    }));
                 }
-                let acc_cell = commit_one(&ctx.pcs, "__acc", batch, out_dim, acc.clone());
-
-                let (mm, com_wb, dom_wb, u, bd_b_wb, bd_b_w, bd_claim_wb, bd_claim_w) =
-                    prove_gkr_batched_matmul(ctx, w, x, &acc_cell, batch, out_dim, in_dim);
-
-                let out_vals: Vec<i64> = acc.iter().map(|&a| requant(a, *shift)).collect();
-                let req = prove_requant_given(
-                    ctx,
-                    &acc_cell.com,
-                    &acc_cell.pd,
-                    acc_cell.dom,
-                    &acc,
-                    &out_vals,
-                    *shift,
-                    cfg.requant_digits,
-                    &digit_table,
-                    &bit_table,
-                );
-
-                ops.push(GkrOpProof::Matmul(MatmulOpProof {
-                    mm,
-                    req,
-                    com_w: w.com.clone(),
-                    dom_w: w.dom,
-                    com_wb,
-                    dom_wb,
-                    com_x: x.com.clone(),
-                    dom_x: x.dom,
-                    com_acc: acc_cell.com.clone(),
-                    dom_acc: acc_cell.dom,
-                    bd_u: u,
-                    bd_b_wb,
-                    bd_b_w,
-                    bd_claim_wb,
-                    bd_claim_w,
-                    shift: *shift,
-                }));
                 let mut s = shapes[input.as_str()].clone();
                 let n = s.len();
                 s[n - 1] = out_dim;
@@ -564,7 +616,12 @@ pub fn prove_gkr_succinct(
                     let bi: Fp = r.iter().zip(&c.fp).map(|(&ri, &vi)| ri * vi).sum();
                     let cl =
                         prove_inner_product_committed_given(ctx, &c.com, &c.pd, c.dom, &c.fp, &r);
-                    ins.push((c.com.clone(), c.dom, bi, cl));
+                    ins.push(TiedClaim {
+                        com: c.com.clone(),
+                        dom: c.dom,
+                        b: bi,
+                        claim: cl,
+                    });
                 }
                 ops.push(GkrOpProof::Add(AddProof {
                     r,
@@ -698,7 +755,7 @@ pub fn prove_gkr_succinct(
                 let qc = &cells[q.as_str()];
                 let kc = &cells[k.as_str()];
                 let sc = &cells[output.as_str()];
-                let inv_q = ((1i64 << crate::spec::RECIP_Q) as f64 / scale).round() as i64;
+                let inv_q = ((1i64 << crate::model::spec::RECIP_Q) as f64 / scale).round() as i64;
                 for li in 0..lq {
                     for hi in 0..h {
                         let qlh: Vec<i64> =
@@ -715,7 +772,7 @@ pub fn prove_gkr_succinct(
                         let y: Vec<i64> = dot.iter().map(|&v| v * inv_q).collect();
                         let srow: Vec<i64> = y
                             .iter()
-                            .map(|&v| requant(v, crate::spec::RECIP_Q))
+                            .map(|&v| requant(v, crate::model::spec::RECIP_Q))
                             .collect();
                         let qlh_c = commit_one(&ctx.pcs, "__scores_q", 1, d, qlh.clone());
                         let kh_c = commit_one(&ctx.pcs, "__scores_k", lq, d, kh.clone());
@@ -763,7 +820,7 @@ pub fn prove_gkr_succinct(
                             y_c.dom,
                             &y,
                             &srow,
-                            crate::spec::RECIP_Q,
+                            crate::model::spec::RECIP_Q,
                             cfg.requant_digits,
                             &digit_table,
                             &bit_table,
@@ -1056,51 +1113,56 @@ pub fn prove_gkr_succinct(
                 }
                 shapes.insert(output.as_str(), vec![seq, hidden]);
             }
-            _ => {
-                panic!("gkr op not yet implemented");
-            }
         }
     }
 
-    // Head argmax (top-1 + MLE, same as committed_succinct).
+    // Head argmax: prove `head_token` is the argmax of the last logits row via a
+    // succinct range check (`scores ≤ max`) + point evaluation. The range table is
+    // over the *score* range (O(|score|)), not the vocab-scaled top-k delta.
     let logits = &cells["logits"];
     let last = logits.rows - 1;
     let cols = logits.cols;
     let head_scores: Vec<i64> = logits.values[last * cols..(last + 1) * cols].to_vec();
     let head_max = head_scores[head_token];
-    let mut choice = vec![0i64; cols];
-    choice[head_token] = 1;
-    let adj: Vec<i64> = (0..cols)
-        .map(|i| head_scores[i] * cols as i64 - i as i64)
-        .collect();
-    let mut adj_sorted = adj.clone();
-    adj_sorted.sort_unstable_by(|a, b| b.cmp(a));
-    let tau = if cols > 1 {
-        adj_sorted[1] + 1
-    } else {
-        adj_sorted[0] - 1
-    };
+
     let srow = commit_one(&ctx.pcs, "__head_scores", 1, cols, head_scores.clone());
-    let crow = commit_one(&ctx.pcs, "__head_choice", 1, cols, choice.clone());
-    let head_tp = prove_topk_committed_given(
+    let s_idx: Vec<usize> = (last * cols..(last + 1) * cols).collect();
+    let head_tie = tie_row(ctx, &srow, logits, &s_idx);
+
+    // Range check: `ones[j] = sign(head_max − scores[j])` for all j, so every score
+    // is ≤ head_max.
+    let ones_i64 = vec![1i64; cols];
+    let orow = commit_one(&ctx.pcs, "__head_ones", 1, cols, ones_i64.clone());
+    let range_table = commit_function_table(
+        &ctx.pcs,
+        |x| if head_max - x >= 0 { 1 } else { 0 },
+        cfg.score_lo,
+        cfg.score_hi,
+        alpha,
+        beta,
+    );
+    let head_range = prove_lookup2_logup_given(
         ctx,
         &srow.com,
         &srow.pd,
         srow.dom,
-        &crow.com,
-        &crow.pd,
-        crow.dom,
+        &orow.com,
+        &orow.pd,
+        orow.dom,
         &head_scores,
-        &choice,
-        1,
-        tau,
-        &tables.sign,
+        &ones_i64,
+        &range_table,
         alpha,
         beta,
     );
-    let s_idx: Vec<usize> = (last * cols..(last + 1) * cols).collect();
-    let head_tie = tie_row(ctx, &srow, logits, &s_idx);
-    let choice_fp = pad(choice.iter().map(|&x| f(x)).collect(), cols);
+    // `⟨1, ones⟩ = cols` — every score passed the sign check (all ones).
+    let ones_fp = pad(vec![Fp::ONE; cols], cols);
+    let orow_fp = pad(ones_i64.iter().map(|&x| f(x)).collect(), cols);
+    let head_count =
+        prove_inner_product_committed_given(ctx, &orow.com, &orow.pd, orow.dom, &orow_fp, &ones_fp);
+
+    // scores[head_token] == head_max (point evaluation at the bound token).
+    let scores_fp = pad(head_scores.iter().map(|&x| f(x)).collect(), cols);
     let log_cols = log2(next_pow2(cols));
     let point: Vec<Ext> = (0..log_cols)
         .map(|k| {
@@ -1111,14 +1173,16 @@ pub fn prove_gkr_succinct(
             }
         })
         .collect();
-    let head_mle = prove_mle_committed(ctx, &crow.com, &crow.pd, crow.dom, &choice_fp, &point);
+    let head_mle = prove_mle_committed(ctx, &srow.com, &srow.pd, srow.dom, &scores_fp, &point);
 
     let fri_proof = ctx.open_all();
     let values = ctx.values.clone();
 
     SuccinctGkrProof {
         ops,
-        head_tp,
+        weight_coms,
+        head_range,
+        head_count,
         head_tie,
         head_mle,
         head_max,
@@ -1150,7 +1214,7 @@ pub fn verify_gkr_succinct(
     let alpha = Fp::new(11);
     let beta = Fp::new(5);
     let tables = build_tables(pcs, cfg, alpha, beta);
-    let digit_table = crate::range_check::commit_digit_table(pcs);
+    let digit_table = crate::lookup::range_check::commit_digit_table(pcs);
     let bit_table = commit_bit_table(pcs);
 
     let wdims: HashMap<&str, (usize, usize)> = spec
@@ -1170,9 +1234,17 @@ pub fn verify_gkr_succinct(
                 };
                 idx += 1;
                 let (vocab, hidden) = wdims[weight.as_str()];
+                let n_chunks = num_chunks(vocab);
+                for i in 0..n_chunks {
+                    if proof.weight_coms.get(&chunk_name(weight, vocab, i)) != Some(&p.com_emb[i]) {
+                        return false;
+                    }
+                }
                 let mut tr = fri::Transcript::new(challenger);
                 tr.observe(&p.com_out);
-                tr.observe(&p.com_emb);
+                for com in &p.com_emb {
+                    tr.observe(com);
+                }
                 let mut r: Vec<Fp> = (0..l * hidden).map(|_| tr.sample_val()).collect();
                 r.resize(next_pow2(l * hidden), Fp::ZERO);
                 let mut h_emb = vec![Fp::ZERO; next_pow2(vocab * hidden)];
@@ -1190,17 +1262,25 @@ pub fn verify_gkr_succinct(
                     &p.claim_out,
                     values,
                     &mut acc,
-                ) || !verify_inner_product_committed(
-                    challenger,
-                    &p.com_emb,
-                    p.dom_emb,
-                    &h_emb,
-                    p.b_emb,
-                    &p.claim_emb,
-                    values,
-                    &mut acc,
                 ) {
                     return false;
+                }
+                for i in 0..n_chunks {
+                    let (r0, r1) = chunk_row_range(vocab, i);
+                    let mut hc: Vec<Fp> = h_emb[r0 * hidden..r1 * hidden].to_vec();
+                    hc.resize(next_pow2((r1 - r0) * hidden), Fp::ZERO);
+                    if !verify_inner_product_committed(
+                        challenger,
+                        &p.com_emb[i],
+                        p.dom_emb[i],
+                        &hc,
+                        p.b_emb[i],
+                        &p.claim_emb[i],
+                        values,
+                        &mut acc,
+                    ) {
+                        return false;
+                    }
                 }
                 shapes.insert(output.as_str(), vec![l, hidden]);
             }
@@ -1210,46 +1290,54 @@ pub fn verify_gkr_succinct(
                 output,
                 shift,
             } => {
-                let p = match &proof.ops[idx] {
-                    GkrOpProof::Matmul(p) => p,
-                    _ => return false,
-                };
-                idx += 1;
                 let (out_dim, in_dim) = wdims[weight.as_str()];
                 let batch = shapes[input.as_str()][0];
-                if !verify_gkr_batched_matmul(
-                    challenger,
-                    &p.com_w,
-                    p.dom_w,
-                    &p.com_wb,
-                    p.dom_wb,
-                    &p.com_x,
-                    p.dom_x,
-                    &p.com_acc,
-                    p.dom_acc,
-                    batch,
-                    out_dim,
-                    in_dim,
-                    &p.mm,
-                    &p.bd_u,
-                    p.bd_b_wb,
-                    p.bd_b_w,
-                    &p.bd_claim_wb,
-                    &p.bd_claim_w,
-                    values,
-                    &mut acc,
-                ) {
-                    return false;
-                }
-                if !verify_requant(
-                    challenger,
-                    &digit_table,
-                    &bit_table,
-                    &p.req,
-                    values,
-                    &mut acc,
-                ) {
-                    return false;
+                let n_chunks = num_chunks(out_dim);
+                for ci in 0..n_chunks {
+                    let (r0, r1) = chunk_row_range(out_dim, ci);
+                    let chunk_rows = r1 - r0;
+                    let p = match &proof.ops[idx] {
+                        GkrOpProof::Matmul(p) => p,
+                        _ => return false,
+                    };
+                    idx += 1;
+                    if proof.weight_coms.get(&chunk_name(weight, out_dim, ci)) != Some(&p.com_w) {
+                        return false;
+                    }
+                    if !verify_gkr_batched_matmul(
+                        challenger,
+                        &p.com_w,
+                        p.dom_w,
+                        &p.com_wb,
+                        p.dom_wb,
+                        &p.com_x,
+                        p.dom_x,
+                        &p.com_acc,
+                        p.dom_acc,
+                        batch,
+                        chunk_rows,
+                        in_dim,
+                        &p.mm,
+                        &p.bd_u,
+                        p.bd_b_wb,
+                        p.bd_b_w,
+                        &p.bd_claim_wb,
+                        &p.bd_claim_w,
+                        values,
+                        &mut acc,
+                    ) {
+                        return false;
+                    }
+                    if !verify_requant(
+                        challenger,
+                        &digit_table,
+                        &bit_table,
+                        &p.req,
+                        values,
+                        &mut acc,
+                    ) {
+                        return false;
+                    }
                 }
                 let mut s = shapes[input.as_str()].clone();
                 let n = s.len();
@@ -1284,8 +1372,8 @@ pub fn verify_gkr_succinct(
                 let n = shapes[inputs[0].as_str()].iter().product::<usize>();
                 let mut tr = fri::Transcript::new(challenger);
                 tr.observe(&p.com_out);
-                for (com, _, _, _) in &p.inputs {
-                    tr.observe(com);
+                for tc in &p.inputs {
+                    tr.observe(&tc.com);
                 }
                 let mut r: Vec<Fp> = (0..n).map(|_| tr.sample_val()).collect();
                 r.resize(next_pow2(n), Fp::ZERO);
@@ -1302,13 +1390,13 @@ pub fn verify_gkr_succinct(
                     return false;
                 }
                 let mut b_sum = Fp::ZERO;
-                for (com, dom, bi, cl) in &p.inputs {
+                for tc in &p.inputs {
                     if !verify_inner_product_committed(
-                        challenger, com, *dom, &r, *bi, cl, values, &mut acc,
+                        challenger, &tc.com, tc.dom, &r, tc.b, &tc.claim, values, &mut acc,
                     ) {
                         return false;
                     }
-                    b_sum += *bi;
+                    b_sum += tc.b;
                 }
                 if p.b_out != b_sum {
                     return false;
@@ -1329,6 +1417,9 @@ pub fn verify_gkr_succinct(
                         _ => return false,
                     };
                     idx += 1;
+                    if proof.weight_coms.get(weight.as_str()) != Some(&p.com_gamma) {
+                        return false;
+                    }
                     let x_idx: Vec<usize> = (b * hidden..(b + 1) * hidden).collect();
                     if !verify_tie(challenger, &x_idx, &p.tie_x, values, &mut acc) {
                         return false;
@@ -1423,7 +1514,7 @@ pub fn verify_gkr_succinct(
             } => {
                 let qsh = shapes[q.as_str()].clone();
                 let (lq, h, d) = (qsh[0], qsh[1], qsh[2]);
-                let inv_q = ((1i64 << crate::spec::RECIP_Q) as f64 / scale).round() as i64;
+                let inv_q = ((1i64 << crate::model::spec::RECIP_Q) as f64 / scale).round() as i64;
                 for li in 0..lq {
                     for hi in 0..h {
                         let p = match &proof.ops[idx] {
@@ -1706,19 +1797,49 @@ pub fn verify_gkr_succinct(
                 }
                 shapes.insert(output.as_str(), vec![seq, hidden]);
             }
-            _ => return false,
         }
     }
 
-    // Head argmax.
-    let cols = proof.head_tp.n;
-    if !verify_topk_committed(challenger, &proof.head_tp, values, &mut acc) {
-        return false;
-    }
+    // Head argmax: `head_token` is the argmax of the last logits row, via a succinct
+    // range check (`scores ≤ max`) + point evaluation.
+    let cols = proof.head_range.n;
+    // Opening order must match the prover: tie, then range check, count, MLE.
     let s_idx: Vec<usize> = ((l - 1) * cols..l * cols).collect();
     if !verify_tie(challenger, &s_idx, &proof.head_tie, values, &mut acc) {
         return false;
     }
+    let range_table = commit_function_table(
+        pcs,
+        |x| if proof.head_max - x >= 0 { 1 } else { 0 },
+        cfg.score_lo,
+        cfg.score_hi,
+        alpha,
+        beta,
+    );
+    if !verify_lookup2_logup(
+        challenger,
+        &range_table.table.com_ft,
+        range_table.table.dom_ft,
+        &proof.head_range,
+        values,
+        &mut acc,
+    ) {
+        return false;
+    }
+    let ones_fp = pad(vec![Fp::ONE; cols], cols);
+    if !verify_inner_product_committed(
+        challenger,
+        &proof.head_range.com_out,
+        proof.head_range.dom_out,
+        &ones_fp,
+        Fp::new(cols as u64),
+        &proof.head_count,
+        values,
+        &mut acc,
+    ) {
+        return false;
+    }
+    // scores[head_token] == head_max (point evaluation at the bound token).
     match head_token {
         Some(h) if h < cols => {
             let log_cols = log2(next_pow2(cols));
@@ -1733,11 +1854,11 @@ pub fn verify_gkr_succinct(
                 .collect();
             if !verify_mle_committed(
                 challenger,
-                &proof.head_tp.com_choice,
-                proof.head_tp.dom_choice,
+                &proof.head_range.com_in,
+                proof.head_range.dom_in,
                 next_pow2(cols),
                 &point,
-                Ext::ONE,
+                Ext::from(f(proof.head_max)),
                 &proof.head_mle,
                 values,
                 &mut acc,
@@ -1753,8 +1874,8 @@ pub fn verify_gkr_succinct(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::spec::{exp_q15, rmsnorm_vec, rope_apply, round_div, RECIP_Q};
     use crate::model::{Cell, Segment, WeightMatrix};
-    use crate::spec::{exp_q15, rmsnorm_vec, rope_apply, round_div, RECIP_Q};
 
     fn cfg() -> CommittedConfig {
         CommittedConfig {
@@ -1847,7 +1968,7 @@ mod tests {
     #[test]
     fn gkr_succinct_honest() {
         let mut ctx = fri::Prover::new(1, 10);
-        let spec: ModelSpec = serde_json::from_str(include_str!("../specs/demo.json")).unwrap();
+        let spec: ModelSpec = serde_json::from_str(include_str!("../../specs/demo.json")).unwrap();
         let mut seed = 12345u64;
         let weights = demo_weights(&mut seed);
         let window = [3, 17, 42, 9];
@@ -1873,7 +1994,7 @@ mod tests {
     fn gkr_succinct_norm_honest() {
         let mut ctx = fri::Prover::new(1, 10);
         let spec: ModelSpec =
-            serde_json::from_str(include_str!("../specs/norm_demo.json")).unwrap();
+            serde_json::from_str(include_str!("../../specs/norm_demo.json")).unwrap();
         let mut seed = 7u64;
         let weights = vec![
             WeightMatrix::new("embed_tokens", 8, 4, rand_i8(&mut seed, 8 * 4)),
@@ -1894,7 +2015,11 @@ mod tests {
         }
         let mut normed = vec![0i64; l * 4];
         for b in 0..l {
-            let row = crate::spec::rmsnorm_vec(&embedding[b * 4..(b + 1) * 4], &gamma.values, 1e-6);
+            let row = crate::model::spec::rmsnorm_vec(
+                &embedding[b * 4..(b + 1) * 4],
+                &gamma.values,
+                1e-6,
+            );
             normed[b * 4..(b + 1) * 4].copy_from_slice(&row);
         }
         let mut logits = vec![0i64; l * 8];

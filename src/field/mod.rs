@@ -2,10 +2,13 @@
 //! degree-3 extension E = F[x]/(x³ − x − 1), used for out-of-domain samples and
 //! challenges (paper Table 2, Definition 4.3).
 
+pub mod arith;
+pub mod sumcheck;
+
 pub use p3_field::extension::CubicTrinomialExtensionField;
 pub use p3_goldilocks::Goldilocks as Fp;
 
-use p3_field::PrimeField64;
+use p3_field::PrimeCharacteristicRing;
 
 /// A base-field element from a canonical (already-reduced) integer.
 pub fn from_u64(v: u64) -> Fp {
@@ -18,6 +21,19 @@ pub fn from_u64(v: u64) -> Fp {
 /// extension. This uses Plonky3's native cubic extension so the OOD samples and
 /// the FRI challenge field are the *same* field.
 pub type Ext = CubicTrinomialExtensionField<Fp>;
+
+/// The multilinear equality polynomial `eq(z, j) = ∏_k (z_k·j_k + (1−z_k)(1−j_k))`
+/// (paper Definition 4.3), the MLE basis: `eq(z, j) = 1` at the Boolean point of
+/// `j` and `0` at every other Boolean point.
+pub fn eq(z: &[Ext], j: usize) -> Ext {
+    let mut acc = Ext::ONE;
+    for (k, &zk) in z.iter().enumerate() {
+        let bit = Ext::from(Fp::new(((j >> k) & 1) as u64));
+        let factor = zk * bit + (Ext::ONE - zk) * (Ext::ONE - bit);
+        acc *= factor;
+    }
+    acc
+}
 
 /// `#[serde(with = "crate::field::fp_vec")]` for `Vec<Fp>`.
 pub mod fp_vec {

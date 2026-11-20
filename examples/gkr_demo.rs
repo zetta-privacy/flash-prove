@@ -2,9 +2,8 @@
 //! product tree. De-risks the GKR integration before wiring it (with the FRI
 //! for leaf authentication) into the succinct verifier.
 
-use p3_challenger::{CanObserve, DuplexChallenger, FieldChallenger};
+use p3_challenger::DuplexChallenger;
 use p3_field::extension::CubicTrinomialExtensionField;
-use p3_field::PrimeCharacteristicRing;
 use p3_gkr::{ProductGkrProof, ProductGkrRootShape, ProductGkrShape};
 use p3_goldilocks::{Goldilocks, Poseidon2Goldilocks};
 use rand::rngs::StdRng;

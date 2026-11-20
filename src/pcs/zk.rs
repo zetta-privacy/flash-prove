@@ -2,10 +2,9 @@
 //! built on the FRI commitment + the linear-claim bridge, replacing the O(n)
 //! `decode_exact` + full model recompute.
 
-use crate::field::{Ext, Fp};
-use crate::fri::{self, Challenger, Pcs, Prover};
-use crate::linear_code::{constant_coeff, constant_quotient, eq_components};
-use crate::protocol::eq;
+use crate::field::{eq, Ext, Fp};
+use crate::pcs::fri::{self, Challenger, Pcs, Prover};
+use crate::pcs::linear_code::{constant_coeff, constant_quotient, eq_components};
 use p3_dft::{Radix2Dit, TwoAdicSubgroupDft};
 use p3_field::{BasedVectorSpace, PrimeCharacteristicRing};
 
@@ -128,6 +127,7 @@ pub type Openings = Vec<(fri::Commitment, fri::Domain, Ext, Ext)>;
 ///     (so `P = h·v`, hence `c0` is the *right* constant coefficient), and
 ///  3. opening `P` and `Q` at a random `α` gives `P(α) = c0 + α·Q(α)` (so `c0` is
 ///     indeed the constant coefficient of `P`).
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct InnerProductProof {
     pub com_p: fri::Commitment,
     pub com_q: fri::Commitment,
@@ -270,7 +270,6 @@ pub fn batch_inner_products(h_list: &[&[Fp]], b_list: &[Fp], r: &[Fp]) -> (Vec<F
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::field::from_u64;
 
     fn f(x: u64) -> Fp {
         Fp::new(x)
@@ -323,7 +322,7 @@ mod tests {
         let claimed = mle_value(&v, &point);
         let (com_v, pd_v, dom) = fri::commit_vec(&ctx.pcs, &v);
         let proofs = prove_mle_committed(&mut ctx, &com_v, &pd_v, dom, &v, &point);
-        let fri_proof = ctx.open_all();
+        let _fri_proof = ctx.open_all();
         let values = ctx.values.clone();
         // Wrong claimed value → the basis coefficients shift, breaking the linear claims.
         let wrong = claimed + Ext::ONE;
@@ -377,7 +376,7 @@ mod tests {
         let h = [f(1), f(2), f(3), f(4)];
         let b = f(71); // ⟨h,v⟩ = 70
         let (com_v, dom, proof) = prove_inner_product_committed(&mut ctx, &v, &h);
-        let fri_proof = ctx.open_all();
+        let _fri_proof = ctx.open_all();
         let values = ctx.values.clone();
         let mut acc = Openings::new();
         assert!(!verify_inner_product_committed(
@@ -399,7 +398,7 @@ mod tests {
         let h = [f(1), f(2), f(3), f(4)];
         let b = f(70);
         let (com_v, dom, proof) = prove_inner_product_committed(&mut ctx, &v, &h);
-        let fri_proof = ctx.open_all();
+        let _fri_proof = ctx.open_all();
         let mut values = ctx.values.clone();
         // Tamper the claimed P(ω^k) value (idx+1): the P = h·v check must reject.
         values[proof.idx + 1] += Ext::ONE;
@@ -459,7 +458,7 @@ mod tests {
         // Wrong b3 = 8 (true ⟨h3, v⟩ = 7) shifts the batched claim by r[2] = 3.
         let (h, b) = batch_inner_products(&[&h1, &h2, &h3], &[f(5), f(6), f(8)], &r);
         let (com_v, dom, proof) = prove_inner_product_committed(&mut ctx, &v, &h);
-        let fri_proof = ctx.open_all();
+        let _fri_proof = ctx.open_all();
         let values = ctx.values.clone();
         let mut acc = Openings::new();
         assert!(!verify_inner_product_committed(

@@ -5,11 +5,11 @@
 //!   norm: sum_sq = ⟨x,x⟩ (IPA), h = x ⊙ gamma (mul), out = round(h · inv)
 
 use crate::field::{Ext, Fp};
-use crate::fri::{self, Challenger, Prover};
-use crate::ipa::{prove_ipa_committed, verify_ipa_committed, CommittedIpa};
-use crate::lookup_committed::{prove_lookup2_committed, verify_lookup2_committed, Lookup2Proof};
-use crate::mul_committed::{prove_mul_committed, verify_mul_committed, MulProof};
-use crate::zk::{
+use crate::pcs::fri::{self, Challenger, Prover};
+use crate::pcs::ipa::{prove_ipa_committed, verify_ipa_committed, CommittedIpa};
+use crate::lookup::lookup_committed::{prove_lookup2_committed, verify_lookup2_committed, Lookup2Proof};
+use crate::lookup::mul_committed::{prove_mul_committed, verify_mul_committed, MulProof};
+use crate::pcs::zk::{
     prove_inner_product_committed_given, verify_inner_product_committed, InnerProductProof,
     Openings,
 };
@@ -25,11 +25,14 @@ fn f(x: i64) -> Fp {
 
 // --- RoPE ---------------------------------------------------------------------
 
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct RopeProof {
     pub n: usize,
     pub com_rot: fri::Commitment,
+    #[serde(with = "crate::pcs::fri::serde::domain")]
     pub dom_rot: fri::Domain,
     pub com_inp: fri::Commitment,
+    #[serde(with = "crate::pcs::fri::serde::domain")]
     pub dom_inp: fri::Domain,
     pub r: Vec<Fp>,
     pub rt: Vec<Fp>, // R^T r (public, derived from pos/theta/r)
@@ -144,7 +147,7 @@ pub fn verify_rope_committed(
     proof.b_rot == proof.b_inp
         && verify_lookup2_committed(
             challenger,
-            |x| crate::spec::requant(x, 15),
+            |x| crate::model::spec::requant(x, 15),
             proof.req_lo,
             proof.req.alpha,
             proof.req.beta,
@@ -246,11 +249,11 @@ mod tests {
         let mut ctx = fri::Prover::new(1, 10);
         let inp = [1i64, 2];
         let mut out = inp.to_vec();
-        crate::spec::rope_apply(&mut out, 3, 10000.0);
+        crate::model::spec::rope_apply(&mut out, 3, 10000.0);
         let proof = prove_rope_committed(&mut ctx, &inp, &out, 3, 10000.0, -65_000, f(11), f(5));
         let fri_proof = ctx.open_all();
         let values = ctx.values.clone();
-        let mut acc = crate::zk::Openings::new();
+        let mut acc = crate::pcs::zk::Openings::new();
         assert!(verify_rope_committed(
             &ctx.challenger,
             &proof,
@@ -270,11 +273,11 @@ mod tests {
         let mut ctx = fri::Prover::new(1, 10);
         let x = [1i64, 2, 3, 4];
         let gamma = [1i8, 1, 1, 1];
-        let out = crate::spec::rmsnorm_vec(&x, &gamma, 1e-6);
+        let out = crate::model::spec::rmsnorm_vec(&x, &gamma, 1e-6);
         let proof = prove_norm_committed(&mut ctx, &x, &gamma, &out, 1e-6, -1000, f(11), f(5));
         let fri_proof = ctx.open_all();
         let values = ctx.values.clone();
-        let mut acc = crate::zk::Openings::new();
+        let mut acc = crate::pcs::zk::Openings::new();
         assert!(verify_norm_committed(
             &ctx.challenger,
             &proof,

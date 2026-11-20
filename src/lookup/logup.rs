@@ -16,28 +16,35 @@
 //! linear claim) and running one IPA `⟨g, diff⟩ = ⟨r, rhs⟩`.
 
 use crate::field::{Ext, Fp};
-use crate::fri::{self, Challenger, Pcs, Prover};
-use crate::ipa::{prove_ipa_committed, verify_ipa_committed, CommittedIpa};
-use crate::zk::{
+use crate::pcs::fri::{self, Challenger, Pcs, Prover};
+use crate::pcs::ipa::{prove_ipa_committed, verify_ipa_committed, CommittedIpa};
+use crate::pcs::zk::{
     prove_inner_product_committed_given, verify_inner_product_committed, InnerProductProof,
     Openings,
 };
 use p3_field::{Field, PrimeCharacteristicRing};
 
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct LogUpProof {
     pub n: usize,
     pub big_n: usize,
     pub com_fq: fri::Commitment,
+    #[serde(with = "crate::pcs::fri::serde::domain")]
     pub dom_fq: fri::Domain,
     pub com_m: fri::Commitment,
+    #[serde(with = "crate::pcs::fri::serde::domain")]
     pub dom_m: fri::Domain,
     pub com_diff_q: fri::Commitment,
+    #[serde(with = "crate::pcs::fri::serde::domain")]
     pub dom_diff_q: fri::Domain,
     pub com_diff_t: fri::Commitment,
+    #[serde(with = "crate::pcs::fri::serde::domain")]
     pub dom_diff_t: fri::Domain,
     pub com_g_q: fri::Commitment,
+    #[serde(with = "crate::pcs::fri::serde::domain")]
     pub dom_g_q: fri::Domain,
     pub com_g_t: fri::Commitment,
+    #[serde(with = "crate::pcs::fri::serde::domain")]
     pub dom_g_t: fri::Domain,
     // query side: g_q = r_q ⊙ fq, ⟨g_q, diff_q⟩ = Σ r_q
     pub diag_q_g: InnerProductProof,
@@ -376,7 +383,7 @@ mod tests {
         let proof = prove_logup_committed(&mut ctx, &fq, &m, &table);
         let fri_proof = ctx.open_all();
         let values = ctx.values.clone();
-        let mut acc = crate::zk::Openings::new();
+        let mut acc = crate::pcs::zk::Openings::new();
         assert!(verify_logup_committed(
             &ctx.challenger,
             &table.com_ft,
@@ -403,7 +410,7 @@ mod tests {
         let proof = prove_logup_committed(&mut ctx, &fq, &m, &table);
         ctx.open_all();
         let values = ctx.values.clone();
-        let mut acc = crate::zk::Openings::new();
+        let mut acc = crate::pcs::zk::Openings::new();
         assert!(!verify_logup_committed(
             &ctx.challenger,
             &table.com_ft,

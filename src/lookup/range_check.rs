@@ -14,9 +14,9 @@
 //! digit/bit decomposition plus a range membership, which is O(log n + log 256).
 
 use crate::field::{Ext, Fp};
-use crate::fri::{self, Challenger, Pcs, Prover};
-use crate::logup::{self, LogUpProof, TableCommitment};
-use crate::zk::{
+use crate::pcs::fri::{self, Challenger, Pcs, Prover};
+use crate::lookup::logup::{self, LogUpProof, TableCommitment};
+use crate::pcs::zk::{
     prove_inner_product_committed_given, verify_inner_product_committed, InnerProductProof,
     Openings,
 };
@@ -65,7 +65,7 @@ fn to_digits(mut value: i64, n: usize) -> Vec<i8> {
 fn digit_table() -> &'static TableCommitment {
     static T: OnceLock<TableCommitment> = OnceLock::new();
     T.get_or_init(|| {
-        let (pcs, _) = crate::fri::new_pcs(1, 10);
+        let (pcs, _) = crate::pcs::fri::new_pcs(1, 10);
         let ft: Vec<Fp> = (1i64..=256).map(f).collect();
         logup::commit_table(&pcs, &ft)
     })
@@ -75,12 +75,15 @@ pub fn commit_digit_table(_pcs: &Pcs) -> TableCommitment {
     digit_table().clone()
 }
 
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct RangeCheckProof {
     pub n: usize,
     pub digits: usize,
     pub com_x: fri::Commitment,
+    #[serde(with = "crate::pcs::fri::serde::domain")]
     pub dom_x: fri::Domain,
     pub com_digits: Vec<fri::Commitment>,
+    #[serde(with = "crate::pcs::fri::serde::domain_vec")]
     pub dom_digits: Vec<fri::Domain>,
     pub r: Vec<Fp>,
     pub b_x: Fp,
@@ -252,7 +255,7 @@ mod tests {
         let proof = prove_range_check_given(&mut ctx, &com_x, &pd_x, dom_x, &x, digits, &table);
         let fri_proof = ctx.open_all();
         let values = ctx.values.clone();
-        let mut acc = crate::zk::Openings::new();
+        let mut acc = crate::pcs::zk::Openings::new();
         assert!(verify_range_check(
             &ctx.challenger,
             &table,
@@ -281,7 +284,7 @@ mod tests {
         let proof = prove_range_check_given(&mut ctx, &com_x, &pd_x, dom_x, &x, digits, &table);
         ctx.open_all();
         let values = ctx.values.clone();
-        let mut acc = crate::zk::Openings::new();
+        let mut acc = crate::pcs::zk::Openings::new();
         assert!(!verify_range_check(
             &ctx.challenger,
             &table,

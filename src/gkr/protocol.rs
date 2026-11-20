@@ -14,13 +14,13 @@
 //! cells. The MLE point is `col_bits ‖ row_bits` (col bits in the low positions),
 //! since `idx = i·2^lp + j`.
 
-use crate::arith::bool_point;
+use crate::field::arith::bool_point;
 use crate::field::{Ext, Fp};
-use crate::fri::{self, Challenger, Prover};
-use crate::logup::TableCommitment;
-use crate::requant::{prove_requant_given, verify_requant, RequantProof};
-use crate::sumcheck::{mle_eval, RoundPoly, RoundPoly3};
-use crate::zk::{prove_mle_committed, verify_mle_committed, InnerProductProof, Openings};
+use crate::pcs::fri::{self, Challenger, Prover};
+use crate::lookup::logup::TableCommitment;
+use crate::lookup::requant::{prove_requant_given, verify_requant, RequantProof};
+use crate::field::sumcheck::{mle_eval, RoundPoly, RoundPoly3};
+use crate::pcs::zk::{prove_mle_committed, verify_mle_committed, InnerProductProof, Openings};
 use p3_field::{Field, PrimeCharacteristicRing};
 
 fn concat(a: &[Ext], b: &[Ext]) -> Vec<Ext> {
@@ -70,6 +70,7 @@ fn round_poly_product(p: &[Ext], q: &[Ext], lm: usize, i: usize, r_prefix: &[Ext
     interpolate_deg2(y[0], y[1], y[2])
 }
 
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct GkrMatmulProof {
     pub ln: usize,
     pub lm: usize,
@@ -133,7 +134,7 @@ pub fn prove_gkr_matmul(
     // Sumcheck over the lm contraction variables. The initial claim is the claimed
     // `C̃(r,s)` value (the prover may be proving a *wrong* `c`; the verifier rejects
     // that by the round checks + the surviving product).
-    let mut claim = c_val;
+    let mut _claim = c_val;
     let mut kstar = Vec::with_capacity(lm);
     let mut rounds = Vec::with_capacity(lm);
     for i in 0..lm {
@@ -144,7 +145,7 @@ pub fn prove_gkr_matmul(
         let ri = tr.sample_ext();
         rounds.push(round);
         kstar.push(ri);
-        claim = round.eval(ri);
+        _claim = round.eval(ri);
     }
 
     // Surviving claim: Ã(r, k*) · B̃(k*, s).
@@ -332,7 +333,7 @@ pub fn prove_gkr_2layer(
         p1[k] = matrix_mle(&w2_ext, &r, &kb);
         q1[k] = matrix_mle(&x1_ext, &kb, &[]);
     }
-    let mut claim = y_val;
+    let mut _claim = y_val;
     let mut kstar = Vec::with_capacity(d1);
     let mut rounds1 = Vec::with_capacity(d1);
     for i in 0..d1 {
@@ -343,7 +344,7 @@ pub fn prove_gkr_2layer(
         let ri = tr.sample_ext();
         rounds1.push(round);
         kstar.push(ri);
-        claim = round.eval(ri);
+        _claim = round.eval(ri);
     }
     let w2_val = mle_eval(&p1, &kstar);
     let x1_val = mle_eval(&q1, &kstar);
@@ -356,7 +357,7 @@ pub fn prove_gkr_2layer(
         p2[j] = matrix_mle(&w1_ext, &kstar, &jb);
         q2[j] = matrix_mle(&x_ext, &jb, &[]);
     }
-    let mut claim2 = x1_val;
+    let mut _claim2 = x1_val;
     let mut jstar = Vec::with_capacity(d0);
     let mut rounds2 = Vec::with_capacity(d0);
     for i in 0..d0 {
@@ -367,7 +368,7 @@ pub fn prove_gkr_2layer(
         let ri = tr.sample_ext();
         rounds2.push(round);
         jstar.push(ri);
-        claim2 = round.eval(ri);
+        _claim2 = round.eval(ri);
     }
     let w1_val = mle_eval(&p2, &jstar);
     let x_val = mle_eval(&q2, &jstar);
@@ -589,7 +590,7 @@ pub fn prove_gkr(
             p[k] = matrix_mle(&weights_ext[l], &r[l + 1], &kb);
             q[k] = matrix_mle(&zs[l], &kb, &[]);
         }
-        let mut claim = z_vals[l + 1];
+        let mut _claim = z_vals[l + 1];
         let mut rl = Vec::with_capacity(dl);
         let mut rounds = Vec::with_capacity(dl);
         for i in 0..dl {
@@ -600,7 +601,7 @@ pub fn prove_gkr(
             let ri = tr.sample_ext();
             rounds.push(round);
             rl.push(ri);
-            claim = round.eval(ri);
+            _claim = round.eval(ri);
         }
         w_vals[l] = mle_eval(&p, &rl);
         z_vals[l] = mle_eval(&q, &rl);
@@ -890,6 +891,7 @@ fn round_poly3_mul(
 }
 
 /// Committed pointwise `out[i] = a[i]·b[i]` via the degree-3 GKR sumcheck.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct GkrMulProof {
     pub n: usize,
     pub rounds: Vec<RoundPoly3>,
@@ -932,7 +934,7 @@ pub fn prove_gkr_mul(
     let out_val = mle_eval(&out_ext, &r);
 
     // Sumcheck over f(i) = eq(r,i)·a[i]·b[i], with initial claim out_val = out̃(r).
-    let mut claim = out_val;
+    let mut _claim = out_val;
     let mut istar = Vec::with_capacity(n);
     let mut rounds = Vec::with_capacity(n);
     for j in 0..n {
@@ -943,7 +945,7 @@ pub fn prove_gkr_mul(
         let rj = tr.sample_ext();
         rounds.push(round);
         istar.push(rj);
-        claim = round.eval(rj);
+        _claim = round.eval(rj);
     }
     let a_val = mle_eval(&a_ext, &istar);
     let b_val = mle_eval(&b_ext, &istar);
@@ -1039,6 +1041,7 @@ fn f_i64(x: i64) -> Fp {
     }
 }
 
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct GkrNormProof {
     pub d: usize,
     /// The proven sum of squares `sum_sq = Σ_i x[i]²` (a field element).
@@ -1046,10 +1049,13 @@ pub struct GkrNormProof {
     /// The public quantized reciprocal `inv_q = round(2^RECIP_Q / sqrt(mean_sq + eps))`.
     pub inv_q: Ext,
     pub com_x2: fri::Commitment,
+    #[serde(with = "crate::pcs::fri::serde::domain")]
     pub dom_x2: fri::Domain,
     pub com_h: fri::Commitment,
+    #[serde(with = "crate::pcs::fri::serde::domain")]
     pub dom_h: fri::Domain,
     pub com_y: fri::Commitment,
+    #[serde(with = "crate::pcs::fri::serde::domain")]
     pub dom_y: fri::Domain,
     pub mul_x2: GkrMulProof,
     pub mle_x2: [InnerProductProof; 3],
@@ -1123,7 +1129,7 @@ pub fn prove_gkr_norm(
 
     // 4. y = h · inv_q (scalar scale).
     let mean_sq = x.iter().map(|&v| (v as f64) * (v as f64)).sum::<f64>() / n as f64;
-    let inv_q_i64 = ((1i64 << crate::spec::RECIP_Q) as f64 / (mean_sq + eps).sqrt()).round() as i64;
+    let inv_q_i64 = ((1i64 << crate::model::spec::RECIP_Q) as f64 / (mean_sq + eps).sqrt()).round() as i64;
     let inv_q_ext = Ext::from(Fp::new(inv_q_i64 as u64));
     let y: Vec<i64> = h.iter().map(|&v| v * inv_q_i64).collect();
     let y_fp: Vec<Fp> = y.iter().map(|&v| f_i64(v)).collect();
@@ -1148,7 +1154,7 @@ pub fn prove_gkr_norm(
         dom_y,
         &y,
         out,
-        crate::spec::RECIP_Q,
+        crate::model::spec::RECIP_Q,
         digits,
         digit_table,
         bit_table,
@@ -1289,13 +1295,12 @@ pub fn verify_gkr_norm(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::field::from_u64;
-    use crate::lookup_logup::{
+    use crate::lookup::lookup_logup::{
         commit_function_table, prove_lookup2_logup_given, verify_lookup2_logup,
     };
-    use crate::range_check::commit_digit_table;
-    use crate::requant::commit_bit_table;
-    use crate::spec::silu;
+    use crate::lookup::range_check::commit_digit_table;
+    use crate::lookup::requant::commit_bit_table;
+    use crate::model::spec::silu;
 
     fn f(x: u64) -> Fp {
         Fp::new(x)
@@ -2033,11 +2038,11 @@ mod tests {
         let gamma = [1i64, 1, 1, 1];
         let sum_sq: i64 = x.iter().map(|&v| v * v).sum();
         let mean_sq = x.iter().map(|&v| (v as f64) * (v as f64)).sum::<f64>() / x.len() as f64;
-        let inv_q = ((1i64 << crate::spec::RECIP_Q) as f64 / (mean_sq + eps).sqrt()).round() as i64;
+        let inv_q = ((1i64 << crate::model::spec::RECIP_Q) as f64 / (mean_sq + eps).sqrt()).round() as i64;
         let y: Vec<i64> = x.iter().zip(&gamma).map(|(&v, &g)| v * g * inv_q).collect();
         let out: Vec<i64> = y
             .iter()
-            .map(|&v| crate::spec::requant(v, crate::spec::RECIP_Q))
+            .map(|&v| crate::model::spec::requant(v, crate::model::spec::RECIP_Q))
             .collect();
         assert!(sum_sq > 0);
 
@@ -2083,11 +2088,11 @@ mod tests {
         let x = [1i64, -2, 3, 4];
         let gamma = [1i64, 1, 1, 1];
         let mean_sq = x.iter().map(|&v| (v as f64) * (v as f64)).sum::<f64>() / x.len() as f64;
-        let inv_q = ((1i64 << crate::spec::RECIP_Q) as f64 / (mean_sq + eps).sqrt()).round() as i64;
+        let inv_q = ((1i64 << crate::model::spec::RECIP_Q) as f64 / (mean_sq + eps).sqrt()).round() as i64;
         let y: Vec<i64> = x.iter().zip(&gamma).map(|(&v, &g)| v * g * inv_q).collect();
         let mut out: Vec<i64> = y
             .iter()
-            .map(|&v| crate::spec::requant(v, crate::spec::RECIP_Q))
+            .map(|&v| crate::model::spec::requant(v, crate::model::spec::RECIP_Q))
             .collect();
         out[0] += 1; // wrong output
 

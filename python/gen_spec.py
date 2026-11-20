@@ -120,6 +120,7 @@ def gen_spec(cfg: dict) -> dict:
             ops.append({"op": "matmul", "input": f"{e_}.h", "weight": f"{e_}.down_proj",
                         "output": f"{e_}.down", "shift": 4})
             terms.append(f"{e_}.down")
+            cells += [f"{e_}.gate", f"{e_}.up", f"{e_}.act", f"{e_}.h", f"{e_}.down"]
         ops.append({"op": "weighted_sum", "choice": f"{p}.expert_choice",
                     "terms": terms, "output": f"{p}.moe"})
         cells.append(f"{p}.moe")

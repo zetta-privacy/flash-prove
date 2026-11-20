@@ -15,7 +15,6 @@
 
 use crate::field::{Ext, Fp};
 use p3_dft::{Radix2Dit, TwoAdicSubgroupDft};
-use p3_field::PrimeField64;
 
 /// The constant coefficient `c_0 = ⟨h, v⟩ / N` of the pointwise-product polynomial.
 pub fn constant_coeff(h: &[Fp], v: &[Fp]) -> Fp {
@@ -66,7 +65,7 @@ pub fn eq_components(point: &[Ext], n: usize) -> [Vec<Fp>; 3] {
     let mut b = Vec::with_capacity(1 << n);
     let mut c = Vec::with_capacity(1 << n);
     for j in 0..(1 << n) {
-        let e = crate::protocol::eq(point, j);
+        let e = crate::field::eq(point, j);
         let coeffs = <Ext as p3_field::BasedVectorSpace<Fp>>::as_basis_coefficients_slice(&e);
         a.push(coeffs[0]);
         b.push(coeffs[1]);
@@ -78,7 +77,6 @@ pub fn eq_components(point: &[Ext], n: usize) -> [Vec<Fp>; 3] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::field::from_u64;
 
     fn f(x: u64) -> Fp {
         Fp::new(x)
@@ -118,7 +116,7 @@ mod tests {
     #[test]
     fn linear_claim_via_fri() {
         use crate::field::Ext;
-        use crate::fri;
+        use crate::pcs::fri;
         use p3_dft::{Radix2Dit, TwoAdicSubgroupDft};
 
         let (pcs, challenger) = fri::new_pcs(1, 10);
@@ -165,7 +163,7 @@ mod tests {
     #[test]
     fn mle_eval_via_fri() {
         use crate::field::Ext;
-        use crate::fri;
+        use crate::pcs::fri;
         use p3_dft::{Radix2Dit, TwoAdicSubgroupDft};
 
         let (pcs, challenger) = fri::new_pcs(1, 10);

@@ -8,8 +8,8 @@
 //! b_hi·x`, with the new claim `c' = c + x²·L + x⁻²·R`.
 
 use crate::field::{Ext, Fp};
-use crate::fri::{self, Challenger, Pcs, Prover};
-use crate::zk::{
+use crate::pcs::fri::{self, Challenger, Prover};
+use crate::pcs::zk::{
     prove_inner_product_committed_given, verify_inner_product_committed, InnerProductProof,
     Openings,
 };
@@ -67,9 +67,11 @@ pub fn fold_coeffs(n: usize, x: &[Fp]) -> Vec<Fp> {
 /// The committed inner-product-argument proof for `⟨a, b⟩ = c` (both `a` and `b`
 /// FRI-committed). No prover material — the verifier checks this with commitments
 /// and FRI opening proofs alone.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct CommittedIpa {
     pub com_a: fri::Commitment,
     pub com_b: fri::Commitment,
+    #[serde(with = "crate::pcs::fri::serde::domain")]
     pub dom: fri::Domain,
     /// `(L_j, R_j)` per folding round.
     pub rounds: Vec<(Fp, Fp)>,
@@ -235,7 +237,6 @@ pub fn verify_ipa_committed(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::field::from_u64;
 
     fn f(x: u64) -> Fp {
         Fp::new(x)
@@ -262,8 +263,8 @@ mod tests {
 
     #[test]
     fn committed_inner_product() {
-        use crate::fri;
-        use crate::linear_code::{constant_coeff, constant_quotient};
+        use crate::pcs::fri;
+        use crate::pcs::linear_code::{constant_coeff, constant_quotient};
         use p3_dft::{Radix2Dit, TwoAdicSubgroupDft};
 
         let (pcs, challenger) = fri::new_pcs(1, 10);
@@ -271,7 +272,7 @@ mod tests {
         // a = [1,2,3,4], b = [5,6,7,8], ⟨a,b⟩ = 70.
         let a = [f(1), f(2), f(3), f(4)];
         let b = [f(5), f(6), f(7), f(8)];
-        let c = f(70);
+        let _c = f(70);
 
         // n = 2 folding challenges.
         let x = [f(9), f(10)];
@@ -301,7 +302,7 @@ mod tests {
 
     #[test]
     fn committed_ipa_honest() {
-        let mut ctx = crate::fri::Prover::new(1, 10);
+        let mut ctx = crate::pcs::fri::Prover::new(1, 10);
         // a = [1,2,3,4], b = [5,6,7,8], ⟨a,b⟩ = 70.
         let a = [f(1), f(2), f(3), f(4)];
         let b = [f(5), f(6), f(7), f(8)];
@@ -327,12 +328,12 @@ mod tests {
 
     #[test]
     fn committed_ipa_rejects_wrong_c() {
-        let mut ctx = crate::fri::Prover::new(1, 10);
+        let mut ctx = crate::pcs::fri::Prover::new(1, 10);
         let a = [f(1), f(2), f(3), f(4)];
         let b = [f(5), f(6), f(7), f(8)];
         let c = f(70);
         let proof = prove_ipa_committed(&mut ctx, &a, &b, c);
-        let fri_proof = ctx.open_all();
+        let _fri_proof = ctx.open_all();
         let values = ctx.values.clone();
         let mut acc = Openings::new();
         assert!(!verify_ipa_committed(

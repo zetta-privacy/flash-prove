@@ -9,9 +9,9 @@
 //! checked by one IPA (`⟨g, b⟩ = c`) and one linear claim (`⟨r, out⟩ = c`).
 
 use crate::field::{Ext, Fp};
-use crate::fri::{self, Challenger, Prover};
-use crate::ipa::{prove_ipa_committed_given, verify_ipa_committed, CommittedIpa};
-use crate::zk::{
+use crate::pcs::fri::{self, Challenger, Prover};
+use crate::pcs::ipa::{prove_ipa_committed_given, verify_ipa_committed, CommittedIpa};
+use crate::pcs::zk::{
     prove_inner_product_committed_given, verify_inner_product_committed, InnerProductProof,
     Openings,
 };
@@ -26,15 +26,20 @@ fn pad(mut v: Vec<Fp>, n: usize) -> Vec<Fp> {
     v
 }
 
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct MulProof {
     pub n: usize,
     pub com_a: fri::Commitment,
+    #[serde(with = "crate::pcs::fri::serde::domain")]
     pub dom_a: fri::Domain,
     pub com_b: fri::Commitment,
+    #[serde(with = "crate::pcs::fri::serde::domain")]
     pub dom_b: fri::Domain,
     pub com_out: fri::Commitment,
+    #[serde(with = "crate::pcs::fri::serde::domain")]
     pub dom_out: fri::Domain,
     pub com_g: fri::Commitment,
+    #[serde(with = "crate::pcs::fri::serde::domain")]
     pub dom_g: fri::Domain,
     /// g = r ⊙ a: ⟨s, g⟩ = b_s = ⟨s ⊙ r, a⟩.
     pub diag_g: InnerProductProof,
@@ -201,7 +206,7 @@ mod tests {
         let proof = prove_mul_committed(&mut ctx, &a, &b, &out);
         let fri_proof = ctx.open_all();
         let values = ctx.values.clone();
-        let mut acc = crate::zk::Openings::new();
+        let mut acc = crate::pcs::zk::Openings::new();
         assert!(verify_mul_committed(
             &ctx.challenger,
             &proof,
@@ -225,7 +230,7 @@ mod tests {
         let proof = prove_mul_committed(&mut ctx, &a, &b, &out);
         ctx.open_all();
         let values = ctx.values.clone();
-        let mut acc = crate::zk::Openings::new();
+        let mut acc = crate::pcs::zk::Openings::new();
         assert!(!verify_mul_committed(
             &ctx.challenger,
             &proof,

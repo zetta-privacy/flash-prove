@@ -61,7 +61,7 @@ pub struct Transcript {
 pub mod serde {
     pub mod domain {
         use crate::field::Fp;
-        use crate::fri::Domain;
+        use crate::pcs::fri::Domain;
         use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
         pub fn serialize<S: Serializer>(d: &Domain, s: S) -> Result<S::Ok, S::Error> {
@@ -72,6 +72,28 @@ pub mod serde {
             let (shift, log_size): (Fp, usize) = <(Fp, usize)>::deserialize(d)?;
             Domain::new(shift, log_size)
                 .ok_or_else(|| serde::de::Error::custom("invalid FRI domain"))
+        }
+    }
+
+    pub mod domain_vec {
+        use crate::field::Fp;
+        use crate::pcs::fri::Domain;
+        use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+        pub fn serialize<S: Serializer>(v: &[Domain], s: S) -> Result<S::Ok, S::Error> {
+            let pairs: Vec<(Fp, usize)> = v.iter().map(|d| (d.shift(), d.log_size())).collect();
+            pairs.serialize(s)
+        }
+
+        pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<Domain>, D::Error> {
+            let pairs: Vec<(Fp, usize)> = Vec::<(Fp, usize)>::deserialize(d)?;
+            pairs
+                .into_iter()
+                .map(|(shift, log_size)| {
+                    Domain::new(shift, log_size)
+                        .ok_or_else(|| serde::de::Error::custom("invalid FRI domain"))
+                })
+                .collect()
         }
     }
 }

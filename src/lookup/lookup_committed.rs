@@ -11,8 +11,8 @@
 //!  2. membership: `⟨r_mem, fp⟩ = Σ_i r_mem[i]·ft[idx[i]]` (one linear claim).
 
 use crate::field::{Ext, Fp};
-use crate::fri::{self, Challenger, Prover};
-use crate::zk::{
+use crate::pcs::fri::{self, Challenger, Prover};
+use crate::pcs::zk::{
     prove_inner_product_committed_given, verify_inner_product_committed, InnerProductProof,
     Openings,
 };
@@ -35,13 +35,17 @@ fn f(x: i64) -> Fp {
     }
 }
 
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Lookup2Proof {
     pub n: usize,
     pub com_in: fri::Commitment,
+    #[serde(with = "crate::pcs::fri::serde::domain")]
     pub dom_in: fri::Domain,
     pub com_out: fri::Commitment,
+    #[serde(with = "crate::pcs::fri::serde::domain")]
     pub dom_out: fri::Domain,
     pub com_fp: fri::Commitment,
+    #[serde(with = "crate::pcs::fri::serde::domain")]
     pub dom_fp: fri::Domain,
     pub r: Vec<Fp>,
     pub b_in: Fp,
@@ -269,7 +273,7 @@ mod tests {
         let proof = prove_lookup2_committed(&mut ctx, &inp, &out, 0, alpha, beta);
         let fri_proof = ctx.open_all();
         let values = ctx.values.clone();
-        let mut acc = crate::zk::Openings::new();
+        let mut acc = crate::pcs::zk::Openings::new();
         assert!(verify_lookup2_committed(
             &ctx.challenger,
             |x| x * x,
@@ -299,7 +303,7 @@ mod tests {
         let proof = prove_lookup2_committed(&mut ctx, &inp, &out, 0, alpha, beta);
         ctx.open_all();
         let values = ctx.values.clone();
-        let mut acc = crate::zk::Openings::new();
+        let mut acc = crate::pcs::zk::Openings::new();
         assert!(!verify_lookup2_committed(
             &ctx.challenger,
             |x| x * x,

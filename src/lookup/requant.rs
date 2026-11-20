@@ -17,11 +17,11 @@
 //!  5. `rem ∈ [0, 2^k)` via a k-bit decomposition (each bit ∈ {0,1}).
 
 use crate::field::{Ext, Fp};
-use crate::fri::{self, Challenger, Pcs, Prover};
-use crate::logup::{self, LogUpProof, TableCommitment};
-use crate::mul_committed::{prove_mul_committed_given, verify_mul_committed, MulProof};
-use crate::range_check::{prove_range_check_given, verify_range_check, RangeCheckProof};
-use crate::zk::{
+use crate::pcs::fri::{self, Challenger, Pcs, Prover};
+use crate::lookup::logup::{self, LogUpProof, TableCommitment};
+use crate::lookup::mul_committed::{prove_mul_committed_given, verify_mul_committed, MulProof};
+use crate::lookup::range_check::{prove_range_check_given, verify_range_check, RangeCheckProof};
+use crate::pcs::zk::{
     prove_inner_product_committed_given, verify_inner_product_committed, InnerProductProof,
     Openings,
 };
@@ -46,7 +46,7 @@ fn f(x: i64) -> Fp {
 }
 
 pub fn requant(x: i64, k: u32) -> i64 {
-    crate::spec::requant(x, k)
+    crate::model::spec::requant(x, k)
 }
 
 /// The `{0,1}` bit table shifted `+1` → `{1,2}` (avoids the fraction-LogUp zero
@@ -55,7 +55,7 @@ pub fn requant(x: i64, k: u32) -> i64 {
 fn bit_table() -> &'static TableCommitment {
     static T: OnceLock<TableCommitment> = OnceLock::new();
     T.get_or_init(|| {
-        let (pcs, _) = crate::fri::new_pcs(1, 10);
+        let (pcs, _) = crate::pcs::fri::new_pcs(1, 10);
         let ft: Vec<Fp> = (1i64..=2).map(f).collect();
         logup::commit_table(&pcs, &ft)
     })
@@ -66,12 +66,15 @@ pub fn commit_bit_table(_pcs: &Pcs) -> TableCommitment {
 }
 
 /// Bit-decomposition range check: `rem[i] ∈ [0, 2^k)` for all `i`.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct BitDecompProof {
     pub n: usize,
     pub k: u32,
     pub com_rem: fri::Commitment,
+    #[serde(with = "crate::pcs::fri::serde::domain")]
     pub dom_rem: fri::Domain,
     pub com_bits: Vec<fri::Commitment>,
+    #[serde(with = "crate::pcs::fri::serde::domain_vec")]
     pub dom_bits: Vec<fri::Domain>,
     pub r: Vec<Fp>,
     pub b_rem: Fp,
@@ -215,23 +218,31 @@ fn verify_bit_decomp(
     )
 }
 
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct RequantProof {
     pub n: usize,
     pub k: u32,
     pub range_x: RangeCheckProof,
     pub com_s: fri::Commitment,
+    #[serde(with = "crate::pcs::fri::serde::domain")]
     pub dom_s: fri::Domain,
     pub com_out: fri::Commitment,
+    #[serde(with = "crate::pcs::fri::serde::domain")]
     pub dom_out: fri::Domain,
     pub com_abs_x: fri::Commitment,
+    #[serde(with = "crate::pcs::fri::serde::domain")]
     pub dom_abs_x: fri::Domain,
     pub com_sx: fri::Commitment,
+    #[serde(with = "crate::pcs::fri::serde::domain")]
     pub dom_sx: fri::Domain,
     pub com_abs_out: fri::Commitment,
+    #[serde(with = "crate::pcs::fri::serde::domain")]
     pub dom_abs_out: fri::Domain,
     pub com_sout: fri::Commitment,
+    #[serde(with = "crate::pcs::fri::serde::domain")]
     pub dom_sout: fri::Domain,
     pub com_rem: fri::Commitment,
+    #[serde(with = "crate::pcs::fri::serde::domain")]
     pub dom_rem: fri::Domain,
     pub mul_ss: MulProof,   // s ⊙ s = s  (s ∈ {0,1})
     pub mul_sx: MulProof,   // sx = s ⊙ x
@@ -516,7 +527,7 @@ pub fn verify_requant(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::range_check::commit_digit_table;
+    use crate::lookup::range_check::commit_digit_table;
 
     #[test]
     fn requant_honest() {
@@ -532,7 +543,7 @@ mod tests {
         let proof = prove_requant_given(&mut ctx, &com_x, &pd_x, dom_x, &x, &out, k, 2, &dt, &bt);
         let fri_proof = ctx.open_all();
         let values = ctx.values.clone();
-        let mut acc = crate::zk::Openings::new();
+        let mut acc = crate::pcs::zk::Openings::new();
         assert!(verify_requant(
             &ctx.challenger,
             &dt,
@@ -564,7 +575,7 @@ mod tests {
         let proof = prove_requant_given(&mut ctx, &com_x, &pd_x, dom_x, &x, &wrong, k, 2, &dt, &bt);
         ctx.open_all();
         let values = ctx.values.clone();
-        let mut acc = crate::zk::Openings::new();
+        let mut acc = crate::pcs::zk::Openings::new();
         assert!(!verify_requant(
             &ctx.challenger,
             &dt,
