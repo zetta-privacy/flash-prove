@@ -162,9 +162,9 @@ pub fn prove_inner_product_committed_given(
     let alpha = tr.sample_ext();
     let point_k = Ext::from(dom.element(k));
     let idx = ctx.record(com_v.clone(), pd_v.clone(), point_k);
-    ctx.record(com_p.clone(), pd_p.clone(), point_k);
-    ctx.record(com_p.clone(), pd_p.clone(), alpha);
-    ctx.record(com_q.clone(), pd_q.clone(), alpha);
+    ctx.record(com_p.clone(), pd_p.clone(), point_k); // keep: pd_p reused below
+    ctx.record(com_p.clone(), pd_p, alpha); // move: last use of pd_p
+    ctx.record(com_q.clone(), pd_q, alpha); // move: only use of pd_q
     InnerProductProof {
         com_p,
         com_q,

@@ -6,7 +6,7 @@ use std::collections::HashMap;
 
 use crate::field::{Ext, Fp};
 use crate::model::spec::{ModelSpec, Op};
-use crate::model::{Trace, Weights};
+use crate::model::{Trace, WeightMatrix, Weights};
 use crate::pcs::fri::{self, Challenger, Pcs, Prover};
 use crate::pcs::zk::{
     prove_inner_product_committed_given, verify_inner_product_committed, InnerProductProof,
@@ -35,6 +35,11 @@ fn f(x: i64) -> Fp {
 /// Merkle tree) to a small constant, so committing a 100M-element embedding no
 /// longer needs a multi-GB tree.
 pub const CHUNK_ROWS: usize = 2048;
+
+/// Sequence positions batched per matmul. The block-diagonal `W ⊗ I_batch` grows
+/// as `batch²`, so a small fixed batch keeps it (and the `u` challenge vector)
+/// bounded; the sequence is processed in `SUB_BATCH`-wide slices.
+pub const SUB_BATCH: usize = 16;
 
 /// Number of row-chunks a weight of `rows` rows splits into.
 pub fn num_chunks(rows: usize) -> usize {
@@ -199,6 +204,41 @@ fn commit_one(pcs: &Pcs, name: &str, rows: usize, cols: usize, values: Vec<i64>)
     }
 }
 
+/// Commit a weight from its compact `i8` values: the `fp`/commitment/tree come from
+/// the `i8` data, but the redundant `i64` `values` copy is omitted (the matmul/norm
+/// read `i8` from the original `weights` and widen transiently).
+fn commit_weight(pcs: &Pcs, name: &str, rows: usize, cols: usize, vals8: &[i8]) -> CellCommit {
+    let fp = pad(vals8.iter().map(|&x| f(x as i64)).collect(), vals8.len());
+    let (com, pd, dom) = fri::commit_vec(pcs, &fp);
+    CellCommit {
+        name: name.to_string(),
+        rows,
+        cols,
+        values: Vec::new(), // no i64 copy; i8 read from `weights`
+        fp,
+        com,
+        pd,
+        dom,
+    }
+}
+
+/// Commit all chunks of one weight, returning `(chunk_name, CellCommit)` pairs in
+/// chunk order. Deterministic, so it matches the offline `commit_weights_public`.
+pub fn commit_weight_chunks(pcs: &Pcs, w: &WeightMatrix) -> Vec<(String, CellCommit)> {
+    let n = num_chunks(w.rows);
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let (start, end) = chunk_row_range(w.rows, i);
+        let vals8 = &w.values[start * w.cols..end * w.cols];
+        let name = chunk_name(&w.name, w.rows, i);
+        out.push((
+            name.clone(),
+            commit_weight(pcs, &name, end - start, w.cols, vals8),
+        ));
+    }
+    out
+}
+
 /// The public commitment of one weight (name + dimensions + commitment + domain),
 /// shared between the commit and verify phases.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -238,14 +278,10 @@ pub fn commit_weights_public(pcs: &Pcs, weights: &Weights) -> Vec<WeightCommit> 
     out
 }
 
-/// Commit every trace cell and every weight once, keyed by name.
-pub fn commit_cells(
-    pcs: &Pcs,
-    weights: &Weights,
-    trace: &Trace,
-) -> (HashMap<String, CellCommit>, HashMap<String, CellCommit>) {
+/// Commit every trace cell once, keyed by name (weights are committed lazily
+/// by the prover on first use).
+pub fn commit_cells(pcs: &Pcs, trace: &Trace) -> HashMap<String, CellCommit> {
     let mut cells = HashMap::new();
-    let mut wmap = HashMap::new();
     for seg in &trace.segments {
         for c in &seg.cells {
             cells.insert(
@@ -254,22 +290,7 @@ pub fn commit_cells(
             );
         }
     }
-    for w in weights {
-        let n = num_chunks(w.rows);
-        for i in 0..n {
-            let (start, end) = chunk_row_range(w.rows, i);
-            let vals: Vec<i64> = w.values[start * w.cols..end * w.cols]
-                .iter()
-                .map(|&v| v as i64)
-                .collect();
-            let name = chunk_name(&w.name, w.rows, i);
-            wmap.insert(
-                name.clone(),
-                commit_one(pcs, &name, end - start, w.cols, vals),
-            );
-        }
-    }
-    (cells, wmap)
+    cells
 }
 
 /// Ties a committed row slice to the committed full cell it was sliced from:

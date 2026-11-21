@@ -27,9 +27,9 @@ pub type Val = Goldilocks;
 pub type Challenge = CubicTrinomialExtensionField<Goldilocks>;
 
 type Perm = Poseidon2Goldilocks<16>;
-type Hash = PaddingFreeSponge<Perm, 16, 8, 8>;
-type Compress = TruncatedPermutation<Perm, 2, 8, 16>;
-type ValMmcs = MerkleTreeMmcs<Val, Val, Hash, Compress, 2, 8>;
+type Hash = PaddingFreeSponge<Perm, 16, 8, 2>;
+type Compress = TruncatedPermutation<Perm, 2, 2, 16>;
+type ValMmcs = MerkleTreeMmcs<Val, Val, Hash, Compress, 2, 2>;
 type ChallengeMmcs = ExtensionMmcs<Val, Challenge, ValMmcs>;
 type Dft = Radix2DitParallel<Val>;
 
@@ -423,6 +423,7 @@ pub struct Prover {
     pub challenger: Challenger,
     pub openings: Vec<(Commitment, ProverData, Challenge)>,
     pub values: Vec<Challenge>,
+    recorded: usize, // global opening count, never resets across flushes
 }
 
 impl Prover {
@@ -433,22 +434,29 @@ impl Prover {
             challenger,
             openings: Vec::new(),
             values: Vec::new(),
+            recorded: 0,
         }
     }
 
     /// Record one opening request and return its value index (the position in the
     /// flattened value vector returned by [`Prover::open_all`]).
     pub fn record(&mut self, com: Commitment, pd: ProverData, point: Challenge) -> usize {
-        let idx = self.openings.len();
+        let idx = self.recorded;
+        self.recorded += 1;
         self.openings.push((com, pd, point));
         idx
+    }
+
+    /// Number of openings not yet flushed.
+    pub fn pending(&self) -> usize {
+        self.openings.len()
     }
 
     /// Open every recorded request in one FRI proof, filling `self.values` (in
     /// record order) and returning the single shared proof.
     pub fn open_all(&mut self) -> Proof {
         let (values, proof) = open_many_prove(&self.pcs, &self.challenger, &self.openings);
-        self.values = values;
+        self.values.extend(values);
         self.openings.clear();
         proof
     }
