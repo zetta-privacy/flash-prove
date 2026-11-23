@@ -23,6 +23,7 @@ p3-symmetric = { git = "https://github.com/Plonky3/Plonky3", rev = "0d80373" }
 p3-mds = { git = "https://github.com/Plonky3/Plonky3", rev = "0d80373" }
 p3-matrix = { git = "https://github.com/Plonky3/Plonky3", rev = "0d80373" }
 p3-maybe-rayon = { git = "https://github.com/Plonky3/Plonky3", rev = "0d80373" }
+p3-blake3 = { git = "https://github.com/Plonky3/Plonky3", rev = "0d80373" }
 
 # randomness
 rand = { version = "0.10", features = ["std_rng"] }

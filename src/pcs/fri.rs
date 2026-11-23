@@ -8,6 +8,7 @@
 //! an isomorphic-but-different degree-3 extension; the OOD/`eq` code still uses
 //! `crate::field::Ext` and will be reconciled at the boundary.)
 
+use crate::pcs::blake3_mmcs::{Blake3Compress, Blake3Hasher};
 use p3_challenger::{CanObserve, CanSampleBits, DuplexChallenger, FieldChallenger};
 use p3_commit::{ExtensionMmcs, Pcs as PcsTrait};
 use p3_dft::Radix2DitParallel;
@@ -17,7 +18,6 @@ use p3_fri::{FriParameters, TwoAdicFriPcs};
 use p3_goldilocks::{Goldilocks, Poseidon2Goldilocks};
 use p3_matrix::dense::RowMajorMatrix;
 use p3_merkle_tree::MerkleTreeMmcs;
-use p3_symmetric::{PaddingFreeSponge, TruncatedPermutation};
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 
@@ -27,8 +27,9 @@ pub type Val = Goldilocks;
 pub type Challenge = CubicTrinomialExtensionField<Goldilocks>;
 
 type Perm = Poseidon2Goldilocks<16>;
-type Hash = PaddingFreeSponge<Perm, 16, 8, 2>;
-type Compress = TruncatedPermutation<Perm, 2, 2, 16>;
+/// BLAKE3 leaf hasher / node compressor over Goldilocks (SIMD-batched).
+type Hash = Blake3Hasher;
+type Compress = Blake3Compress;
 type ValMmcs = MerkleTreeMmcs<Val, Val, Hash, Compress, 2, 2>;
 type ChallengeMmcs = ExtensionMmcs<Val, Challenge, ValMmcs>;
 type Dft = Radix2DitParallel<Val>;
@@ -159,8 +160,8 @@ pub fn new_challenger() -> Challenger {
 pub fn new_pcs(log_blowup: usize, num_queries: usize) -> (Pcs, Challenger) {
     let mut rng = StdRng::seed_from_u64(0);
     let perm = Perm::new_from_rng_128(&mut rng);
-    let hash = Hash::new(perm.clone());
-    let compress = Compress::new(perm.clone());
+    let hash = Blake3Hasher;
+    let compress = Blake3Compress;
 
     let val_mmcs = ValMmcs::new(hash, compress, 0);
     let challenge_mmcs = ChallengeMmcs::new(val_mmcs.clone());

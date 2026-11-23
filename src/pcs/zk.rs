@@ -67,11 +67,19 @@ pub fn prove_mle_committed(
     point: &[Ext],
 ) -> [InnerProductProof; 3] {
     let [a, b, c] = eq_components(point, log2(v.len()));
-    [
-        prove_inner_product_committed_given(ctx, com_v, pd_v, dom_v, v, &a),
-        prove_inner_product_committed_given(ctx, com_v, pd_v, dom_v, v, &b),
-        prove_inner_product_committed_given(ctx, com_v, pd_v, dom_v, v, &c),
-    ]
+    // Collapse the three base-field claims ⟨a,v⟩, ⟨b,v⟩, ⟨c,v⟩ over the same v into a
+    // single claim ⟨r0·a + r1·b + r2·c, v⟩ (Schwartz–Zippel in r), so we commit one
+    // p/q tree instead of three. The verifier recomputes the same r and batched claim.
+    let mut tr = fri::Transcript::new(&ctx.challenger);
+    tr.observe(com_v);
+    let r0 = tr.sample_val();
+    let r1 = tr.sample_val();
+    let r2 = tr.sample_val();
+    let zero = [Fp::ZERO; 3];
+    let (h, _) = batch_inner_products(&[&a, &b, &c], &zero, &[r0, r1, r2]);
+    let p = prove_inner_product_committed_given(ctx, com_v, pd_v, dom_v, v, &h);
+    // The batched proof is returned in all three slots; the verifier checks slot 0.
+    [p.clone(), p.clone(), p]
 }
 
 /// Verify the committed MLE evaluation `ṽ(point) = claimed` from commitments and
@@ -91,12 +99,19 @@ pub fn verify_mle_committed(
 ) -> bool {
     let [a, b, c] = eq_components(point, log2(n));
     let coeffs = <Ext as BasedVectorSpace<Fp>>::as_basis_coefficients_slice(&claimed);
+    // Recompute the same random linear combination the prover batched into.
+    let mut tr = fri::Transcript::new(challenger);
+    tr.observe(com_v);
+    let r0 = tr.sample_val();
+    let r1 = tr.sample_val();
+    let r2 = tr.sample_val();
+    let (h, b_batched) = batch_inner_products(
+        &[&a, &b, &c],
+        &[coeffs[0], coeffs[1], coeffs[2]],
+        &[r0, r1, r2],
+    );
     verify_inner_product_committed(
-        challenger, com_v, dom_v, &a, coeffs[0], &proofs[0], values, acc,
-    ) && verify_inner_product_committed(
-        challenger, com_v, dom_v, &b, coeffs[1], &proofs[1], values, acc,
-    ) && verify_inner_product_committed(
-        challenger, com_v, dom_v, &c, coeffs[2], &proofs[2], values, acc,
+        challenger, com_v, dom_v, &h, b_batched, &proofs[0], values, acc,
     )
 }
 

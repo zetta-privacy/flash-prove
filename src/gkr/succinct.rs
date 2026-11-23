@@ -42,7 +42,7 @@ use p3_field::PrimeCharacteristicRing;
 
 /// Flush FRI openings into a new FRI proof once this many are pending, bounding
 /// the prover's peak `ProverData` retention. Tune for your memory budget.
-const WAVE_THRESHOLD: usize = 8;
+const WAVE_THRESHOLD: usize = 512;
 
 fn next_pow2(n: usize) -> usize {
     n.next_power_of_two()
@@ -326,22 +326,27 @@ fn prove_gkr_batched_matmul(
     tr.observe(&acc.com);
     tr.observe(&w.com);
     let r: Vec<Fp> = (0..batch).map(|_| tr.sample_val()).collect();
-    let s: Vec<Fp> = (0..out_dim).map(|_| tr.sample_val()).collect();
-    let t: Vec<Fp> = (0..in_dim).map(|_| tr.sample_val()).collect();
+    let mut s: Vec<Fp> = (0..out_dim).map(|_| tr.sample_val()).collect();
+    s.resize(next_pow2(out_dim), Fp::ZERO);
+    let mut t: Vec<Fp> = (0..in_dim).map(|_| tr.sample_val()).collect();
+    t.resize(next_pow2(in_dim), Fp::ZERO);
 
-    // r ⊗ t  (batch·in_dim) and r ⊗ s (batch·out_dim).
+    // r ⊗ t  (batch·in_dim) and r ⊗ s (batch·out_dim), padded to match the padded
+    // committed cells `x.fp` / `acc.fp` so the inner-product lengths agree.
     let mut rt = vec![Fp::ZERO; batch * in_dim];
     for b in 0..batch {
         for j in 0..in_dim {
             rt[b * in_dim + j] = r[b] * t[j];
         }
     }
+    rt.resize(next_pow2(batch * in_dim), Fp::ZERO);
     let mut rs = vec![Fp::ZERO; batch * out_dim];
     for b in 0..batch {
         for i in 0..out_dim {
             rs[b * out_dim + i] = r[b] * s[i];
         }
     }
+    rs.resize(next_pow2(batch * out_dim), Fp::ZERO);
 
     // x_comb[j] = Σ_b r_b·x[b,j];  acc_comb[i] = Σ_b r_b·acc[b,i]  (field).
     let mut xc = vec![Fp::ZERO; in_dim];
@@ -434,12 +439,14 @@ fn verify_gkr_batched_matmul(
             rt[b * in_dim + j] = r[b] * t[j];
         }
     }
+    rt.resize(next_pow2(batch * in_dim), Fp::ZERO);
     let mut rs = vec![Fp::ZERO; batch * out_dim];
     for b in 0..batch {
         for i in 0..out_dim {
             rs[b * out_dim + i] = r[b] * s[i];
         }
     }
+    rs.resize(next_pow2(batch * out_dim), Fp::ZERO);
 
     verify_inner_product_committed(challenger, com_xc, dom_xc, t, b_xc, claim_xc, values, acc)
         && verify_inner_product_committed(challenger, com_x, dom_x, &rt, b_x, claim_x, values, acc)
@@ -594,10 +601,6 @@ pub fn prove_gkr_succinct(
                     claim_embs.push(claim_emb);
                     com_embs.push(emb.com.clone());
                     dom_embs.push(emb.dom);
-                    if ctx.pending() >= WAVE_THRESHOLD {
-                        wave_sizes.push(ctx.pending());
-                        fri_proofs.push(ctx.open_all());
-                    }
                 }
 
                 ops.push(GkrOpProof::Embed(EmbedProof {
@@ -706,10 +709,6 @@ pub fn prove_gkr_succinct(
                         claim_acc,
                         shift: *shift,
                     }));
-                    if ctx.pending() >= WAVE_THRESHOLD {
-                        wave_sizes.push(ctx.pending());
-                        fri_proofs.push(ctx.open_all());
-                    }
                 }
                 for ci in 0..n_chunks {
                     wmap.remove(&chunk_name(weight, out_dim, ci));
