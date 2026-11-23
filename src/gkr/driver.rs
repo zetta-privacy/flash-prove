@@ -701,6 +701,120 @@ pub fn prove_segment_with_weights(
                 }
                 planned.push(Some(PlannedOp::WeightedV(per_head)));
             }
+            Op::Norm {
+                input, weight, ..
+            } => {
+                let w = by_name
+                    .get(weight.as_str())
+                    .ok_or_else(|| DriverError::UnknownCell(weight.clone()))?;
+                let Some((rows, hidden)) = plan.logical(input) else {
+                    return Err(DriverError::UnknownCell(input.clone()));
+                };
+                if hidden != w.values.len() {
+                    return Err(DriverError::UnknownCell(weight.clone()));
+                }
+                let gamma: Vec<i64> = w.values.iter().map(|&v| v as i64).collect();
+                plan.add(&format!("__norm.gamma.{i}"), hidden, 1, gamma.clone());
+                let xs = plan.values(input).to_vec();
+                let mut rqs = Vec::with_capacity(rows);
+                for row in 0..rows {
+                    let xr: Vec<i64> = xs[row * hidden..(row + 1) * hidden].to_vec();
+                    plan.add(&format!("__norm.{i}.{row}.xr"), hidden, 1, xr.clone());
+                    let hh: Vec<i64> = (0..hidden).map(|j| xr[j] * gamma[j]).collect();
+                    let h_name = format!("__norm.{i}.{row}.h");
+                    plan.add(&h_name, hidden, 1, hh.clone());
+                    let sum_sq: i64 = xr.iter().map(|&v| v * v).sum();
+                    let inv_q = crate::gkr::nonlinear::norm_inv_q(sum_sq, hidden, rec_q, eps);
+                    let y: Vec<i64> = hh.iter().map(|&v| v * inv_q).collect();
+                    let y_name = format!("__norm.{i}.{row}.y");
+                    plan.add(&y_name, hidden, 1, y.clone());
+                    let ob: Vec<i64> = y
+                        .iter()
+                        .map(|&v| crate::model::spec::requant(v, k as u32))
+                        .collect();
+                    let ob_name = format!("__norm.{i}.{row}.ob");
+                    plan.add(&ob_name, hidden, 1, ob);
+                    rqs.push(plan.requant(
+                        &format!("__norm.{i}.{row}.rq"),
+                        &y_name,
+                        &ob_name,
+                        k,
+                        digits,
+                    ));
+                }
+                planned.push(Some(PlannedOp::Norm(rqs)));
+            }
+            Op::CausalSoftmax { input, output } => {
+                let Some((rows, n)) = plan.logical(input) else {
+                    return Err(DriverError::UnknownCell(input.clone()));
+                };
+                let table = bounds.exp_table(alpha, beta);
+                let big_n = bounds.exp_big_n();
+                let max_tbl = crate::gkr::nonlinear::max_table(bounds.exp_lo, alpha, beta);
+                let max_big = crate::gkr::nonlinear::max_big_n(bounds.exp_lo);
+                let xs = plan.values(input).to_vec();
+                let mut per_row = Vec::with_capacity(rows);
+                for row in 0..rows {
+                    let l = row.min(n - 1);
+                    let m = (0..=l).map(|i| xs[row * n + i]).max().unwrap_or(0);
+                    let tstar = (0..=l).find(|&i| xs[row * n + i] == m).unwrap_or(0);
+                    let d: Vec<i64> = (0..n)
+                        .map(|i| if i <= l { xs[row * n + i] - m } else { bounds.exp_lo })
+                        .collect();
+                    let e: Vec<i64> = d.iter().map(|&v| crate::model::spec::exp_q15(v)).collect();
+                    let s_sum: i64 = e.iter().take(l + 1).sum();
+                    let inv_q = crate::gkr::nonlinear::softmax_inv_q(s_sum, rec_q);
+                    let y: Vec<i64> = e.iter().map(|&v| v * inv_q).collect();
+                    let nrm: Vec<i64> = y
+                        .iter()
+                        .map(|&v| crate::model::spec::requant(v, k as u32))
+                        .collect();
+                    let pre = format!("__sm.{i}.{row}");
+                    plan.add(&format!("{pre}.d"), n, 1, d.clone());
+                    plan.add(&format!("{pre}.e"), n, 1, e.clone());
+                    plan.add(&format!("{pre}.y"), n, 1, y.clone());
+                    plan.add(&format!("{pre}.nrm"), n, 1, nrm.clone());
+                    let over: Vec<i64> = d.iter().map(|&x| if x > 0 { 1 } else { 0 }).collect();
+                    plan.add(&format!("{pre}.over"), n, 1, over);
+                    let lookup = plan.lookup2(
+                        &format!("{pre}.lk"),
+                        &format!("{pre}.d"),
+                        &format!("{pre}.e"),
+                        (alpha, beta),
+                        &table,
+                        big_n,
+                    );
+                    let over_lookup = plan.lookup2(
+                        &format!("{pre}.olk"),
+                        &format!("{pre}.d"),
+                        &format!("{pre}.over"),
+                        (alpha, beta),
+                        &max_tbl,
+                        max_big,
+                    );
+                    let requant = plan.requant(
+                        &format!("{pre}.rq"),
+                        &format!("{pre}.y"),
+                        &format!("{pre}.nrm"),
+                        k,
+                        digits,
+                    );
+                    per_row.push(SoftmaxPlan {
+                        d: format!("{pre}.d"),
+                        e: format!("{pre}.e"),
+                        y: format!("{pre}.y"),
+                        nrm: format!("{pre}.nrm"),
+                        lookup,
+                        requant,
+                        over: format!("{pre}.over"),
+                        over_lookup,
+                        m,
+                        tstar,
+                    });
+                }
+                let _ = output;
+                planned.push(Some(PlannedOp::Softmax(per_row)));
+            }
             other => return Err(DriverError::Unsupported(op_name(other))),
         }
     }
@@ -826,6 +940,117 @@ pub fn prove_segment_with_weights(
                     ));
                 }
                 proofs.push(SegmentOpProof::Norm(row_proofs));
+            }
+            (
+                Op::WeightedV { weights, v, output },
+                PlannedOp::WeightedV(per_head),
+            ) => {
+                let (cw, cv, co) = (seg.id(weights), seg.id(v), seg.id(output));
+                let (h, d) = (dims.heads, dims.head_dim);
+                let lq = seg.cells_meta(cv).logical_rows;
+                let (log_l, log_d, log_h) = (
+                    lq.trailing_zeros() as usize,
+                    d.trailing_zeros() as usize,
+                    h.trailing_zeros() as usize,
+                );
+                let mut out = Vec::with_capacity(per_head.len());
+                for hp in per_head.iter() {
+                    let cells = crate::gkr::attention::WeightedVCells {
+                        w: cw,
+                        v: cv,
+                        out: co,
+                        acc: seg.id(&hp.acc),
+                        ob: seg.id(&hp.ob),
+                        requant: hp.requant.cells(&seg),
+                    };
+                    let block_start = ((hp.li * h) + hp.hi) * d;
+                    out.push(crate::gkr::attention::claim_weighted_v(
+                        &mut seg,
+                        cells,
+                        (log_l, log_d, log_h),
+                        (hp.hi, block_start),
+                        (d, 15, digits),
+                        &mut tr,
+                    ));
+                }
+                proofs.push(SegmentOpProof::WeightedV(out));
+            }
+            (
+                Op::Scores { q, k, output, .. },
+                PlannedOp::Scores(per_head),
+            ) => {
+                let (cq, ck, co) = (seg.id(q), seg.id(k), seg.id(output));
+                let (h, d) = (dims.heads, dims.head_dim);
+                let lq = seg.cells_meta(cq).logical_rows;
+                let (log_l, log_d, log_h) = (
+                    lq.trailing_zeros() as usize,
+                    d.trailing_zeros() as usize,
+                    h.trailing_zeros() as usize,
+                );
+                let mut out = Vec::with_capacity(per_head.len());
+                for hp in per_head.iter() {
+                    let cells = crate::gkr::attention::HeadCells {
+                        q: cq,
+                        k: ck,
+                        out: co,
+                        dot: seg.id(&hp.dot),
+                        y: seg.id(&hp.y),
+                        s: seg.id(&hp.s),
+                        requant: hp.requant.cells(&seg),
+                    };
+                    let q_start = ((hp.li * h) + hp.hi) * d;
+                    let out_start = ((hp.li * h) + hp.hi) * lq;
+                    out.push(crate::gkr::attention::claim_scores(
+                        &mut seg,
+                        cells,
+                        (log_l, log_d, log_h),
+                        hp.hi,
+                        (q_start, out_start),
+                        Fp::new(hp.inv_q as u64),
+                        (lq, crate::model::spec::RECIP_Q as usize, digits),
+                        &mut tr,
+                    ));
+                }
+                proofs.push(SegmentOpProof::Scores(out));
+            }
+            (
+                Op::CausalSoftmax { input, output },
+                PlannedOp::Softmax(per_row),
+            ) => {
+                let (ci, co) = (seg.id(input), seg.id(output));
+                let (rows, n) = {
+                    let m = seg.cells_meta(ci);
+                    (m.logical_rows, m.logical_cols)
+                };
+                let table = bounds.exp_table(alpha, beta);
+                let big_n = bounds.exp_big_n();
+                let mut row_proofs = Vec::with_capacity(rows);
+                for (row, pc) in per_row.iter().enumerate() {
+                    let cells = crate::gkr::nonlinear::SoftmaxRowCells {
+                        scores: ci,
+                        probs: co,
+                        d: seg.id(&pc.d),
+                        e: seg.id(&pc.e),
+                        y: seg.id(&pc.y),
+                        nrm: seg.id(&pc.nrm),
+                        lookup: pc.lookup.cells(&seg),
+                        over: seg.id(&pc.over),
+                        over_lookup: pc.over_lookup.cells(&seg),
+                        requant: pc.requant.cells(&seg),
+                    };
+                    let l = row.min(n - 1);
+                    row_proofs.push(crate::gkr::nonlinear::claim_softmax_row(
+                        &mut seg,
+                        cells,
+                        (row, n, l),
+                        (pc.m, bounds.exp_lo, pc.tstar),
+                        (rec_q, k, digits),
+                        (alpha, beta),
+                        (&table, big_n),
+                        &mut tr,
+                    ));
+                }
+                proofs.push(SegmentOpProof::Softmax(row_proofs));
             }
             _ => return Err(DriverError::Unsupported(op_name(op))),
         }
@@ -1083,6 +1308,132 @@ pub fn verify_segment_with_weights(
                         (hidden, k, digits),
                         (rec_q, eps),
                         &gamma_pub,
+                        &mut tr,
+                    ) {
+                        return false;
+                    }
+                }
+            }
+            (
+                Op::WeightedV { output, v, .. },
+                SegmentOpProof::WeightedV(per_head),
+            ) => {
+                let (Some(co), Some(cv)) = (
+                    bundle.segment.commitment.cell(output),
+                    bundle.segment.commitment.cell(v),
+                ) else {
+                    return false;
+                };
+                let (h, d) = (dims.heads, dims.head_dim);
+                let lq = bundle.segment.commitment.cells[cv].logical_rows;
+                let (log_l, log_d, log_h) = (
+                    lq.trailing_zeros() as usize,
+                    d.trailing_zeros() as usize,
+                    h.trailing_zeros() as usize,
+                );
+                if per_head.len() != lq * h {
+                    return false;
+                }
+                for (n, hp) in per_head.iter().enumerate() {
+                    let (li, hi) = (n / h, n % h);
+                    if hp.cells.out != co || hp.cells.v != cv {
+                        return false;
+                    }
+                    let block_start = ((li * h) + hi) * d;
+                    if !crate::gkr::attention::verify_weighted_v(
+                        &bundle.segment.commitment,
+                        &bundle.segment.claims,
+                        hp,
+                        (log_l, log_d, log_h),
+                        (hi, block_start),
+                        (d, 15, digits),
+                        &mut tr,
+                    ) {
+                        return false;
+                    }
+                }
+            }
+            (
+                Op::Scores { q, k, output, .. },
+                SegmentOpProof::Scores(per_head),
+            ) => {
+                let (Some(cq), Some(ck), Some(co)) = (
+                    bundle.segment.commitment.cell(q),
+                    bundle.segment.commitment.cell(k),
+                    bundle.segment.commitment.cell(output),
+                ) else {
+                    return false;
+                };
+                let (h, d) = (dims.heads, dims.head_dim);
+                let lq = bundle.segment.commitment.cells[cq].logical_rows;
+                let (log_l, log_d, log_h) = (
+                    lq.trailing_zeros() as usize,
+                    d.trailing_zeros() as usize,
+                    h.trailing_zeros() as usize,
+                );
+                if per_head.len() != lq * h {
+                    return false;
+                }
+                for (n, hp) in per_head.iter().enumerate() {
+                    let (li, hi) = (n / h, n % h);
+                    let c = &hp.cells;
+                    if c.q != cq || c.k != ck || c.out != co || hp.head != hi {
+                        return false;
+                    }
+                    let q_start = ((li * h) + hi) * d;
+                    let out_start = ((li * h) + hi) * lq;
+                    if !crate::gkr::attention::verify_scores(
+                        &bundle.segment.commitment,
+                        &bundle.segment.claims,
+                        hp,
+                        (log_l, log_d, log_h),
+                        hi,
+                        (q_start, out_start),
+                        hp.inv_q,
+                        (lq, crate::model::spec::RECIP_Q as usize, digits),
+                        &mut tr,
+                    ) {
+                        return false;
+                    }
+                }
+            }
+            (
+                Op::CausalSoftmax { input, output },
+                SegmentOpProof::Softmax(row_proofs),
+            ) => {
+                let (Some(ci), Some(co)) = (
+                    bundle.segment.commitment.cell(input),
+                    bundle.segment.commitment.cell(output),
+                ) else {
+                    return false;
+                };
+                let (rows, n) = {
+                    let m = &bundle.segment.commitment.cells[co];
+                    (m.logical_rows, m.logical_cols)
+                };
+                let table = bounds.exp_table(alpha, beta);
+                let big_n = bounds.exp_big_n();
+                if row_proofs.len() != rows {
+                    return false;
+                }
+                for (row, rp) in row_proofs.iter().enumerate() {
+                    let c = &rp.cells;
+                    if c.scores != ci || c.probs != co {
+                        return false;
+                    }
+                    let l = row.min(n - 1);
+                    if !crate::gkr::nonlinear::verify_softmax_row(
+                        &bundle.segment.commitment,
+                        &bundle.segment.claims,
+                        rp,
+                        (row, n, l),
+                        (rp.row_max.m, bounds.exp_lo, rp.row_max.tstar),
+                        (rec_q, k, digits),
+                        (&table, big_n),
+                        (
+                            &crate::gkr::nonlinear::max_table(bounds.exp_lo, alpha, beta),
+                            crate::gkr::nonlinear::max_big_n(bounds.exp_lo),
+                        ),
                         &mut tr,
                     ) {
                         return false;
@@ -1600,4 +1951,274 @@ mod tests {
         ));
     }
 
+
+    #[test]
+    fn norm_driven_row_by_row() {
+        let alpha = Fp::new(11);
+        let beta = Fp::new(5);
+        let bounds = LookupBounds {
+            silu_lo: -1,
+            silu_hi: 1,
+            sign_lo: -1,
+            sign_hi: 1,
+            exp_lo: -1,
+            score_lo: 0,
+            score_hi: 1,
+        };
+        let dims = crate::model::spec::Dims {
+            hidden: 2,
+            vocab: 2,
+            layers: 1,
+            heads: 1,
+            head_dim: 2,
+            experts: 2,
+            active: 1,
+            intermediate: 2,
+        };
+        let (k, rec_q, eps, digits) = (1usize, 8u32, 0.0f64, 2usize);
+        let gamma = WeightMatrix::new("g", 2, 1, vec![1, 2]);
+        let x = vec![1i64, 2, 3, 4];
+        let mut out = Vec::new();
+        for row in 0..2usize {
+            let xr = &x[row * 2..(row + 1) * 2];
+            let sum_sq: i64 = xr.iter().map(|&v| v * v).sum();
+            let inv_q = crate::gkr::nonlinear::norm_inv_q(sum_sq, 2, rec_q, eps);
+            for j in 0..2usize {
+                let y = xr[j] * (gamma.values[j] as i64) * inv_q;
+                out.push(crate::model::spec::requant(y, k as u32));
+            }
+        }
+
+        let cells = vec![
+            Cell::new("x", 2, 2, x.clone()),
+            Cell::new("out", 2, 2, out.clone()),
+        ];
+        let ops = vec![Op::Norm {
+            input: "x".into(),
+            weight: "g".into(),
+            output: "out".into(),
+            eps: 0.0,
+        }];
+        let weights = vec![gamma.clone()];
+        let bundle = prove_segment_with_weights(
+            &ops,
+            &cells,
+            &weights,
+            &dims,
+            (k, digits, alpha, beta, rec_q, eps),
+            &bounds,
+            Params::default(),
+        )
+        .expect("drivable");
+        let published = std::collections::HashMap::new();
+        assert!(verify_segment_with_weights(
+            &ops, &bundle, &published, &weights, &dims, (k, digits, alpha, beta, rec_q, eps), &bounds
+        ));
+
+        // A wrong output breaks the requant link to `y`.
+        let mut bad_out = out.clone();
+        bad_out[0] += 1;
+        let bad_cells = vec![Cell::new("x", 2, 2, x), Cell::new("out", 2, 2, bad_out)];
+        let bad = prove_segment_with_weights(
+            &ops,
+            &bad_cells,
+            &weights,
+            &dims,
+            (k, digits, alpha, beta, rec_q, eps),
+            &bounds,
+            Params::default(),
+        )
+        .unwrap();
+        assert!(!verify_segment_with_weights(
+            &ops, &bad, &published, &weights, &dims, (k, digits, alpha, beta, rec_q, eps), &bounds
+        ));
+
+        // A γ the verifier does not know is rejected: the copy is bound to it.
+        let other = vec![WeightMatrix::new("g", 2, 1, vec![5, 7])];
+        assert!(!verify_segment_with_weights(
+            &ops, &bundle, &published, &other, &dims, (k, digits, alpha, beta, rec_q, eps), &bounds
+        ));
+    }
+
+    fn base_bounds() -> LookupBounds {
+        LookupBounds {
+            silu_lo: -1,
+            silu_hi: 1,
+            sign_lo: -1,
+            sign_hi: 1,
+            exp_lo: -3,
+            score_lo: 0,
+            score_hi: 1,
+        }
+    }
+
+    #[test]
+    fn weighted_v_driven_per_head() {
+        let alpha = Fp::new(11);
+        let beta = Fp::new(5);
+        let bounds = base_bounds();
+        let (lq, h, d) = (2usize, 2usize, 2usize);
+        let dims = crate::model::spec::Dims {
+            hidden: 4, vocab: 2, layers: 1, heads: h, head_dim: d,
+            experts: 2, active: 1, intermediate: 4,
+        };
+        let v = vec![32768i64; lq * h * d];
+        let w = vec![3i64, -1, 5, -1, 7, -1, 9, -1];
+        let mut out = vec![0i64; lq * h * d];
+        for li in 0..lq {
+            for hi in 0..h {
+                for i in 0..d {
+                    let acc: i64 = (0..lq)
+                        .map(|t| v[(t * h + hi) * d + i] * w[((li * h) + hi) * lq + t])
+                        .sum();
+                    out[((li * h) + hi) * d + i] = crate::model::spec::requant(acc, 15);
+                }
+            }
+        }
+        assert_ne!(out, vec![0; lq * h * d]);
+
+        let cells = vec![
+            Cell::new("w", lq, h * lq, w.clone()),
+            Cell::new("v", lq, h * d, v.clone()),
+            Cell::new("out", lq, h * d, out.clone()),
+        ];
+        let ops = vec![Op::WeightedV { weights: "w".into(), v: "v".into(), output: "out".into() }];
+        let bundle = prove_segment_with_weights(
+            &ops, &cells, &[], &dims, (1, 3, alpha, beta, 8, 0.0), &bounds, Params::default(),
+        )
+        .expect("drivable");
+        let published = std::collections::HashMap::new();
+        assert!(verify_segment_with_weights(
+            &ops, &bundle, &published, &[], &dims, (1, 3, alpha, beta, 8, 0.0), &bounds
+        ));
+
+        let mut bad = out.clone();
+        bad[0] += 1;
+        let bad_cells = vec![
+            Cell::new("w", lq, h * lq, w),
+            Cell::new("v", lq, h * d, v),
+            Cell::new("out", lq, h * d, bad),
+        ];
+        let bad_bundle = prove_segment_with_weights(
+            &ops, &bad_cells, &[], &dims, (1, 3, alpha, beta, 8, 0.0), &bounds, Params::default(),
+        )
+        .unwrap();
+        assert!(!verify_segment_with_weights(
+            &ops, &bad_bundle, &published, &[], &dims, (1, 3, alpha, beta, 8, 0.0), &bounds
+        ));
+    }
+
+    #[test]
+    fn scores_driven_per_head() {
+        let alpha = Fp::new(11);
+        let beta = Fp::new(5);
+        let bounds = base_bounds();
+        let (lq, h, d) = (2usize, 2usize, 2usize);
+        let dims = crate::model::spec::Dims {
+            hidden: 4, vocab: 2, layers: 1, heads: h, head_dim: d,
+            experts: 2, active: 1, intermediate: 4,
+        };
+        let q = vec![1i64; lq * h * d];
+        let k = (0..(lq * h * d) as i64).collect::<Vec<_>>();
+        let rq = crate::model::spec::RECIP_Q;
+        let inv_q = ((1i64 << rq) as f64 / 1.0).round() as i64;
+        let mut out = vec![0i64; lq * h * lq];
+        for li in 0..lq {
+            for hi in 0..h {
+                for t in 0..lq {
+                    let dot: i64 = (0..d)
+                        .map(|j| q[((li * h) + hi) * d + j] * k[(t * h + hi) * d + j])
+                        .sum();
+                    out[((li * h) + hi) * lq + t] = crate::model::spec::requant(dot * inv_q, rq);
+                }
+            }
+        }
+        assert!(out.windows(2).any(|w| w[0] != w[1]));
+
+        let cells = vec![
+            Cell::new("q", lq, h * d, q.clone()),
+            Cell::new("k", lq, h * d, k.clone()),
+            Cell::new("out", lq, h * lq, out.clone()),
+        ];
+        let ops = vec![Op::Scores { q: "q".into(), k: "k".into(), output: "out".into(), scale: 1.0 }];
+        let bundle = prove_segment_with_weights(
+            &ops, &cells, &[], &dims, (1, 4, alpha, beta, 8, 0.0), &bounds, Params::default(),
+        )
+        .expect("drivable");
+        let published = std::collections::HashMap::new();
+        assert!(verify_segment_with_weights(
+            &ops, &bundle, &published, &[], &dims, (1, 4, alpha, beta, 8, 0.0), &bounds
+        ));
+
+        let mut bad = out.clone();
+        bad[0] += 1;
+        let bad_cells = vec![
+            Cell::new("q", lq, h * d, q),
+            Cell::new("k", lq, h * d, k),
+            Cell::new("out", lq, h * lq, bad),
+        ];
+        let bad_bundle = prove_segment_with_weights(
+            &ops, &bad_cells, &[], &dims, (1, 4, alpha, beta, 8, 0.0), &bounds, Params::default(),
+        )
+        .unwrap();
+        assert!(!verify_segment_with_weights(
+            &ops, &bad_bundle, &published, &[], &dims, (1, 4, alpha, beta, 8, 0.0), &bounds
+        ));
+    }
+
+    #[test]
+    fn causal_softmax_driven_row_by_row() {
+        let alpha = Fp::new(11);
+        let beta = Fp::new(5);
+        let bounds = base_bounds();
+        let dims = crate::model::spec::Dims {
+            hidden: 2, vocab: 2, layers: 1, heads: 1, head_dim: 2,
+            experts: 2, active: 1, intermediate: 2,
+        };
+        let (k, rec_q, eps, digits) = (1usize, 1u32, 0.0f64, 3usize);
+        let exp_lo = bounds.exp_lo;
+        let scores = vec![3i64, 1, 2, 5];
+        let (rows, n) = (2usize, 2usize);
+        let mut probs = Vec::new();
+        for row in 0..rows {
+            let l = row.min(n - 1);
+            let m = (0..=l).map(|i| scores[row * n + i]).max().unwrap();
+            let d: Vec<i64> = (0..n)
+                .map(|i| if i <= l { scores[row * n + i] - m } else { exp_lo })
+                .collect();
+            let e: Vec<i64> = d.iter().map(|&v| crate::model::spec::exp_q15(v)).collect();
+            let s: i64 = e.iter().take(l + 1).sum();
+            let inv_q = crate::gkr::nonlinear::softmax_inv_q(s, rec_q);
+            for i in 0..n {
+                probs.push(crate::model::spec::requant(e[i] * inv_q, k as u32));
+            }
+        }
+        let cells = vec![
+            Cell::new("scores", rows, n, scores.clone()),
+            Cell::new("probs", rows, n, probs.clone()),
+        ];
+        let ops = vec![Op::CausalSoftmax { input: "scores".into(), output: "probs".into() }];
+        let bundle = prove_segment_with_weights(
+            &ops, &cells, &[], &dims, (k, digits, alpha, beta, rec_q, eps), &bounds, Params::default(),
+        )
+        .expect("drivable");
+        let published = std::collections::HashMap::new();
+        assert!(verify_segment_with_weights(
+            &ops, &bundle, &published, &[], &dims, (k, digits, alpha, beta, rec_q, eps), &bounds
+        ));
+
+        let mut bad = probs.clone();
+        bad[0] += 1;
+        let bad_cells = vec![
+            Cell::new("scores", rows, n, scores),
+            Cell::new("probs", rows, n, bad),
+        ];
+        let bad_bundle = prove_segment_with_weights(
+            &ops, &bad_cells, &[], &dims, (k, digits, alpha, beta, rec_q, eps), &bounds, Params::default(),
+        )
+        .unwrap();
+        assert!(!verify_segment_with_weights(
+            &ops, &bad_bundle, &published, &[], &dims, (k, digits, alpha, beta, rec_q, eps), &bounds
+        ));
+    }
 }

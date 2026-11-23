@@ -373,7 +373,6 @@ pub fn claim_row_max(
     tr.observe_val(Fp::new(cells.over as u64));
 
     let r: Vec<Fp> = (0..n).map(|_| tr.sample_val()).collect();
-    let h = LinearH::Dense(r.clone());
     // `mask ⊙ r`: only the prefix carries the equation.
     let hm: Vec<Fp> = r.iter().zip(&mask).map(|(&ri, &mi)| ri * mi).collect();
     let m_ext = Ext::from(fp_i64(m));
@@ -382,7 +381,9 @@ pub fn claim_row_max(
         sum_mr += Ext::from(x);
     }
 
-    let d_v = seg.claim_linear_id(cells.d, 0, &h, tr);
+    // Both sides carry the *masked* functional, so the equation constrains only the
+    // prefix and masked-out entries cannot leak in.
+    let d_v = seg.claim_linear_id(cells.d, 0, &LinearH::Dense(hm.clone()), tr);
     let m_scores = seg.cells_meta(cells.scores).m();
     let scores_v = seg.claim_linear_view(
         cells.scores,
@@ -456,7 +457,6 @@ pub fn verify_row_max(
     if r != proof.r {
         return false;
     }
-    let h = LinearH::Dense(r.clone());
     let mask: Vec<Fp> = (0..n)
         .map(|i| if i <= prefix { Fp::ONE } else { Fp::ZERO })
         .collect();
@@ -473,7 +473,7 @@ pub fn verify_row_max(
     let Some(v) = claim_value_at_id(commitment, claims, c.d, &z) else {
         return false;
     };
-    if !linear_finish(&h, &z, cf, v) {
+    if !linear_finish(&LinearH::Dense(hm.clone()), &z, cf, v) {
         return false;
     }
     let blk = View::block(m_scores, row * n, log_n);
