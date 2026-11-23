@@ -3,6 +3,7 @@
 //! `decode_exact` + full model recompute.
 
 use crate::field::{eq, Ext, Fp};
+use crate::pcs::basefold;
 use crate::pcs::fri::{self, Challenger, Pcs, Prover};
 use crate::pcs::linear_code::{constant_coeff, constant_quotient, eq_components};
 use p3_dft::{Radix2Dit, TwoAdicSubgroupDft};
@@ -113,6 +114,25 @@ pub fn verify_mle_committed(
     verify_inner_product_committed(
         challenger, com_v, dom_v, &h, b_batched, &proofs[0], values, acc,
     )
+}
+
+/// WHIR/BaseFold MLE opening (scaffolding for the commitment-layer flip): commit
+/// `v`, open `ṽ(point)`, returning `(commitment, proof, m)`.
+pub fn prove_mle_whir(v: &[Fp], point: &[Ext]) -> (basefold::Commitment, basefold::Proof, usize) {
+    let (com, pd, m) = basefold::commit(v);
+    let proof = basefold::open(&com, pd, m, point);
+    (com, proof, m)
+}
+
+/// Verify a WHIR/BaseFold MLE opening against `claimed`.
+pub fn verify_mle_whir(
+    com: &basefold::Commitment,
+    proof: &basefold::Proof,
+    m: usize,
+    point: &[Ext],
+    claimed: Ext,
+) -> bool {
+    basefold::verify(com, proof, m, point, claimed)
 }
 
 /// One FRI opening: the claimed value and its opening proof. (The verifier holds
@@ -288,6 +308,33 @@ mod tests {
 
     fn f(x: u64) -> Fp {
         Fp::new(x)
+    }
+
+    #[test]
+    fn whir_mle_roundtrip() {
+        let v: Vec<Fp> = (0..16).map(|i| Fp::new(i as u64 + 1)).collect();
+        let point: Vec<Ext> = (0..4).map(|k| Ext::from(Fp::new(k as u64 + 2))).collect();
+        // WHIR folds MSB-first (point[0] = most-significant variable).
+        let mut vals: Vec<Ext> = v.iter().map(|&x| Ext::from(x)).collect();
+        for &z in &point {
+            let half = vals.len() / 2;
+            let mut next = Vec::with_capacity(half);
+            for i in 0..half {
+                next.push(vals[i] + z * (vals[i + half] - vals[i]));
+            }
+            vals = next;
+        }
+        let claimed = vals[0];
+        let (com, proof, m) = prove_mle_whir(&v, &point);
+        assert_eq!(m, 4);
+        assert!(
+            verify_mle_whir(&com, &proof, m, &point, claimed),
+            "honest WHIR MLE verifies"
+        );
+        assert!(
+            !verify_mle_whir(&com, &proof, m, &point, claimed + Ext::ONE),
+            "wrong value rejects"
+        );
     }
 
     #[test]

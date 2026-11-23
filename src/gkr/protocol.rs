@@ -23,14 +23,14 @@ use crate::field::sumcheck::{mle_eval, RoundPoly, RoundPoly3};
 use crate::pcs::zk::{prove_mle_committed, verify_mle_committed, InnerProductProof, Openings};
 use p3_field::{Field, PrimeCharacteristicRing};
 
-fn concat(a: &[Ext], b: &[Ext]) -> Vec<Ext> {
+pub(crate) fn concat(a: &[Ext], b: &[Ext]) -> Vec<Ext> {
     let mut v = a.to_vec();
     v.extend_from_slice(b);
     v
 }
 
 /// MLE of a row-major matrix at `(row_point, col_point)`.
-fn matrix_mle(flat: &[Ext], row_point: &[Ext], col_point: &[Ext]) -> Ext {
+pub(crate) fn matrix_mle(flat: &[Ext], row_point: &[Ext], col_point: &[Ext]) -> Ext {
     mle_eval(flat, &concat(col_point, row_point))
 }
 
@@ -46,7 +46,7 @@ fn interpolate_deg2(y0: Ext, y1: Ext, y2: Ext) -> RoundPoly {
 
 /// The GKR round polynomial for `Σ_k p(k)·q(k)`: at variable `i` it is
 /// `g_i(t) = Σ_{k_{>i}} p̃(r_<i, t, k_>i) · q̃(r_<i, t, k_>i)`.
-fn round_poly_product(p: &[Ext], q: &[Ext], lm: usize, i: usize, r_prefix: &[Ext]) -> RoundPoly {
+pub(crate) fn round_poly_product(p: &[Ext], q: &[Ext], lm: usize, i: usize, r_prefix: &[Ext]) -> RoundPoly {
     let suffix = lm - i - 1;
     let mut y = [Ext::ZERO; 3];
     let samples = [Ext::ZERO, Ext::ONE, Ext::from(Fp::new(2))];
@@ -843,7 +843,7 @@ fn interpolate_deg3(y0: Ext, y1: Ext, y2: Ext, y3: Ext) -> RoundPoly3 {
 }
 
 /// `eq(r, point)` for an *arbitrary* point (not just Boolean).
-fn eq_partial(r: &[Ext], point: &[Ext]) -> Ext {
+pub(crate) fn eq_partial(r: &[Ext], point: &[Ext]) -> Ext {
     let mut acc = Ext::ONE;
     for k in 0..r.len() {
         let p = point[k];
@@ -854,7 +854,7 @@ fn eq_partial(r: &[Ext], point: &[Ext]) -> Ext {
 
 /// Degree-3 GKR round polynomial for a pointwise product `Σ_i eq(r,i)·a[i]·b[i]`:
 /// `g_j(t) = Σ_{i_>j} eq(r, r_<j, t, i_>)·ã(r_<j, t, i_>)·b̃(r_<j, t, i_>)`.
-fn round_poly3_mul(
+pub(crate) fn round_poly3_mul(
     a: &[Ext],
     b: &[Ext],
     r: &[Ext],

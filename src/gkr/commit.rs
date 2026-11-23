@@ -391,3 +391,52 @@ pub fn verify_tie(
         acc,
     ) && tie.b_row == tie.b_full
 }
+
+/// Commit every weight tensor to its own WHIR root (the **pre-shared map**).
+///
+/// This is the commit phase's output, and it is what the verifier passes as
+/// `published` to [`crate::gkr::driver::verify_segment_with_weights`]. The roots are
+/// computed with the one-flat-column convention of
+/// [`crate::gkr::segment::CellSegment::weight_segment`], so the prover's lazily
+/// committed tensors reproduce them exactly.
+///
+/// Each tensor's witness is dropped as soon as its root is computed, so the commit
+/// phase's peak memory is one tensor.
+pub fn commit_weights_whir(
+    weights: &[WeightMatrix],
+    params: crate::pcs::whir_stacked::Params,
+) -> Vec<(String, crate::pcs::whir_stacked::SegmentCommitment)> {
+    weights
+        .iter()
+        .map(|w| {
+            let seg = crate::gkr::segment::CellSegment::weight_segment(w, params);
+            (w.name.clone(), seg.commitment().clone())
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod whir_tests {
+    use super::*;
+    use crate::pcs::whir_stacked::Params;
+
+    #[test]
+    fn commit_phase_roots_match_the_drivers() {
+        let weights = vec![
+            WeightMatrix::new("a", 4, 1, vec![1, -2, 3, -4]),
+            WeightMatrix::new("b", 2, 1, vec![7, -8]),
+        ];
+        let params = Params::default();
+        let published = commit_weights_whir(&weights, params);
+        assert_eq!(published.len(), 2);
+        assert_ne!(published[0].1.root, published[1].1.root);
+
+        // The prover's lazy commit must reproduce each root exactly.
+        for (name, com) in &published {
+            let w = weights.iter().find(|w| &w.name == name).unwrap();
+            let seg = crate::gkr::segment::CellSegment::weight_segment(w, params);
+            assert_eq!(&seg.commitment().root, &com.root, "root for {name}");
+            assert_eq!(&seg.commitment().tables, &com.tables, "shape for {name}");
+        }
+    }
+}
