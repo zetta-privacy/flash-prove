@@ -221,9 +221,9 @@ pub fn verify_top_k_row(
     let inner = crate::field::arith::bool_point(proof.tstar, log_e);
     let adj_pt = View::block(m_adj, row * e, log_e).point(&inner, m_adj);
     let choice_pt = View::block(m_choice, row * e, log_e).point(&inner, m_choice);
-    claim_value_at_id(commitment, claims, cells.adj, &adj_pt) == Some(proof.adj_at_tstar)
-        && claim_value_at_id(commitment, claims, cells.choice, &choice_pt)
-            == Some(proof.choice_at_tstar)
+    let adj_found = claim_value_at_id(commitment, claims, cells.adj, &adj_pt);
+    let choice_found = claim_value_at_id(commitment, claims, cells.choice, &choice_pt);
+    adj_found == Some(proof.adj_at_tstar) && choice_found == Some(proof.choice_at_tstar)
 }
 
 /// The public sign table `α + β·x + β²·1[x ≥ 0]` over `[lo, hi]`, padded with `1`.

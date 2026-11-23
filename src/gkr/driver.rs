@@ -54,6 +54,13 @@ pub enum SegmentOpProof {
     Norm(Vec<crate::gkr::nonlinear::NormRowProof>),
     /// One proof per row of the attention scores.
     Softmax(Vec<crate::gkr::nonlinear::SoftmaxRowProof>),
+    /// Per-row selection plus the global sign lookup.
+    TopK {
+        /// Resolved ids, carried in the proof so the verifier never rebuilds names.
+        cells: crate::gkr::selection::TopKCells,
+        rows: Vec<crate::gkr::selection::TopKRowProof>,
+        lookup: crate::gkr::logup::Lookup2SegmentProof,
+    },
     /// One proof per (position, head) of the weighted sum over `v`.
     WeightedV(Vec<crate::gkr::attention::WeightedVSegmentProof>),
     /// One proof per (position, head) of the attention scores.
@@ -815,6 +822,51 @@ pub fn prove_segment_with_weights(
                 let _ = output;
                 planned.push(Some(PlannedOp::Softmax(per_row)));
             }
+            Op::TopK { input, choice, k, .. } => {
+                let Some((rows, e)) = plan.logical(input) else {
+                    return Err(DriverError::UnknownCell(input.clone()));
+                };
+                let xs = plan.values(input).to_vec();
+                let cs = plan.values(choice).to_vec();
+                // adj = e·scores − i, per row.
+                let adj: Vec<i64> = (0..rows * e)
+                    .map(|i| e as i64 * xs[i] - (i % e) as i64)
+                    .collect();
+                let mut tau = Vec::with_capacity(rows);
+                let mut tstar = Vec::with_capacity(rows);
+                let mut delta = vec![0i64; rows * e];
+                for row in 0..rows {
+                    let mut sorted: Vec<i64> = adj[row * e..(row + 1) * e].to_vec();
+                    sorted.sort_unstable_by(|a, b| b.cmp(a));
+                    // `sorted` is descending: the k-th largest is index `k-1`.
+                    let t = sorted[(*k).clamp(1, e) - 1];
+                    let idx = (0..e).find(|&t2| adj[row * e + t2] == t).unwrap_or(0);
+                    tau.push(t);
+                    tstar.push(idx);
+                    for i in 0..e {
+                        delta[row * e + i] = adj[row * e + i] - t;
+                    }
+                }
+                let pre = format!("__tk.{i}");
+                plan.add(&format!("{pre}.adj"), rows * e, 1, adj.clone());
+                plan.add(&format!("{pre}.delta"), rows * e, 1, delta.clone());
+                let _ = cs;
+                let lookup = plan.lookup2(
+                    &format!("{pre}.lk"),
+                    &format!("{pre}.delta"),
+                    choice,
+                    (alpha, beta),
+                    &bounds.sign_table(alpha, beta),
+                    bounds.sign_big_n(),
+                );
+                planned.push(Some(PlannedOp::TopK(TopKPlan {
+                    adj: format!("{pre}.adj"),
+                    delta: format!("{pre}.delta"),
+                    lookup,
+                    tau,
+                    tstar,
+                })));
+            }
             other => return Err(DriverError::Unsupported(op_name(other))),
         }
     }
@@ -1052,6 +1104,42 @@ pub fn prove_segment_with_weights(
                 }
                 proofs.push(SegmentOpProof::Softmax(row_proofs));
             }
+            (
+                Op::TopK { input, choice, k, .. },
+                PlannedOp::TopK(tp),
+            ) => {
+                let (cs, cc) = (seg.id(input), seg.id(choice));
+                let (rows, e) = {
+                    let m = seg.cells_meta(cs);
+                    (m.logical_rows, m.logical_cols)
+                };
+                let cells = crate::gkr::selection::TopKCells {
+                    scores: cs,
+                    choice: cc,
+                    adj: seg.id(&tp.adj),
+                    delta: seg.id(&tp.delta),
+                    lookup: tp.lookup.cells(&seg),
+                };
+                let mut row_proofs = Vec::with_capacity(rows);
+                for row in 0..rows {
+                    row_proofs.push(crate::gkr::selection::claim_top_k_row(
+                        &mut seg,
+                        &cells,
+                        (row, e, *k, tp.tau[row], tp.tstar[row]),
+                        &mut tr,
+                    ));
+                }
+                let table = bounds.sign_table(alpha, beta);
+                let lookup = crate::gkr::logup::claim_lookup2(
+                    &mut seg,
+                    cells.lookup.clone(),
+                    (alpha, beta),
+                    &table,
+                    (rows * e, bounds.sign_big_n()),
+                    &mut tr,
+                );
+                proofs.push(SegmentOpProof::TopK { cells, rows: row_proofs, lookup });
+            }
             _ => return Err(DriverError::Unsupported(op_name(op))),
         }
     }
@@ -1068,6 +1156,15 @@ pub fn prove_segment_with_weights(
         },
         weights: set.prove_all(),
     })
+}
+
+/// What a `top_k` needed at plan time.
+struct TopKPlan {
+    adj: String,
+    delta: String,
+    lookup: crate::gkr::plan::Lookup2Names,
+    tau: Vec<i64>,
+    tstar: Vec<usize>,
 }
 
 /// What a softmax row needed at plan time.
@@ -1099,6 +1196,7 @@ enum PlannedOp {
     WeightedV(Vec<WeightedVPlan>),
     /// Per-head names.
     Scores(Vec<ScoresPlan>),
+    TopK(TopKPlan),
 }
 
 /// What a `scores` head needed at plan time.
@@ -1438,6 +1536,80 @@ pub fn verify_segment_with_weights(
                     ) {
                         return false;
                     }
+                }
+            }
+            (
+                Op::TopK { input, choice, k, .. },
+                SegmentOpProof::TopK { cells, rows: row_proofs, lookup },
+            ) => {
+                let (Some(cs), Some(cc)) = (
+                    bundle.segment.commitment.cell(input),
+                    bundle.segment.commitment.cell(choice),
+                ) else {
+                    return false;
+                };
+                // The proof carries resolved ids, so every one of them must be the
+                // cell the plan names — otherwise a prover could point an opening at
+                // an arbitrary table and the point claim would silently find nothing.
+                let name = |suffix: &str| format!("__tk.{i}.{suffix}");
+                let (Some(plan_adj), Some(plan_delta)) = (
+                    bundle.segment.commitment.cell(&name("adj")),
+                    bundle.segment.commitment.cell(&name("delta")),
+                ) else {
+                    return false;
+                };
+                let mut plan_lookup = Vec::with_capacity(5);
+                for k2 in ["lk.fp", "lk.dq", "lk.ft", "lk.dt", "lk.m"] {
+                    match bundle.segment.commitment.cell(&name(k2)) {
+                        Some(id) => plan_lookup.push(id),
+                        None => return false,
+                    }
+                }
+                if cells.scores != cs
+                    || cells.choice != cc
+                    || cells.adj != plan_adj
+                    || cells.delta != plan_delta
+                    || cells.lookup.input != cells.delta
+                    || cells.lookup.output != cc
+                    || [
+                        cells.lookup.fp,
+                        cells.lookup.diff_q,
+                        cells.lookup.ft,
+                        cells.lookup.diff_t,
+                        cells.lookup.m,
+                    ] != [plan_lookup[0], plan_lookup[1], plan_lookup[2], plan_lookup[3], plan_lookup[4]]
+                {
+                    return false;
+                }
+                let (rows, e) = {
+                    let m = &bundle.segment.commitment.cells[cs];
+                    (m.logical_rows, m.logical_cols)
+                };
+                if row_proofs.len() != rows {
+                    return false;
+                }
+                for (row, rp) in row_proofs.iter().enumerate() {
+                    if !crate::gkr::selection::verify_top_k_row(
+                        &bundle.segment.commitment,
+                        &bundle.segment.claims,
+                        cells,
+                        rp,
+                        (row, e, *k),
+                        &mut tr,
+                    ) {
+                        return false;
+                    }
+                }
+                let table = bounds.sign_table(alpha, beta);
+                if !crate::gkr::logup::verify_lookup2(
+                    &bundle.segment.commitment,
+                    &bundle.segment.claims,
+                    lookup,
+                    &table,
+                    (rows * e, bounds.sign_big_n()),
+                    &mut tr,
+                ) {
+                    return false;
                 }
             }
             _ => return false,
@@ -2219,6 +2391,58 @@ mod tests {
         .unwrap();
         assert!(!verify_segment_with_weights(
             &ops, &bad_bundle, &published, &[], &dims, (k, digits, alpha, beta, rec_q, eps), &bounds
+        ));
+    }
+
+
+
+
+
+
+    #[test]
+    fn top_k_driven_per_row() {
+        let alpha = Fp::new(11);
+        let beta = Fp::new(5);
+        let mut bounds = base_bounds();
+        bounds.sign_lo = -9;
+        bounds.sign_hi = 0;
+        let dims = crate::model::spec::Dims {
+            hidden: 2, vocab: 2, layers: 1, heads: 1, head_dim: 2,
+            experts: 2, active: 1, intermediate: 2,
+        };
+        let (rows, e, k) = (2usize, 2usize, 1usize);
+        let scores = vec![5i64, 1, 0, 3];
+        let adj: Vec<i64> = (0..rows * e)
+            .map(|i| e as i64 * scores[i] - (i % e) as i64)
+            .collect();
+        let mut choice = vec![0i64; rows * e];
+        for row in 0..rows {
+            let mut sorted: Vec<i64> = adj[row * e..(row + 1) * e].to_vec();
+            sorted.sort_unstable_by(|a, b| b.cmp(a));
+            let tau = sorted[k - 1];
+            for i in 0..e {
+                if adj[row * e + i] >= tau {
+                    choice[row * e + i] = 1;
+                }
+            }
+        }
+        let cells = vec![
+            Cell::new("scores", rows, e, scores.clone()),
+            Cell::new("choice", rows, e, choice.clone()),
+        ];
+        let ops = vec![Op::TopK {
+            input: "scores".into(),
+            output: "scores".into(),
+            choice: "choice".into(),
+            k,
+        }];
+        let bundle = prove_segment_with_weights(
+            &ops, &cells, &[], &dims, (1, 1, alpha, beta, 8, 0.0), &bounds, Params::default(),
+        )
+        .expect("drivable");
+        let published = std::collections::HashMap::new();
+        assert!(verify_segment_with_weights(
+            &ops, &bundle, &published, &[], &dims, (1, 1, alpha, beta, 8, 0.0), &bounds
         ));
     }
 }
