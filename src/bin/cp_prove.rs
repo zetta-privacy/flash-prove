@@ -13,8 +13,7 @@ use std::path::PathBuf;
 use clap::Parser;
 use flashprove::field::Fp;
 use flashprove::gkr::driver::{
-    ops_per_segment, prove_segment_with_head, DriverError, HeadSpec, LookupBounds, ProvedModel,
-    SegmentBundle,
+    ops_per_segment, DriverError, HeadSpec, LookupBounds, ProvedModel, SegmentBundle,
 };
 use flashprove::model::spec::ModelSpec;
 use flashprove::model::Trace;
@@ -45,6 +44,12 @@ struct Args {
     /// `eps` for the RMSNorm denominator.
     #[arg(long, default_value_t = 1e-6)]
     eps: f64,
+    /// Maximum number of committed tables per segment.
+    #[arg(long, default_value_t = 40)]
+    segments: usize,
+    /// The cell holding the last logits row (the head's input).
+    #[arg(long, default_value = "logits")]
+    head_cell: String,
 }
 
 fn main() {
@@ -74,48 +79,76 @@ fn main() {
         Some(h) => h,
         None => panic!("trace has no head token"),
     };
+
+    // One map from name to the trace cell; the trace may arrive as a single segment.
+    let by_name: std::collections::HashMap<&str, &flashprove::model::Cell> = trace
+        .segments
+        .iter()
+        .flat_map(|s| s.cells.iter())
+        .map(|c| (c.name.as_str(), c))
+        .collect();
+
     let head_max = {
-        let seg = trace.segments.last().expect("at least one segment");
-        let logits = seg.cells.last().expect("logits cell");
+        let logits = by_name
+            .get(args.head_cell.as_str())
+            .unwrap_or_else(|| panic!("trace has no `{}` cell", args.head_cell));
         logits.values[(logits.rows - 1) * logits.cols + head_token]
     };
     let bounds = LookupBounds::derive(&spec, &trace);
 
-    // Assign every op to the segment that owns its output cell.
-    let segment_cells: Vec<Vec<String>> = trace
-        .segments
-        .iter()
-        .map(|s| s.cells.iter().map(|c| c.name.clone()).collect())
-        .collect();
+    // Split the op graph into segments and tie every cross-segment input back to the
+    // segment that owns it (see `driver::link_schedule`).
+    let segment_cells =
+        flashprove::gkr::driver::plan_segments(&spec.ops, &spec.cells, args.segments);
     let per_segment =
         ops_per_segment(&spec.ops, &segment_cells).unwrap_or_else(|e| panic!("{e:?}"));
+    let links = flashprove::gkr::driver::link_schedule(&segment_cells, &per_segment);
+    let arity = |name: &str| {
+        let cell = by_name[name];
+        (cell.rows * cell.cols).next_power_of_two().trailing_zeros() as usize
+    };
+    let openings = flashprove::gkr::driver::link_openings(&links, segment_cells.len(), arity);
 
-    let head_segment = trace.segments.len() - 1;
-    let mut segments: Vec<SegmentBundle> = Vec::with_capacity(trace.segments.len());
-    for (s, seg) in trace.segments.iter().enumerate() {
+    let head_segment = segment_cells
+        .iter()
+        .position(|cs| cs.iter().any(|c| c == &args.head_cell))
+        .unwrap_or(segment_cells.len() - 1);
+    let mut segments: Vec<SegmentBundle> = Vec::with_capacity(segment_cells.len());
+    for s in 0..segment_cells.len() {
         let head = if s == head_segment {
             Some(HeadSpec {
-                logits: trace.segments[s]
-                    .cells
-                    .last()
-                    .map(|c| c.name.clone())
-                    .unwrap_or_default(),
+                logits: args.head_cell.clone(),
                 token: head_token,
                 max: head_max,
             })
         } else {
             None
         };
+        // Own cells plus a copy of every input an earlier segment owns.
+        let mut cells: Vec<flashprove::model::Cell> = segment_cells[s]
+            .iter()
+            .map(|n| (*by_name[n.as_str()]).clone())
+            .collect();
+        for name in flashprove::gkr::driver::external_inputs(&segment_cells[s], &per_segment[s]) {
+            if !segment_cells[s].iter().any(|c| c == &name) {
+                cells.push((*by_name[name.as_str()]).clone());
+            }
+        }
+        // Outgoing and incoming links: open our own cells (and the copies we hold) at
+        // the points the other segment reads.
+        let extra = openings[s].clone();
+
         eprintln!(
-            "segment {s}/{}: {} cells, {} ops",
-            trace.segments.len(),
-            seg.cells.len(),
-            per_segment[s].len()
+            "segment {s}/{}: {} cells, {} ops, {} links out",
+            segment_cells.len(),
+            cells.len(),
+            per_segment[s].len(),
+            extra.len()
         );
         let t0 = std::time::Instant::now();
-        let bundle = prove_segment_with_head(
+        let bundle = flashprove::gkr::driver::prove_segment_full(
             &per_segment[s],
-            &seg.cells,
+            &cells,
             &weights,
             &spec.dims,
             (args.digits, Fp::new(11), Fp::new(5), args.rec_q, args.eps),
@@ -123,6 +156,7 @@ fn main() {
             Params::default(),
             &window,
             head.as_ref(),
+            &extra,
         )
         .unwrap_or_else(|e: DriverError| panic!("segment {s}: {e:?}"));
         eprintln!("segment {s}: proved in {:.1}s", t0.elapsed().as_secs_f64());

@@ -227,10 +227,12 @@ impl Committer {
             .log2(),
             m
         );
+        let t0 = std::time::Instant::now();
         let (root, pd) = with_prover(m, params, |p| {
             let mut ch = new_challenger();
             p.commit(witness, &mut ch).expect("WHIR stacked commit")
         });
+        eprintln!("  committed in {:.1}s", t0.elapsed().as_secs_f64());
 
         SegmentProver {
             commitment: SegmentCommitment {

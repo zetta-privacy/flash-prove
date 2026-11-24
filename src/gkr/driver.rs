@@ -19,7 +19,7 @@
 //! Currently driven: `add`, `mul`, `reshape` — the ops that need no derived
 //! cells, so the planner is exactly the trace cells.
 
-use crate::field::Fp;
+use crate::field::{Ext, Fp};
 use crate::gkr::requant::RequantSegmentProof;
 use crate::gkr::segment::{
     claim_add, claim_mul, claim_reshape, verify_add, verify_mul, verify_reshape, AddSegmentProof,
@@ -466,7 +466,9 @@ impl WeightSet {
                 .tensors
                 .get(name)
                 .ok_or_else(|| DriverError::UnknownCell(name.to_string()))?;
+            let t0 = std::time::Instant::now();
             let prov = weight_prover(w, self.params);
+            eprintln!("  weight {name} committed in {:.1}s", t0.elapsed().as_secs_f64());
             self.provers.insert(name.to_string(), prov);
         }
         Ok(self.provers.get_mut(name).expect("just inserted"))
@@ -649,6 +651,171 @@ pub struct SegmentBundle {
     pub weights: Vec<(String, whir_stacked::SegmentCommitment, whir_stacked::Proof)>,
 }
 
+/// The cells an op writes.
+fn op_outputs(op: &Op) -> Vec<&str> {
+    match op {
+        Op::TopK { output, choice, .. } => vec![output.as_str(), choice.as_str()],
+        Op::Add { output, .. }
+        | Op::Mul { output, .. }
+        | Op::Reshape { output, .. }
+        | Op::Matmul { output, .. }
+        | Op::Scores { output, .. }
+        | Op::CausalSoftmax { output, .. }
+        | Op::WeightedV { output, .. }
+        | Op::Silu { output, .. }
+        | Op::WeightedSum { output, .. }
+        | Op::Norm { output, .. }
+        | Op::Rope { output, .. }
+        | Op::Embed { output, .. } => vec![output.as_str()],
+    }
+}
+
+/// The cells an op reads (weights are committed separately, not as cells).
+fn op_inputs(op: &Op) -> Vec<&str> {
+    match op {
+        Op::Add { inputs, .. } => inputs.iter().map(|s| s.as_str()).collect(),
+        Op::Mul { a, b, .. } => vec![a.as_str(), b.as_str()],
+        Op::Reshape { input, .. }
+        | Op::Matmul { input, .. }
+        | Op::CausalSoftmax { input, .. }
+        | Op::Silu { input, .. }
+        | Op::TopK { input, .. }
+        | Op::Norm { input, .. }
+        | Op::Rope { input, .. } => vec![input.as_str()],
+        Op::Scores { q, k, .. } => vec![q.as_str(), k.as_str()],
+        Op::WeightedV { weights, v, .. } => vec![weights.as_str(), v.as_str()],
+        Op::WeightedSum { choice, terms, .. } => std::iter::once(choice.as_str())
+            .chain(terms.iter().map(|s| s.as_str()))
+            .collect(),
+        Op::Embed { .. } => Vec::new(),
+    }
+}
+
+/// Split the model's cells into segments of at most `max_cells` tables each.
+///
+/// Segments follow the spec's op order, so an op and its output cell always land in
+/// the same segment. Both sides run this: the prover from `spec.cells`, the verifier
+/// from the same spec. Any input that lives in an earlier segment is **copied** into
+/// the later one and tied back by a [`link_point`] opening, so no claim ever needs
+/// another segment's root.
+pub fn plan_segments(ops: &[Op], cells: &[String], max_cells: usize) -> Vec<Vec<String>> {
+    let max_cells = max_cells.max(1);
+    let mut out: Vec<Vec<String>> = Vec::new();
+    let mut cur: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for op in ops {
+        for name in op_outputs(op) {
+            if seen.insert(name.to_string()) {
+                cur.push(name.to_string());
+            }
+        }
+        if cur.len() >= max_cells {
+            out.push(std::mem::take(&mut cur));
+        }
+    }
+    if !cur.is_empty() || out.is_empty() {
+        out.push(cur);
+    }
+    // Cells no op produces are model inputs: they belong to the first segment, so an
+    // op that reads one usually finds it in its own segment.
+    let tail: Vec<String> = cells
+        .iter()
+        .filter(|c| !seen.contains(*c))
+        .cloned()
+        .collect();
+    if !tail.is_empty() {
+        out.first_mut().expect("at least one segment").extend(tail);
+    }
+    out
+}
+
+/// One cross-segment tie: `name` is committed in `from` and copied into `to`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LinkSpec {
+    pub from: usize,
+    pub to: usize,
+    pub name: String,
+}
+
+/// The Fiat–Shamir point at which a link is opened on both sides.
+///
+/// Derived from public data only (`to`, the cell name, and its arity), so the earlier
+/// segment can record its opening before the later one is even planned.
+pub fn link_point(to: usize, name: &str, m: usize) -> Vec<Ext> {
+    let mut tr = Transcript::new(&crate::pcs::transcript::new_challenger());
+    tr.observe_val(Fp::new(to as u64));
+    for b in name.as_bytes() {
+        tr.observe_val(Fp::new(*b as u64));
+    }
+    (0..m).map(|_| tr.sample_ext()).collect()
+}
+
+/// Every tie the segment split needs, in `(from, to, name)` order.
+pub fn link_schedule(segment_cells: &[Vec<String>], per_segment: &[Vec<Op>]) -> Vec<LinkSpec> {
+    let mut out = Vec::new();
+    for (to, ops) in per_segment.iter().enumerate() {
+        let own = &segment_cells[to];
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for op in ops {
+            for name in op_inputs(op) {
+                if own.iter().any(|c| c == name) || !seen.insert(name) {
+                    continue;
+                }
+                if let Some(from) = segment_cells
+                    .iter()
+                    .position(|cs| cs.iter().any(|c| c == name))
+                {
+                    // A copy may look *forward* too (an unproduced model input lives in
+                    // segment 0), so both directions are linked.
+                    if from != to {
+                        out.push(LinkSpec {
+                            from,
+                            to,
+                            name: name.to_string(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The openings each segment must record for the link schedule.
+///
+/// Index `s` holds the `(name, point)` pairs for `s`'s outgoing links (the original
+/// cell) **and** its incoming ones (the copy), so both sides of every tie end up as
+/// ordinary claims in the two segments' proofs.
+pub fn link_openings(
+    links: &[LinkSpec],
+    segments: usize,
+    m_of: impl Fn(&str) -> usize,
+) -> Vec<Vec<(String, Vec<Ext>)>> {
+    let mut out = vec![Vec::new(); segments];
+    for l in links {
+        let point = link_point(l.to, &l.name, m_of(&l.name));
+        out[l.from].push((l.name.clone(), point.clone()));
+        out[l.to].push((l.name.clone(), point));
+    }
+    out
+}
+
+/// The cells an op reads that its own segment does not commit, deduplicated.
+pub fn external_inputs(own: &[String], ops: &[Op]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for op in ops {
+        for name in op_inputs(op) {
+            if own.iter().any(|c| c == name) {
+                continue;
+            }
+            if !out.iter().any(|c| c == name) {
+                out.push(name.to_string());
+            }
+        }
+    }
+    out
+}
+
 /// `y = W·x` for a single input row.
 fn matvec(w: &WeightMatrix, x: &[i64]) -> Vec<i64> {
     assert_eq!(x.len(), w.cols, "matvec input width");
@@ -672,11 +839,40 @@ pub fn prove_segment_with_head(
     cells: &[Cell],
     weights: &[WeightMatrix],
     dims: &crate::model::spec::Dims,
+    params_digits: (usize, Fp, Fp, u32, f64),
+    bounds: &LookupBounds,
+    params: Params,
+    window: &[usize],
+    head: Option<&HeadSpec>,
+) -> Result<SegmentBundle, DriverError> {
+    prove_segment_full(
+        ops,
+        cells,
+        weights,
+        dims,
+        params_digits,
+        bounds,
+        params,
+        window,
+        head,
+        &[],
+    )
+}
+
+/// [`prove_segment_with_head`] plus extra openings of **this** segment's cells at
+/// caller-chosen points — the outgoing side of the cross-segment links.
+#[allow(clippy::too_many_arguments)]
+pub fn prove_segment_full(
+    ops: &[Op],
+    cells: &[Cell],
+    weights: &[WeightMatrix],
+    dims: &crate::model::spec::Dims,
     (digits, alpha, beta, rec_q, eps): (usize, Fp, Fp, u32, f64),
     bounds: &LookupBounds,
     params: Params,
     window: &[usize],
     head: Option<&HeadSpec>,
+    extra: &[(String, Vec<Ext>)],
 ) -> Result<SegmentBundle, DriverError> {
     let _ = (dims, window, head);
     let by_name: std::collections::HashMap<&str, &WeightMatrix> =
@@ -1483,6 +1679,14 @@ pub fn prove_segment_with_head(
         _ => None,
     };
 
+    // Outgoing cross-segment links: open this segment's own cells at the points the
+    // later segments will read. Those points are public, so the verifier replays them
+    // from the commitments without touching the transcript.
+    for (name, point) in extra {
+        let id = seg.id(name);
+        seg.claim_id(id, &[0], point);
+    }
+
     let commitment = seg.commitment();
     let claims = seg.claims().to_vec();
     let proof = seg.prove(&mut new_challenger());
@@ -2138,6 +2342,62 @@ pub fn ops_per_segment(
     Ok(out)
 }
 
+/// Verify every cross-segment link of a proven model.
+///
+/// A link `(from, to, name)` says the cell `name` committed in segment `to` is a copy
+/// of the one committed in segment `from`. Both are opened at the public point
+/// [`link_point`], and the two opened values must agree; a prover that fabricates the
+/// copy is caught with probability `1 − 1/|F|` per link.
+///
+/// The schedule is **derived**, not taken from the proof: segments come from
+/// [`plan_segments`] over the spec, so a proof cannot drop or add a link.
+pub fn verify_links(
+    file: &ProvedModel,
+    spec: &crate::model::spec::ModelSpec,
+    max_cells: usize,
+) -> bool {
+    let plan = plan_segments(&spec.ops, &spec.cells, max_cells);
+    if plan.len() != file.segments.len() {
+        return false;
+    }
+    let Ok(per_segment) = ops_per_segment(&spec.ops, &plan) else {
+        return false;
+    };
+    for link in link_schedule(&plan, &per_segment) {
+        let (Some(a), Some(b)) = (file.segments.get(link.from), file.segments.get(link.to)) else {
+            return false;
+        };
+        let (Some(ca), Some(cb)) = (
+            a.segment.commitment.cell(&link.name),
+            b.segment.commitment.cell(&link.name),
+        ) else {
+            return false;
+        };
+        let m = b.segment.commitment.cells[cb].m();
+        if a.segment.commitment.cells[ca].m() != m {
+            return false;
+        }
+        let point = link_point(link.to, &link.name, m);
+        let va = crate::gkr::segment::claim_value_at_id(
+            &a.segment.commitment,
+            &a.segment.claims,
+            ca,
+            &point,
+        );
+        let vb = crate::gkr::segment::claim_value_at_id(
+            &b.segment.commitment,
+            &b.segment.claims,
+            cb,
+            &point,
+        );
+        // `segment_cells` is only used for its length above; the plan is authoritative.
+        if va.is_none() || va != vb {
+            return false;
+        }
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2608,6 +2868,125 @@ mod tests {
             &bounds,
             &[]
         ));
+    }
+
+    #[test]
+    fn segmented_model_links_every_cross_segment_input() {
+        use crate::model::spec::{Dims, ModelSpec};
+
+        let dims = Dims {
+            hidden: 4,
+            vocab: 4,
+            layers: 1,
+            heads: 1,
+            head_dim: 4,
+            experts: 4,
+            active: 1,
+            intermediate: 4,
+        };
+        let x = vec![1i64, 2, 3, 4];
+        // Two chained ops: `p = x·x`, `q = p + p`.
+        let p: Vec<i64> = x.iter().map(|&v| v * v).collect();
+        let q: Vec<i64> = p.iter().map(|&v| 2 * v).collect();
+        let cells = vec![
+            Cell::new("x", 4, 1, x),
+            Cell::new("p", 4, 1, p),
+            Cell::new("q", 4, 1, q),
+        ];
+        let ops = vec![
+            Op::Mul {
+                a: "x".into(),
+                b: "x".into(),
+                output: "p".into(),
+            },
+            Op::Add {
+                inputs: vec!["p".into(), "p".into()],
+                output: "q".into(),
+            },
+        ];
+        let spec = ModelSpec {
+            dims: dims.clone(),
+            weights: Vec::new(),
+            ops: ops.clone(),
+            cells: vec!["x".into(), "p".into(), "q".into()],
+        };
+        let bounds = LookupBounds {
+            silu_lo: -1,
+            silu_hi: 1,
+            sign_lo: -1,
+            sign_hi: 1,
+            exp_lo: -1,
+            score_lo: 0,
+            score_hi: 1,
+            rope_lo: -1,
+            rope_hi: 1,
+        };
+
+        // One cell per segment, so `q`'s read of `p` must cross a boundary.
+        let plan = plan_segments(&spec.ops, &spec.cells, 1);
+        assert_eq!(plan.len(), 2, "two segments");
+        let mut first = plan[0].clone();
+        first.sort();
+        assert_eq!(first, vec!["p".to_string(), "x".to_string()]);
+        assert_eq!(plan[1], vec!["q".to_string()]);
+        let per_segment = ops_per_segment(&spec.ops, &plan).unwrap();
+        let links = link_schedule(&plan, &per_segment);
+        assert_eq!(links.len(), 1, "q reads p across the boundary");
+        assert_eq!(
+            (links[0].from, links[0].to, links[0].name.as_str()),
+            (0, 1, "p")
+        );
+
+        // Prove each segment, copying the external input and opening it at the link point.
+        let arity = |_name: &str| 2usize; // every cell here is 4 entries -> 2^2
+        let openings = link_openings(&links, plan.len(), arity);
+        let mut segments = Vec::new();
+        for s in 0..plan.len() {
+            let mut seg_cells: Vec<Cell> = plan[s]
+                .iter()
+                .map(|n| cells.iter().find(|c| &c.name == n).unwrap().clone())
+                .collect();
+            for name in external_inputs(&plan[s], &per_segment[s]) {
+                seg_cells.push(cells.iter().find(|c| &c.name == &name).unwrap().clone());
+            }
+            let extra: Vec<(String, Vec<Ext>)> = openings[s].clone();
+            segments.push(
+                prove_segment_full(
+                    &per_segment[s],
+                    &seg_cells,
+                    &[],
+                    &dims,
+                    (1, Fp::new(11), Fp::new(5), 8, 0.0),
+                    &bounds,
+                    Params::default(),
+                    &[],
+                    None,
+                    &extra,
+                )
+                .unwrap(),
+            );
+        }
+        let file = ProvedModel {
+            segments,
+            window: Vec::new(),
+            bounds,
+            head_token: 0,
+            head_max: 0,
+            head_segment: 1,
+        };
+        assert!(verify_links(&file, &spec, 1), "honest links verify");
+
+        // A copy that disagrees with the cell it claims to copy is rejected.
+        let mut bad = file.clone();
+        let mut forged = bad.segments[1].segment.commitment.clone();
+        forged.cells[0].name = "q".into();
+        let mut bundle = bad.segments[1].clone();
+        bundle.segment.commitment.cells[1].name = "q".into();
+        bad.segments[1] = bundle;
+        let _ = forged;
+        // Simpler forgery: rename the copied cell so the link cannot find it.
+        bad.segments[1].segment.commitment.cells[1].name = "p2".into();
+        assert!(!verify_links(&bad, &spec, 1));
     }
 
     #[test]

@@ -30,6 +30,12 @@ struct Args {
     /// `eps` for the RMSNorm denominator (must match the proof).
     #[arg(long, default_value_t = 1e-6)]
     eps: f64,
+    /// Maximum number of committed tables per segment (must match the proof).
+    #[arg(long, default_value_t = 40)]
+    segments: usize,
+    /// The cell holding the last logits row (the head's input).
+    #[arg(long, default_value = "logits")]
+    head_cell: String,
 }
 
 fn main() -> ExitCode {
@@ -40,21 +46,14 @@ fn main() -> ExitCode {
     let published: HashMap<String, SegmentCommitment> = commits.into_iter().collect();
     let file: ProvedModel = common::load_bin(&args.proof);
 
-    // Ops are assigned to segments by the cell names each segment committed, so the
-    // verifier never needs the trace.
-    let segment_cells: Vec<Vec<String>> = file
-        .segments
-        .iter()
-        .map(|b| {
-            b.segment
-                .commitment
-                .cells
-                .iter()
-                .map(|c| c.name.clone())
-                .collect()
-        })
-        .collect();
-    let Some(per_segment) = ops_per_segment(&spec.ops, &segment_cells).ok() else {
+    // Ops are assigned to segments by the spec's own split, so the verifier derives
+    // the same schedule the prover used (including the cross-segment links).
+    let plan = flashprove::gkr::driver::plan_segments(&spec.ops, &spec.cells, args.segments);
+    if plan.len() != file.segments.len() {
+        println!("reject (segment count)");
+        return ExitCode::FAILURE;
+    }
+    let Some(per_segment) = ops_per_segment(&spec.ops, &plan).ok() else {
         println!("reject (ops do not map to segments)");
         return ExitCode::FAILURE;
     };
@@ -62,9 +61,8 @@ fn main() -> ExitCode {
     let mut ok = true;
     for (s, bundle) in file.segments.iter().enumerate() {
         let head = if s == file.head_segment {
-            let logits = segment_cells[s].last().cloned().unwrap_or_default();
             Some(HeadSpec {
-                logits,
+                logits: args.head_cell.clone(),
                 token: file.head_token,
                 max: file.head_max,
             })
@@ -89,6 +87,9 @@ fn main() -> ExitCode {
             head.as_ref(),
         );
     }
+
+    // Every cross-segment copy must equal the cell it copies.
+    ok &= flashprove::gkr::driver::verify_links(&file, &spec, args.segments);
 
     println!("{}", if ok { "accept" } else { "reject" });
     if ok {
