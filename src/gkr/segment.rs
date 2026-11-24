@@ -124,6 +124,8 @@ pub struct CellClaim {
 pub struct CellSegment {
     prover: SegmentProver,
     cells: Vec<CellMeta>,
+    /// Name → cell id, so the op graph does not scan the table list per lookup.
+    ids: HashMap<String, usize>,
     claims: Vec<CellClaim>,
 }
 
@@ -142,6 +144,11 @@ impl CellSegment {
         }
         Self {
             prover: c.seal(params),
+            ids: metas
+                .iter()
+                .enumerate()
+                .map(|(i, m)| (m.name.clone(), i))
+                .collect(),
             cells: metas,
             claims: Vec::new(),
         }
@@ -232,6 +239,11 @@ impl CellSegment {
         }
         Self {
             prover: c.seal(params),
+            ids: metas
+                .iter()
+                .enumerate()
+                .map(|(i, m)| (m.name.clone(), i))
+                .collect(),
             cells: metas,
             claims: Vec::new(),
         }
@@ -250,9 +262,9 @@ impl CellSegment {
 
     /// The id of `name`, panicking when the segment does not hold it.
     pub fn id(&self, name: &str) -> usize {
-        self.cells
-            .iter()
-            .position(|c| c.name == name)
+        *self
+            .ids
+            .get(name)
             .unwrap_or_else(|| panic!("unknown cell `{name}`"))
     }
 
@@ -1976,15 +1988,35 @@ pub fn claim_matmul(
     assert_eq!(c.len(), 1 << (ln + lp), "C dimensions");
 
     let c_val = matrix_mle(&c, &r, &s);
+    drop(c);
 
-    // Contraction MLEs: p[k] = Ã(r, k), q[k] = B̃(k, s).
+    // Contraction MLEs, each a single pass over the operand:
+    //   p[k] = Ã(r, k) = Σ_n eq(r, n)·a[n·2^lm + k]
+    //   q[k] = B̃(k, s) = Σ_t eq(s, t)·b[k·2^lp + t]
+    // The `2^lm`-fold `matrix_mle` sweep this replaces is `O(N·K·K)`.
     let mut p = vec![Ext::ZERO; 1 << lm];
-    let mut q = vec![Ext::ZERO; 1 << lm];
-    for k in 0..(1 << lm) {
-        let kb = bool_point(k, lm);
-        p[k] = matrix_mle(&a, &r, &kb);
-        q[k] = matrix_mle(&b, &kb, &s);
+    for (n, rn) in (0..(1usize << ln))
+        .map(|n| (n, crate::field::eq(&r, n)))
+        .filter(|&(_, rn)| rn != Ext::ZERO)
+    {
+        let base = n << lm;
+        for k in 0..(1 << lm) {
+            p[k] += rn * a[base + k];
+        }
     }
+    drop(a);
+
+    let eq_s: Vec<Ext> = (0..(1usize << lp))
+        .map(|t| crate::field::eq(&s, t))
+        .collect();
+    let mut q = vec![Ext::ZERO; 1 << lm];
+    for (k, qk) in q.iter_mut().enumerate() {
+        let base = k << lp;
+        for (t, &et) in eq_s.iter().enumerate() {
+            *qk += et * b[base + t];
+        }
+    }
+    drop(b);
 
     let mut kstar = Vec::with_capacity(lm);
     let mut rounds = Vec::with_capacity(lm);

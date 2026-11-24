@@ -1299,10 +1299,9 @@ pub fn prove_segment_full(
     let mut proofs = Vec::with_capacity(ops.len());
 
     // Pass 2: claim, in spec order.
+    let t_ops = std::time::Instant::now();
     for (i, op) in ops.iter().enumerate() {
-        if i % 25 == 0 {
-            eprintln!("  op {}/{}: {}", i, ops.len(), op_name(op));
-        }
+        eprintln!("  op {}/{}: {}  [t={:.1}s]", i, ops.len(), op_name(op), t_ops.elapsed().as_secs_f64());
         let names = planned[i].take().expect("planned in pass 1");
         match (op, names) {
             (Op::Add { inputs, output }, PlannedOp::Plain) => {

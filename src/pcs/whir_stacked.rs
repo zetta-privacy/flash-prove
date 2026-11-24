@@ -354,6 +354,33 @@ impl SegmentProver {
         values
     }
 
+    /// Record an opening whose value the caller already computed.
+    ///
+    /// [`Self::claim`] evaluates the full `2^m`-entry MLE; when the value is available
+    /// cheaply (a single row of a huge table, say), this is the way to record it.
+    pub fn claim_value(&mut self, table: usize, cols: &[usize], point: &[EF], values: Vec<EF>) {
+        let shape = self.commitment.tables[table];
+        assert_eq!(point.len(), shape.m, "point arity must equal the table's m");
+        assert_eq!(values.len(), cols.len(), "one value per column");
+        self.claims.push(Claim {
+            table,
+            cols: cols.to_vec(),
+            point: point.to_vec(),
+            values,
+        });
+    }
+
+    /// The logical values `[start, start + len)` of a column, without copying the rest.
+    pub fn column_range(&self, table: usize, col: usize, start: usize, len: usize) -> Vec<F> {
+        self.pd
+            .table(table)
+            .column(col)
+            .values()
+            .skip(start)
+            .take(len)
+            .collect()
+    }
+
     /// Produce the single stacked WHIR proof covering every recorded claim.
     ///
     /// `ch` must be the segment's transcript: this absorbs the root and then

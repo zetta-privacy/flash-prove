@@ -26,8 +26,8 @@ use crate::gkr::segment::{
     verify_sum_squares, CellClaim, CellSegment, CellSegmentCommitment, MulSegmentProof,
     SumSquaresProof, View,
 };
-use crate::pcs::transcript::Transcript;
 use crate::pcs::linear_claim::{LinearClaimProof, LinearH};
+use crate::pcs::transcript::Transcript;
 use p3_field::PrimeCharacteristicRing;
 
 /// One random-point linear claim value.
@@ -426,7 +426,6 @@ pub fn verify_rope(
     verify_requant(commitment, claims, &proof.requant, (n, k, digits), tr)
 }
 
-
 /// The reference reciprocal `inv_q = round(2^Q / s)` for a softmax total `s`.
 pub fn softmax_inv_q(s: i64, rec_q: u32) -> i64 {
     if s <= 0 {
@@ -562,12 +561,7 @@ pub fn claim_softmax_row(
     let requant = claim_requant(seg, c.requant.clone(), (n, k, digits), tr);
     let b_nrm = seg.claim_linear_id(c.nrm, 0, &h2, tr);
     let m_probs = seg.cells_meta(c.probs).m();
-    let b_probs = seg.claim_linear_view(
-        c.probs,
-        &View::block(m_probs, row * n, log_n),
-        &h2,
-        tr,
-    );
+    let b_probs = seg.claim_linear_view(c.probs, &View::block(m_probs, row * n, log_n), &h2, tr);
 
     SoftmaxRowProof {
         row,
@@ -752,17 +746,54 @@ pub fn verify_softmax_row(
     linear_finish(&h2, &z, cf, v) && proof.b_nrm.0 == proof.b_probs.0
 }
 
+/// One window row of an `embed` claim: `out[t, ·] == W[row, ·]`, checked at one
+/// random point per side.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct EmbedRow {
+    /// The weight row this activation row must equal.
+    pub row: usize,
+    /// The point on the activation cell (the row block at `r`).
+    pub out_point: Vec<Ext>,
+    /// The point on the weight (the same `r` over the row's hidden block).
+    pub weight_point: Vec<Ext>,
+    pub out_value: Ext,
+    pub weight_value: Ext,
+}
+
 /// An `embed` claim: `out[b, ·] = emb[window[b], ·]`.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct EmbedSegmentProof {
     pub out: usize,
-    pub weight: crate::gkr::segment::WeightOpen,
-    pub r: Vec<Fp>,
-    pub b_out: Lin,
-    pub b_emb: Lin,
+    pub weight_cell: usize,
+    pub weight_name: String,
+    /// The random point `r` over a hidden block, sampled after both commitments.
+    pub r: Vec<Ext>,
+    pub rows: Vec<EmbedRow>,
+}
+
+/// The two points one embed row is opened at: the activation's row block and the
+/// weight's row, both at the same random `r` over `hidden`.
+///
+/// `hidden` must be a power of two (the block and the row are aligned views of the
+/// two commitments), and `token < vocab`.
+fn embed_points(
+    t: usize,
+    token: usize,
+    r: &[Ext],
+    (hidden_bits, m_out, m_w): (usize, usize, usize),
+) -> (Vec<Ext>, Vec<Ext>) {
+    let out_view = View::block(m_out, t << hidden_bits, hidden_bits);
+    let row_bits: Vec<(usize, bool)> = (0..m_w - hidden_bits)
+        .map(|i| (hidden_bits + i, (token >> i) & 1 == 1))
+        .collect();
+    let weight_view = View::gather((0..hidden_bits).collect(), row_bits);
+    (out_view.point(r, m_out), weight_view.point(r, m_w))
 }
 
 /// Claim `out = emb[window]` for a whole activation row block.
+///
+/// Cost is `O(l · hidden)`: each row is one point opening on the activation and one
+/// on the weight's own root, instead of a dense scan of the whole vocabulary.
 #[allow(clippy::too_many_arguments)]
 pub fn claim_embed(
     seg: &mut CellSegment,
@@ -774,33 +805,59 @@ pub fn claim_embed(
     weight_name: &str,
     tr: &mut Transcript,
 ) -> EmbedSegmentProof {
-    let n = l * hidden;
     assert_eq!(window.len(), l, "one window position per row");
+    let m_out = seg.cells_meta(out).m();
+    let m_w = weight.table_m(weight_cell);
+    let hidden_bits = hidden.trailing_zeros() as usize;
+    assert!(
+        hidden.is_power_of_two(),
+        "embed hidden must be a power of two"
+    );
+    assert_eq!(1usize << hidden_bits, hidden);
+    assert!(
+        (l << hidden_bits) <= (1usize << m_out),
+        "activation rows fit the cell"
+    );
+    assert!(
+        (1usize << (m_w - hidden_bits)) >= vocab,
+        "vocabulary fits the weight table"
+    );
+
     tr.observe_val(Fp::new(out as u64));
+    tr.observe_val(Fp::new(weight_cell as u64));
+    let r: Vec<Ext> = (0..hidden_bits).map(|_| tr.sample_ext()).collect();
 
-    let mut r: Vec<Fp> = (0..n).map(|_| tr.sample_val()).collect();
-    r.resize(n.next_power_of_two(), Fp::new(0));
-    let b_out = seg.claim_linear_id(out, 0, &LinearH::Dense(r.clone()), tr);
+    // One read of the tensor; the window's rows are sliced out of it. (`claim` would
+    // evaluate the whole `2^m_w` MLE once per row, which is `l · vocab · hidden`.)
+    let col = weight.column_logical(weight_cell, 0);
+    let block = 1usize << hidden_bits;
 
-    let h = LinearH::Sparse {
-        entries: (0..n)
-            .map(|i| (window[i / hidden] * hidden + i % hidden, r[i]))
-            .collect(),
-        len: vocab * hidden,
-    };
-    let (b_emb, proof, z_emb, opened_emb) = weight.claim_linear(weight_cell, 0, &h, tr);
+    let mut rows = Vec::with_capacity(l);
+    for (t, &token) in window.iter().enumerate() {
+        let (out_point, weight_point) = embed_points(t, token, &r, (hidden_bits, m_out, m_w));
+        let out_value = seg.claim_id(out, &[0], &out_point)[0];
+        let start = token << hidden_bits;
+        // The MLE of the row block at `r`: `Σ_j eq(r, j)·value_j` over the `hidden` entries.
+        let weight_value: Ext = (0..block)
+            .map(|j| crate::field::eq(&r, j) * Ext::from(col[start + j]))
+            .sum();
+        weight.claim_value(weight_cell, &[0], &weight_point, vec![weight_value]);
+        debug_assert_eq!(out_value, weight_value, "embed row matches the weight row");
+        rows.push(EmbedRow {
+            row: token,
+            out_point,
+            weight_point,
+            out_value,
+            weight_value,
+        });
+    }
 
     EmbedSegmentProof {
         out,
-        weight: crate::gkr::segment::WeightOpen {
-            name: weight_name.to_string(),
-            cell: weight_cell,
-            point: z_emb,
-            value: opened_emb,
-        },
+        weight_cell,
+        weight_name: weight_name.to_string(),
         r,
-        b_out,
-        b_emb: (b_emb, proof),
+        rows,
     }
 }
 
@@ -816,51 +873,63 @@ pub fn verify_embed(
     (l, hidden, vocab): (usize, usize, usize),
     tr: &mut Transcript,
 ) -> bool {
-    let n = l * hidden;
-    let n_pad = n.next_power_of_two();
-    if window.len() != l || proof.r.len() != n_pad {
+    if window.len() != l {
+        return false;
+    }
+    let Some(meta) = commitment.cells.get(proof.out) else {
+        return false;
+    };
+    let (Some(wm), Some(wshape)) = (
+        w_com.tables.get(proof.weight_cell).map(|t| t.m),
+        w_com.tables.get(proof.weight_cell),
+    ) else {
+        return false;
+    };
+    let _ = wshape;
+    if proof.rows.len() != l {
+        return false;
+    }
+    let hidden_bits = hidden.trailing_zeros() as usize;
+    if !hidden.is_power_of_two() || proof.r.len() != hidden_bits {
         return false;
     }
     tr.observe_val(Fp::new(proof.out as u64));
-    let mut r: Vec<Fp> = (0..n).map(|_| tr.sample_val()).collect();
-    r.resize(n_pad, Fp::new(0));
+    tr.observe_val(Fp::new(proof.weight_cell as u64));
+    let r: Vec<Ext> = (0..hidden_bits).map(|_| tr.sample_ext()).collect();
     if r != proof.r {
         return false;
     }
 
-    let Some((z, cf)) = linear_verify(&proof.b_out.1, proof.b_out.0, tr) else {
-        return false;
-    };
-    let Some(v) = claim_value_at_id(commitment, claims, proof.out, &z) else {
-        return false;
-    };
-    if !linear_finish(&LinearH::Dense(r.clone()), &z, cf, v) {
-        return false;
+    // Every row must be opened at the two derived points, and the two values agree.
+    let m_out = meta.m();
+    let mut w_claims = Vec::with_capacity(l);
+    for (t, row) in proof.rows.iter().enumerate() {
+        if row.row != window[t] || row.row >= vocab {
+            return false;
+        }
+        let (out_point, weight_point) = embed_points(t, row.row, &r, (hidden_bits, m_out, wm));
+        if row.out_point != out_point || row.weight_point != weight_point {
+            return false;
+        }
+        if claim_value_at_id(commitment, claims, proof.out, &out_point) != Some(row.out_value)
+            || row.out_value != row.weight_value
+        {
+            return false;
+        }
+        w_claims.push(crate::pcs::whir_stacked::Claim {
+            table: proof.weight_cell,
+            cols: vec![0],
+            point: weight_point,
+            values: vec![row.weight_value],
+        });
     }
 
-    let h = LinearH::Sparse {
-        entries: (0..n)
-            .map(|i| (window[i / hidden] * hidden + i % hidden, r[i]))
-            .collect(),
-        len: vocab * hidden,
-    };
-    let Some((zw, cfw)) = linear_verify(&proof.b_emb.1, proof.b_emb.0, tr) else {
-        return false;
-    };
-    let opened = crate::pcs::whir_stacked::verify(
+    crate::pcs::whir_stacked::verify(
         w_com,
-        &[crate::pcs::whir_stacked::Claim {
-            table: proof.weight.cell,
-            cols: vec![0],
-            point: proof.weight.point.clone(),
-            values: vec![proof.weight.value],
-        }],
+        &w_claims,
         w_proof,
         &mut crate::pcs::transcript::new_challenger(),
-    );
-    opened
-        && linear_finish(&h, &zw, cfw, proof.weight.value)
-        && proof.b_out.0 == proof.b_emb.0
+    )
 }
 
 #[cfg(test)]
@@ -1040,7 +1109,9 @@ mod tests {
         let scores = vec![3i64, 1];
         let m = 3i64;
         let exp_lo = -2i64;
-        let d: Vec<i64> = (0..n).map(|i| if i <= l { scores[i] - m } else { exp_lo }).collect();
+        let d: Vec<i64> = (0..n)
+            .map(|i| if i <= l { scores[i] - m } else { exp_lo })
+            .collect();
         let e: Vec<i64> = d.iter().map(|&x| exp_q15(x)).collect();
         let s_int: i64 = e.iter().take(l + 1).sum();
         let inv_q = super::softmax_inv_q(s_int, rec_q);
