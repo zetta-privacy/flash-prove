@@ -76,6 +76,21 @@ impl Plan {
         self.sc.cell(name, rows, cols, values)
     }
 
+    /// Add a derived cell as a **flat** one-column table, keeping `rows × cols` as its
+    /// logical shape.
+    ///
+    /// This is the storage the trace cells use (and what the linear claims read), so a
+    /// derived cell that a multi-dimensional claim indexes must be added this way: a
+    /// `cols`-wide table has only `log2(rows)` variables, while a flat cell has
+    /// `log2(rows·cols)`.
+    pub fn add_logical(&mut self, name: &str, rows: usize, cols: usize, values: Vec<i64>) -> usize {
+        self.trace
+            .entry(name.to_string())
+            .or_insert_with(|| values.clone());
+        self.logical.entry(name.to_string()).or_insert((rows, cols));
+        self.sc.cell_logical(name, rows, cols, values)
+    }
+
     /// Seal the whole plan into one segment.
     pub fn seal(self, params: Params) -> CellSegment {
         self.sc.seal(params)

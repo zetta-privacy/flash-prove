@@ -11,13 +11,13 @@ mod common;
 use std::path::PathBuf;
 
 use clap::Parser;
+use flashprove::field::Fp;
 use flashprove::gkr::driver::{
     ops_per_segment, prove_segment_with_head, DriverError, HeadSpec, LookupBounds, ProvedModel,
     SegmentBundle,
 };
-use flashprove::field::Fp;
-use flashprove::model::Trace;
 use flashprove::model::spec::ModelSpec;
+use flashprove::model::Trace;
 use flashprove::pcs::whir_stacked::Params;
 
 #[derive(Parser)]
@@ -87,7 +87,8 @@ fn main() {
         .iter()
         .map(|s| s.cells.iter().map(|c| c.name.clone()).collect())
         .collect();
-    let per_segment = ops_per_segment(&spec.ops, &segment_cells).unwrap_or_else(|e| panic!("{e:?}"));
+    let per_segment =
+        ops_per_segment(&spec.ops, &segment_cells).unwrap_or_else(|e| panic!("{e:?}"));
 
     let head_segment = trace.segments.len() - 1;
     let mut segments: Vec<SegmentBundle> = Vec::with_capacity(trace.segments.len());
@@ -105,6 +106,13 @@ fn main() {
         } else {
             None
         };
+        eprintln!(
+            "segment {s}/{}: {} cells, {} ops",
+            trace.segments.len(),
+            seg.cells.len(),
+            per_segment[s].len()
+        );
+        let t0 = std::time::Instant::now();
         let bundle = prove_segment_with_head(
             &per_segment[s],
             &seg.cells,
@@ -117,6 +125,7 @@ fn main() {
             head.as_ref(),
         )
         .unwrap_or_else(|e: DriverError| panic!("segment {s}: {e:?}"));
+        eprintln!("segment {s}: proved in {:.1}s", t0.elapsed().as_secs_f64());
         segments.push(bundle);
     }
 

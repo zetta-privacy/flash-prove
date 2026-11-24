@@ -919,6 +919,19 @@ pub struct MatmulWeightProof {
 /// Same sumcheck as [`claim_matmul`]; the only difference is where the three
 /// surviving evaluations are opened: `W`'s on the weight root, `B`/`C`'s on the
 /// activation segment. No weight bytes enter the activation stack.
+///
+/// The three operands are laid out logically as `A = W[n][k]` (weight row-major),
+/// `B = X[t][k]` read **transposed** as `[k][t]`, and `C = Y[t][n]` read transposed
+/// as `[n][t]`, where `t` is the batch (sequence) index. `ln`, `lm`, `lp` are the
+/// arities of `n`, `k`, `t`, so a single batched matmul is one claim:
+///
+/// ```text
+///   p[k] = Σ_n r̃(n)·W[n][k]        O(N·K)
+///   q[k] = Σ_t s̃(t)·X[t][k]        O(L·K)
+///   c    = Σ_{t,n} r̃(n)s̃(t)·Y[t][n]  O(L·N)
+/// ```
+///
+/// i.e. one pass over the data — never the `2^lm`-fold `matrix_mle` sweep.
 #[allow(clippy::too_many_arguments)]
 pub fn claim_matmul_weight(
     seg: &mut CellSegment,
@@ -926,6 +939,7 @@ pub fn claim_matmul_weight(
     weight_cell: usize,
     w_view: &View,
     (b, c): (usize, usize),
+    (b_view, c_view): (&View, &View),
     weight_name: &str,
     tr: &mut Transcript,
     (ln, lm, lp): (usize, usize, usize),
@@ -939,23 +953,57 @@ pub fn claim_matmul_weight(
     let s: Vec<Ext> = (0..lp).map(|_| tr.sample_ext()).collect();
 
     let to_ext = |v: Vec<Fp>| -> Vec<Ext> { v.into_iter().map(Ext::from).collect() };
-    let m_w = weight.table_m(weight_cell);
-    let a = to_ext(w_view.values(&weight.column_logical(weight_cell, 0), m_w));
-    let bv = to_ext(seg.values(b, 0));
-    let cv = to_ext(seg.values(c, 0));
-    assert_eq!(a.len(), 1 << (ln + lm), "W dimensions");
+    let (m_w, m_b, m_c) = (
+        weight.table_m(weight_cell),
+        seg.cells_meta(b).m(),
+        seg.cells_meta(c).m(),
+    );
+    assert_eq!(w_view.bits(m_w), ln + lm, "W view dimensions");
+    assert_eq!(b_view.bits(m_b), lm + lp, "B view dimensions");
+    assert_eq!(c_view.bits(m_c), ln + lp, "C view dimensions");
+
+    let bv = to_ext(b_view.values(&seg.values(b, 0), m_b));
+    let cv = to_ext(c_view.values(&seg.values(c, 0), m_c));
     assert_eq!(bv.len(), 1 << (lm + lp), "B dimensions");
     assert_eq!(cv.len(), 1 << (ln + lp), "C dimensions");
 
     let c_val = matrix_mle(&cv, &r, &s);
+    drop(cv);
 
+    // p[k] = Ã(r,k): contract the weight's rows against `r`. One pass over the
+    // weight, in base-field values (no `Ext` copy of a whole tensor).
+    let wv = {
+        let column = weight.column_logical(weight_cell, 0);
+        match w_view {
+            View::Whole => column,
+            _ => w_view.values(&column, m_w),
+        }
+    };
+    assert_eq!(wv.len(), 1 << (ln + lm), "W dimensions");
     let mut p = vec![Ext::ZERO; 1 << lm];
-    let mut q = vec![Ext::ZERO; 1 << lm];
-    for k in 0..(1 << lm) {
-        let kb = bool_point(k, lm);
-        p[k] = matrix_mle(&a, &r, &kb);
-        q[k] = matrix_mle(&bv, &kb, &s);
+    for (n, rn) in (0..(1usize << ln))
+        .map(|n| (n, crate::field::eq(&r, n)))
+        .filter(|&(_, rn)| rn != Ext::ZERO)
+    {
+        let base = n << lm;
+        for k in 0..(1 << lm) {
+            p[k] += rn * Ext::from(wv[base + k]);
+        }
     }
+    drop(wv);
+
+    // q[k] = B̃(k,s): contract the batch axis of `B` against `s`.
+    let eq_s: Vec<Ext> = (0..(1usize << lp))
+        .map(|t| crate::field::eq(&s, t))
+        .collect();
+    let mut q = vec![Ext::ZERO; 1 << lm];
+    for (k, qk) in q.iter_mut().enumerate() {
+        let base = k << lp;
+        for (t, &et) in eq_s.iter().enumerate() {
+            *qk += et * bv[base + t];
+        }
+    }
+    drop(bv);
 
     let mut kstar = Vec::with_capacity(lm);
     let mut rounds = Vec::with_capacity(lm);
@@ -974,8 +1022,8 @@ pub fn claim_matmul_weight(
 
     let a_point = w_view.point(&concat(&kstar, &r), m_w);
     let opened_a = weight.claim(weight_cell, &[0], &a_point);
-    let opened_b = seg.claim_id(b, &[0], &concat(&s, &kstar))[0];
-    let opened_c = seg.claim_id(c, &[0], &concat(&s, &r))[0];
+    let opened_b = seg.claim_id(b, &[0], &b_view.point(&concat(&s, &kstar), m_b))[0];
+    let opened_c = seg.claim_id(c, &[0], &c_view.point(&concat(&s, &r), m_c))[0];
     assert_eq!(opened_a[0], a_val, "W opening matches the sumcheck");
     assert_eq!(opened_b, b_val, "B opening matches the sumcheck");
     assert_eq!(opened_c, c_val, "C opening matches the sumcheck");
@@ -1000,12 +1048,14 @@ pub fn claim_matmul_weight(
 }
 
 /// Verify a [`MatmulWeightProof`].
+#[allow(clippy::too_many_arguments)]
 pub fn verify_matmul_weight(
     commitment: &CellSegmentCommitment,
     claims: &[CellClaim],
     w_com: &whir_stacked::SegmentCommitment,
     w_proof: &whir_stacked::Proof,
     w_view: &View,
+    (b_view, c_view): (&View, &View),
     proof: &MatmulWeightProof,
     tr: &mut Transcript,
 ) -> bool {
@@ -1013,10 +1063,14 @@ pub fn verify_matmul_weight(
     let Some(m_w) = w_com.tables.get(proof.w.cell).map(|t| t.m) else {
         return false;
     };
-    if commitment.cells.get(b).is_none()
-        || commitment.cells.get(c).is_none()
-        || w_view.bits(m_w) != proof.ln + proof.lm
-    {
+    let (Some(m_b), Some(m_c)) = (
+        commitment.cells.get(b).map(|c| c.m()),
+        commitment.cells.get(c).map(|c| c.m()),
+    ) else {
+        return false;
+    };
+    let (ln, lm, lp) = (proof.ln, proof.lm, proof.lp);
+    if w_view.bits(m_w) != ln + lm || b_view.bits(m_b) != lm + lp || c_view.bits(m_c) != ln + lp {
         return false;
     }
     for id in [b, c] {
@@ -1024,7 +1078,6 @@ pub fn verify_matmul_weight(
     }
     tr.observe_val(Fp::new(proof.w.cell as u64));
 
-    let (ln, lm, lp) = (proof.ln, proof.lm, proof.lp);
     let r: Vec<Ext> = (0..ln).map(|_| tr.sample_ext()).collect();
     let s: Vec<Ext> = (0..lp).map(|_| tr.sample_ext()).collect();
     if proof.rounds.len() != lm {
@@ -1048,8 +1101,14 @@ pub fn verify_matmul_weight(
         return false;
     }
 
-    if claim_value_at_id(commitment, claims, b, &concat(&s, &kstar)) != Some(proof.b_val)
-        || claim_value_at_id(commitment, claims, c, &concat(&s, &r)) != Some(proof.c_val)
+    if claim_value_at_id(
+        commitment,
+        claims,
+        b,
+        &b_view.point(&concat(&s, &kstar), m_b),
+    ) != Some(proof.b_val)
+        || claim_value_at_id(commitment, claims, c, &c_view.point(&concat(&s, &r), m_c))
+            != Some(proof.c_val)
     {
         return false;
     }
@@ -1766,6 +1825,24 @@ impl View {
     /// A gather: logical bit `k` reads cell bit `map[k]`, the rest are fixed.
     pub fn gather(map: Vec<usize>, fixed: Vec<(usize, bool)>) -> Self {
         Self::Mapped { map, fixed }
+    }
+
+    /// Swap the low `lo` bits with the high `hi` bits of an `lo + hi`-bit cell.
+    ///
+    /// This is the transpose of a row-major matrix whose row and column counts are
+    /// both powers of two: logical `[hi][lo]` reads cell `[lo][hi]`.
+    ///
+    /// # Panics
+    ///
+    /// `lo + hi` must equal the cell's arity.
+    pub fn swap_blocks(lo: usize, hi: usize) -> Self {
+        let map = (0..lo + hi)
+            .map(|k| if k < lo { hi + k } else { k - lo })
+            .collect();
+        Self::Mapped {
+            map,
+            fixed: Vec::new(),
+        }
     }
 
     /// Bits of the logical view.
@@ -2986,6 +3063,7 @@ mod tests {
             0,
             &View::Whole,
             (cb, cc),
+            (&View::Whole, &View::Whole),
             "W",
             &mut tr,
             (1, 1, 0),
@@ -3003,6 +3081,7 @@ mod tests {
             &w_com,
             &wt_proof,
             &View::Whole,
+            (&View::Whole, &View::Whole),
             &proof,
             &mut vtr
         ));
@@ -3029,6 +3108,7 @@ mod tests {
             0,
             &View::Whole,
             (cb, cc),
+            (&View::Whole, &View::Whole),
             "W",
             &mut Transcript::new(&new_challenger()),
             (1, 1, 0),
@@ -3041,6 +3121,7 @@ mod tests {
             &w_com,
             &wt_proof,
             &View::Whole,
+            (&View::Whole, &View::Whole),
             &bad_proof,
             &mut vtr
         ));
@@ -3087,6 +3168,7 @@ mod tests {
             0,
             &view,
             (cb, cc),
+            (&View::Whole, &View::Whole),
             "W",
             &mut tr,
             (1, 1, 0),
@@ -3098,7 +3180,14 @@ mod tests {
         assert!(verify(&com, &claims, &wproof, &mut new_challenger()));
         let mut vtr = Transcript::new(&new_challenger());
         assert!(verify_matmul_weight(
-            &com, &claims, &w_com, &wt_proof, &view, &proof, &mut vtr
+            &com,
+            &claims,
+            &w_com,
+            &wt_proof,
+            &view,
+            (&View::Whole, &View::Whole),
+            &proof,
+            &mut vtr
         ));
 
         // The whole-matrix view is not what the proof used, so it is rejected.
@@ -3109,6 +3198,7 @@ mod tests {
             &w_com,
             &wt_proof,
             &View::Whole,
+            (&View::Whole, &View::Whole),
             &proof,
             &mut vtr
         ));

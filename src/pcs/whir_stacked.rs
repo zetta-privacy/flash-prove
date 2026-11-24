@@ -216,6 +216,13 @@ impl Committer {
 
         let witness = Witness::new(tables, FOLDING);
         let m = witness.num_variables();
+        eprintln!(
+            "  stack: {} tables, max 2^{}, stacked 2^{} ({} values)",
+            shapes.len(),
+            shapes.iter().map(|s| s.m).max().unwrap_or(0),
+            m,
+            if m < 63 { 1usize << m } else { 0 }
+        );
         let (root, pd) = with_prover(m, params, |p| {
             let mut ch = new_challenger();
             p.commit(witness, &mut ch).expect("WHIR stacked commit")

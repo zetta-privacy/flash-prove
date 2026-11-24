@@ -85,9 +85,12 @@ def main():
     args = p.parse_args()
 
     spec_names = None
+    spec_shapes = {}
     if args.spec:
         with open(args.spec) as f:
-            spec_names = {w["name"] for w in json.load(f)["weights"]}
+            spec_weights = json.load(f)["weights"]
+        spec_names = {w["name"] for w in spec_weights}
+        spec_shapes = {w["name"]: (w["rows"], w["cols"]) for w in spec_weights}
 
     index_path = os.path.join(args.dir, "model.safetensors.index.json")
     with open(index_path) as f:
@@ -101,16 +104,21 @@ def main():
             name = rename(key)
             if spec_names is not None and name not in spec_names:
                 continue
-            tensors.append((name, quantize(tensor)))
+            vals = quantize(tensor)
+            if vals.ndim == 1:
+                vals = vals.reshape(1, -1)
+            # The spec fixes each tensor's shape (e.g. a reduced test vocab). Trim the
+            # checkpoint tensor to it, so spec and weights always agree.
+            if name in spec_shapes:
+                rows, cols = spec_shapes[name]
+                vals = vals[:rows, :cols]
+            tensors.append((name, vals))
         del state
 
     with open(args.out, "wb") as f:
         f.write(struct.pack("<I", len(tensors)))
         for name, vals in tensors:
-            if vals.ndim == 1:
-                rows, cols = 1, vals.shape[0]
-            else:
-                rows, cols = vals.shape
+            rows, cols = vals.shape
             nb = name.encode("utf-8")
             f.write(struct.pack("<H", len(nb)))
             f.write(nb)
