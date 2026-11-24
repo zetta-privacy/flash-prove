@@ -52,10 +52,6 @@ pub struct ScoresSegmentProof {
     pub cells: HeadCells,
     /// `(log positions, log head dim, log heads)`.
     pub dims: (usize, usize, usize),
-    /// `q`'s head-block offset (`· d`) and `out`'s (`· lq`) — they differ unless
-    /// `d == lq`, so they cannot share one offset.
-    pub q_start: usize,
-    pub out_start: usize,
     pub head: usize,
     pub inv_q: Fp,
     pub mm: MatmulSegmentProof,
@@ -77,14 +73,48 @@ pub fn head_k_view(log_d: usize, log_h: usize, log_l: usize, head: usize) -> Vie
     View::gather(map, fixed)
 }
 
+/// The `[·][row]` view of a `[rows][heads][·]` cell, head bits fixed.
+///
+/// `lo` is the width of the per-position block: `log_d` for `q`/`k`, `log_l` for the
+/// `scores` output. Logical bits are `[lo..., row...]`.
+pub fn head_block_view(lo: usize, log_h: usize, log_l: usize, head: usize) -> View {
+    let mut map: Vec<usize> = (0..lo).collect();
+    map.extend((0..log_l).map(|r| lo + log_h + r));
+    let fixed: Vec<(usize, bool)> = (0..log_h)
+        .map(|i| (lo + i, (head >> i) & 1 == 1))
+        .collect();
+    View::gather(map, fixed)
+}
+
+/// The transposed `k` head view: logical `[row][dim]` becomes `[dim][row]`.
+pub fn head_k_t_view(log_d: usize, log_h: usize, log_l: usize, head: usize) -> View {
+    let mut map: Vec<usize> = (0..log_l).map(|t| log_d + log_h + t).collect();
+    map.extend(0..log_d);
+    let fixed: Vec<(usize, bool)> = (0..log_h)
+        .map(|i| (log_d + i, (head >> i) & 1 == 1))
+        .collect();
+    View::gather(map, fixed)
+}
+
 /// Claim one head of `scores`.
+/// Claim one **whole head** of `scores`: every query position at once.
+///
+/// ```text
+///   dot[li][t] = Σ_j q[li, hi, j]·k[t, hi, j]        (ln = log_l, lm = log_d, lp = log_l)
+///   y          = inv_q · dot
+///   s          = requant(y, RECIP_Q)
+///   scores[·, hi, ·] = s
+/// ```
+///
+/// Batching the positions into one claim is what keeps the per-op cost proportional to
+/// the data rather than to the number of claims: a `64 × 16` head grid used to be 1024
+/// separate claims, each with its own requant and its own set of cells.
 #[allow(clippy::too_many_arguments)]
 pub fn claim_scores(
     seg: &mut CellSegment,
     cells: HeadCells,
     (log_l, log_d, log_h): (usize, usize, usize),
     head: usize,
-    (q_start, out_start): (usize, usize),
     inv_q: Fp,
     (n, k, digits): (usize, usize, usize),
     tr: &mut Transcript,
@@ -93,39 +123,36 @@ pub fn claim_scores(
         tr.observe_val(Fp::new(id as u64));
     }
 
-    // `dot = k_h · q_h`.
-    let vk = head_k_view(log_d, log_h, log_l, head);
-    let m_q = seg.cells_meta(cells.q).m();
-    let vq = View::block(m_q, q_start, log_d);
-    let dot_view = View::Whole;
+    // `dot = q_h · k_hᵀ`, over all query rows at once.
+    let vq = head_block_view(log_d, log_h, log_l, head);
+    let vkt = head_k_t_view(log_d, log_h, log_l, head);
     let mm = claim_matmul(
         seg,
-        (cells.k, cells.q, cells.dot),
-        (&vk, &vq, &dot_view),
+        (cells.q, cells.k, cells.dot),
+        (&vq, &vkt, &View::Whole),
         tr,
-        (log_l, log_d, 0),
+        (log_l, log_d, log_l),
     );
 
-    // `y = inv_q · dot` at one point.
+    // `y = inv_q · dot` over the whole head block.
     tr.observe_val(Fp::new(cells.dot as u64));
     tr.observe_val(Fp::new(cells.y as u64));
-    let r: Vec<Fp> = (0..(1usize << log_l)).map(|_| tr.sample_val()).collect();
+    let r: Vec<Fp> = (0..(1usize << (log_l + log_l)))
+        .map(|_| tr.sample_val())
+        .collect();
     let h = LinearH::Dense(r.clone());
     let dot_v = seg.claim_linear_view(cells.dot, &View::Whole, &h, tr);
     let y_v = seg.claim_linear_view(cells.y, &View::Whole, &h, tr);
 
-    // `s = requant(y, RECIP_Q)`, then `out`'s block must equal `s`.
+    // `s = requant(y, RECIP_Q)`, then the output's head block must equal `s`.
     let requant = claim_requant(seg, cells.requant.clone(), (n, k, digits), tr);
     let s_v = seg.claim_linear_view(cells.s, &View::Whole, &h, tr);
-    let m_out = seg.cells_meta(cells.out).m();
-    let vout = View::block(m_out, out_start, log_l);
+    let vout = head_block_view(log_l, log_h, log_l, head);
     let out_v = seg.claim_linear_view(cells.out, &vout, &h, tr);
 
     ScoresSegmentProof {
         cells,
         dims: (log_l, log_d, log_h),
-        q_start,
-        out_start,
         head,
         inv_q,
         mm,
@@ -146,18 +173,12 @@ pub fn verify_scores(
     proof: &ScoresSegmentProof,
     (log_l, log_d, log_h): (usize, usize, usize),
     head: usize,
-    (q_start, out_start): (usize, usize),
     inv_q: Fp,
     (n, k, digits): (usize, usize, usize),
     tr: &mut Transcript,
 ) -> bool {
     let cells = proof.cells.clone();
-    if proof.dims != (log_l, log_d, log_h)
-        || proof.head != head
-        || proof.q_start != q_start
-        || proof.out_start != out_start
-        || proof.inv_q != inv_q
-    {
+    if proof.dims != (log_l, log_d, log_h) || proof.head != head || proof.inv_q != inv_q {
         return false;
     }
     let (Some(m_q), Some(m_out)) = (
@@ -170,13 +191,13 @@ pub fn verify_scores(
         tr.observe_val(Fp::new(id as u64));
     }
 
-    let vk = head_k_view(log_d, log_h, log_l, head);
-    let vq = View::block(m_q, q_start, log_d);
+    let vq = head_block_view(log_d, log_h, log_l, head);
+    let vkt = head_k_t_view(log_d, log_h, log_l, head);
     if !verify_matmul(
         commitment,
         claims,
-        (cells.k, cells.q, cells.dot),
-        (&vk, &vq, &View::Whole),
+        (cells.q, cells.k, cells.dot),
+        (&vq, &vkt, &View::Whole),
         &proof.mm,
         tr,
     ) {
@@ -185,7 +206,9 @@ pub fn verify_scores(
 
     tr.observe_val(Fp::new(cells.dot as u64));
     tr.observe_val(Fp::new(cells.y as u64));
-    let r: Vec<Fp> = (0..(1usize << log_l)).map(|_| tr.sample_val()).collect();
+    let r: Vec<Fp> = (0..(1usize << (log_l + log_l)))
+        .map(|_| tr.sample_val())
+        .collect();
     if r != proof.r {
         return false;
     }
@@ -218,7 +241,7 @@ pub fn verify_scores(
         return false;
     }
 
-    // `out`'s head block equals `s`.
+    // `scores[·, hi, ·] == s`.
     let Some((z, cf)) = linear_verify(&proof.s_v.1, proof.s_v.0, tr) else {
         return false;
     };
@@ -228,13 +251,14 @@ pub fn verify_scores(
     if !linear_finish(&h, &z, cf, v) {
         return false;
     }
-    let vout = View::block(m_out, out_start, log_l);
+    let vout = head_block_view(log_l, log_h, log_l, head);
     let Some((z, cf)) = linear_verify(&proof.out_v.1, proof.out_v.0, tr) else {
         return false;
     };
     let Some(v) = claim_value_at_id(commitment, claims, cells.out, &vout.point(&z, m_out)) else {
         return false;
     };
+    let _ = m_q;
     linear_finish(&h, &z, cf, v) && proof.s_v.0 == proof.out_v.0
 }
 
@@ -256,7 +280,6 @@ pub struct WeightedVCells {
 pub struct WeightedVSegmentProof {
     pub cells: WeightedVCells,
     pub dims: (usize, usize, usize),
-    pub block_start: usize,
     pub head: usize,
     pub mm: MatmulSegmentProof,
     pub r: Vec<Fp>,
@@ -280,14 +303,19 @@ pub fn head_v_view(log_d: usize, log_h: usize, log_l: usize, head: usize) -> Vie
     View::gather(map, fixed)
 }
 
-/// Claim one head of `weighted_v`: `acc = v_hᵀ·w_h`, `ob = requant(acc)`,
-/// `out`'s head block `= ob`.
+/// Claim one **whole head** of `weighted_v`: every query position at once.
+///
+/// ```text
+///   acc[li][i] = Σ_t w[li, hi, t]·v[t, hi, i]     (ln = log_l, lm = log_l, lp = log_d)
+///   ob         = requant(acc, 15)
+///   out[·, hi, ·] = ob
+/// ```
 #[allow(clippy::too_many_arguments)]
 pub fn claim_weighted_v(
     seg: &mut CellSegment,
     cells: WeightedVCells,
     (log_l, log_d, log_h): (usize, usize, usize),
-    (head, block_start): (usize, usize),
+    head: usize,
     (n, k, digits): (usize, usize, usize),
     tr: &mut Transcript,
 ) -> WeightedVSegmentProof {
@@ -295,30 +323,31 @@ pub fn claim_weighted_v(
         tr.observe_val(Fp::new(id as u64));
     }
 
-    let vv = head_v_view(log_d, log_h, log_l, head);
-    let m_w = seg.cells_meta(cells.w).m();
-    let vw = View::block(m_w, block_start, log_l);
+    // A = the head's `[li][t]` block of the attention weights,
+    // B = the head's `[t][i]` block of `v`, C = `acc[li][i]`.
+    let vw = head_block_view(log_l, log_h, log_l, head);
+    let vv = head_k_view(log_d, log_h, log_l, head);
     let mm = claim_matmul(
         seg,
-        (cells.v, cells.w, cells.acc),
-        (&vv, &vw, &View::Whole),
+        (cells.w, cells.v, cells.acc),
+        (&vw, &vv, &View::Whole),
         tr,
-        (log_d, log_l, 0),
+        (log_l, log_l, log_d),
     );
 
     let requant = claim_requant(seg, cells.requant.clone(), (n, k, digits), tr);
 
-    let r: Vec<Fp> = (0..(1usize << log_d)).map(|_| tr.sample_val()).collect();
+    let r: Vec<Fp> = (0..(1usize << (log_l + log_d)))
+        .map(|_| tr.sample_val())
+        .collect();
     let h = LinearH::Dense(r.clone());
     let ob_v = seg.claim_linear_view(cells.ob, &View::Whole, &h, tr);
-    let m_out = seg.cells_meta(cells.out).m();
-    let vout = View::block(m_out, block_start, log_d);
+    let vout = head_block_view(log_d, log_h, log_l, head);
     let out_v = seg.claim_linear_view(cells.out, &vout, &h, tr);
 
     WeightedVSegmentProof {
         cells,
         dims: (log_l, log_d, log_h),
-        block_start,
         head,
         mm,
         r,
@@ -335,13 +364,12 @@ pub fn verify_weighted_v(
     claims: &[CellClaim],
     proof: &WeightedVSegmentProof,
     (log_l, log_d, log_h): (usize, usize, usize),
-    (head, block_start): (usize, usize),
+    head: usize,
     (n, k, digits): (usize, usize, usize),
     tr: &mut Transcript,
 ) -> bool {
     let cells = proof.cells.clone();
-    if proof.dims != (log_l, log_d, log_h) || proof.head != head || proof.block_start != block_start
-    {
+    if proof.dims != (log_l, log_d, log_h) || proof.head != head {
         return false;
     }
     let (Some(m_w), Some(m_out)) = (
@@ -354,13 +382,13 @@ pub fn verify_weighted_v(
         tr.observe_val(Fp::new(id as u64));
     }
 
-    let vv = head_v_view(log_d, log_h, log_l, head);
-    let vw = View::block(m_w, block_start, log_l);
+    let vw = head_block_view(log_l, log_h, log_l, head);
+    let vv = head_k_view(log_d, log_h, log_l, head);
     if !verify_matmul(
         commitment,
         claims,
-        (cells.v, cells.w, cells.acc),
-        (&vv, &vw, &View::Whole),
+        (cells.w, cells.v, cells.acc),
+        (&vw, &vv, &View::Whole),
         &proof.mm,
         tr,
     ) {
@@ -371,7 +399,9 @@ pub fn verify_weighted_v(
         return false;
     }
 
-    let r: Vec<Fp> = (0..(1usize << log_d)).map(|_| tr.sample_val()).collect();
+    let r: Vec<Fp> = (0..(1usize << (log_l + log_d)))
+        .map(|_| tr.sample_val())
+        .collect();
     if r != proof.r {
         return false;
     }
@@ -387,7 +417,8 @@ pub fn verify_weighted_v(
         return false;
     }
 
-    let vout = View::block(m_out, block_start, log_d);
+    let _ = m_w;
+    let vout = head_block_view(log_d, log_h, log_l, head);
     let Some((z, cf)) = linear_verify(&proof.out_v.1, proof.out_v.0, tr) else {
         return false;
     };
@@ -473,25 +504,37 @@ mod tests {
     #[test]
     fn one_head_of_weighted_v() {
         let (lq, h, d) = (2usize, 2usize, 2usize);
-        let (li, hi) = (0usize, 1usize);
+        let hi = 1usize;
         let recip_q = 1usize;
 
         let v_vals: Vec<i64> = (0..(lq * h * d) as i64).map(|i| i % 5 - 2).collect();
         let w_vals: Vec<i64> = (0..(lq * h * lq) as i64).map(|i| i % 3 - 1).collect();
-        let wh: Vec<i64> = (0..lq).map(|t| w_vals[((li * h) + hi) * lq + t]).collect();
-        let acc: Vec<i64> = (0..d)
-            .map(|i| (0..lq).map(|t| v_vals[(t * h + hi) * d + i] * wh[t]).sum())
-            .collect();
+
+        // Head `hi`, every query position: `acc[li][i] = Σ_t w[li][hi][t]·v[t][hi][i]`.
+        let mut acc: Vec<i64> = Vec::with_capacity(lq * d);
+        for li in 0..lq {
+            for i in 0..d {
+                let mut sum = 0i64;
+                for t in 0..lq {
+                    sum += w_vals[((li * h) + hi) * lq + t] * v_vals[(t * h + hi) * d + i];
+                }
+                acc.push(sum);
+            }
+        }
         let ob: Vec<i64> = acc
             .iter()
             .map(|&x| requant_i64(x, recip_q as u32))
             .collect();
 
-        let block_start = ((li * h) + hi) * d;
         let mut out_vals = vec![0i64; lq * h * d];
-        for (i, &x) in ob.iter().enumerate() {
-            out_vals[block_start + i] = x;
+        for li in 0..lq {
+            for i in 0..d {
+                out_vals[((li * h) + hi) * d + i] = ob[li * d + i];
+            }
         }
+
+        let n = lq * d;
+        let (sg, sx, sout, abs_x, abs_out, rem) = requant_cells(&acc, &ob, recip_q);
 
         let mut cells = SegmentCells::new();
         for (name, vals) in [("v", &v_vals), ("w", &w_vals), ("out", &out_vals)] {
@@ -502,15 +545,6 @@ mod tests {
             let m: Vec<Fp> = vals.iter().map(|&x| fp(x)).collect();
             cells.cell_fp(name, vals.len(), 1, m);
         }
-        let sg: Vec<i64> = acc.iter().map(|&x| if x < 0 { 1 } else { 0 }).collect();
-        let sx: Vec<i64> = (0..d).map(|i| sg[i] * acc[i]).collect();
-        let sout: Vec<i64> = (0..d).map(|i| sg[i] * ob[i]).collect();
-        let abs_x: Vec<i64> = (0..d).map(|i| acc[i] - 2 * sx[i]).collect();
-        let abs_out: Vec<i64> = (0..d).map(|i| ob[i] - 2 * sout[i]).collect();
-        let half = 1i64 << (recip_q - 1);
-        let rem: Vec<i64> = (0..d)
-            .map(|i| abs_x[i] - abs_out[i] * (1i64 << recip_q) + half)
-            .collect();
         for (name, vals) in [
             ("rs", &sg),
             ("sx", &sx),
@@ -522,8 +556,8 @@ mod tests {
             let m: Vec<Fp> = vals.iter().map(|&x| fp(x)).collect();
             cells.cell_fp(name, vals.len(), 1, m);
         }
-        add_decomp(&mut cells, "bit", &rem, Decomp::bits(recip_q), d);
-        add_decomp(&mut cells, "dig", &acc, Decomp::signed_bytes(1), d);
+        add_decomp(&mut cells, "bit", &rem, Decomp::bits(recip_q), n);
+        add_decomp(&mut cells, "dig", &acc, Decomp::signed_bytes(1), n);
 
         let mut seg = cells.seal(Params::default());
         let com = seg.commitment();
@@ -556,8 +590,8 @@ mod tests {
             &mut seg,
             wc.clone(),
             dims,
-            (hi, block_start),
-            (d, recip_q, 1),
+            hi,
+            (n, recip_q, 1),
             &mut tr,
         );
         let claims = seg.claims().to_vec();
@@ -569,8 +603,8 @@ mod tests {
             &claims,
             &proof,
             dims,
-            (hi, block_start),
-            (d, recip_q, 1),
+            hi,
+            (n, recip_q, 1),
             &mut vtr
         ));
 
@@ -581,6 +615,7 @@ mod tests {
             .iter()
             .map(|&x| requant_i64(x, recip_q as u32))
             .collect();
+        let (bsg, bsx, bsout, babs_x, babs_out, brem) = requant_cells(&bad_acc, &bad_ob, recip_q);
         let mut bad_cells = SegmentCells::new();
         for (name, vals) in [("v", &v_vals), ("w", &w_vals), ("out", &out_vals)] {
             let m: Vec<Fp> = vals.iter().map(|&x| fp(x)).collect();
@@ -591,27 +626,27 @@ mod tests {
             bad_cells.cell_fp(name, vals.len(), 1, m);
         }
         for (name, vals) in [
-            ("rs", &sg),
-            ("sx", &sx),
-            ("sout", &sout),
-            ("abs_x", &abs_x),
-            ("abs_out", &abs_out),
-            ("rem", &rem),
+            ("rs", &bsg),
+            ("sx", &bsx),
+            ("sout", &bsout),
+            ("abs_x", &babs_x),
+            ("abs_out", &babs_out),
+            ("rem", &brem),
         ] {
             let m: Vec<Fp> = vals.iter().map(|&x| fp(x)).collect();
             bad_cells.cell_fp(name, vals.len(), 1, m);
         }
-        add_decomp(&mut bad_cells, "bit", &rem, Decomp::bits(recip_q), d);
-        add_decomp(&mut bad_cells, "dig", &bad_acc, Decomp::signed_bytes(1), d);
+        add_decomp(&mut bad_cells, "bit", &brem, Decomp::bits(recip_q), n);
+        add_decomp(&mut bad_cells, "dig", &bad_acc, Decomp::signed_bytes(1), n);
 
         let mut bad = bad_cells.seal(Params::default());
         let bad_com = bad.commitment();
         let bad_wc = WeightedVCells {
-            w: wc.w,
-            v: wc.v,
-            out: wc.out,
-            acc: wc.acc,
-            ob: wc.ob,
+            w: bad.id("w"),
+            v: bad.id("v"),
+            out: bad.id("out"),
+            acc: bad.id("acc"),
+            ob: bad.id("ob"),
             requant: RequantCells {
                 x: bad.id("acc"),
                 out: bad.id("ob"),
@@ -629,8 +664,8 @@ mod tests {
             &mut bad,
             bad_wc,
             dims,
-            (hi, block_start),
-            (d, recip_q, 1),
+            hi,
+            (n, recip_q, 1),
             &mut Transcript::new(&new_challenger()),
         );
         let bad_claims = bad.claims().to_vec();
@@ -642,40 +677,73 @@ mod tests {
             &bad_claims,
             &bad_proof,
             dims,
-            (hi, block_start),
-            (d, recip_q, 1),
+            hi,
+            (n, recip_q, 1),
             &mut vtr
         ));
+    }
+    /// The six helper vectors of `s = requant(y, recip_q)`.
+    fn requant_cells(
+        y: &[i64],
+        s: &[i64],
+        recip_q: usize,
+    ) -> (Vec<i64>, Vec<i64>, Vec<i64>, Vec<i64>, Vec<i64>, Vec<i64>) {
+        let sg: Vec<i64> = y.iter().map(|&v| if v < 0 { 1 } else { 0 }).collect();
+        let sx: Vec<i64> = (0..y.len()).map(|i| sg[i] * y[i]).collect();
+        let sout: Vec<i64> = (0..y.len()).map(|i| sg[i] * s[i]).collect();
+        let abs_x: Vec<i64> = (0..y.len()).map(|i| y[i] - 2 * sx[i]).collect();
+        let abs_out: Vec<i64> = (0..y.len()).map(|i| s[i] - 2 * sout[i]).collect();
+        let half = 1i64 << (recip_q - 1);
+        let rem: Vec<i64> = (0..y.len())
+            .map(|i| abs_x[i] - abs_out[i] * (1i64 << recip_q) + half)
+            .collect();
+        (sg, sx, sout, abs_x, abs_out, rem)
     }
 
     #[test]
     fn one_head_of_scores() {
         let (lq, h, d) = (2usize, 2usize, 2usize);
-        let (li, hi) = (0usize, 1usize);
+        let hi = 1usize;
         let recip_q = 1usize;
         let inv_q = 2i64;
 
         let k_vals: Vec<i64> = (0..(lq * h * d) as i64).map(|i| i % 5 - 2).collect();
         let q_vals: Vec<i64> = (0..(lq * h * d) as i64).map(|i| i % 3 - 1).collect();
+
+        // Head `hi` of both operands: `[row][d]`, every row.
         let kh: Vec<i64> = (0..lq)
             .flat_map(|t| {
                 let s = (t * h + hi) * d;
                 k_vals[s..s + d].to_vec()
             })
             .collect();
-        let qh: Vec<i64> = q_vals[((li * h) + hi) * d..((li * h) + hi + 1) * d].to_vec();
-        let dot: Vec<i64> = (0..lq)
-            .map(|t| (0..d).map(|j| kh[t * d + j] * qh[j]).sum())
+        let qh: Vec<i64> = (0..lq)
+            .flat_map(|li| {
+                let s = (li * h + hi) * d;
+                q_vals[s..s + d].to_vec()
+            })
             .collect();
+
+        // The whole `lq x lq` score matrix of this head.
+        let mut dot: Vec<i64> = Vec::with_capacity(lq * lq);
+        for li in 0..lq {
+            for t in 0..lq {
+                dot.push((0..d).map(|j| qh[li * d + j] * kh[t * d + j]).sum());
+            }
+        }
         let y: Vec<i64> = dot.iter().map(|&v| v * inv_q).collect();
         let s: Vec<i64> = y.iter().map(|&v| requant_i64(v, recip_q as u32)).collect();
         assert_eq!(s, dot, "inv_q = 2^RECIP_Q rounds back to the dot product");
 
-        let block_start = ((li * h) + hi) * lq;
         let mut out_vals = vec![0i64; lq * h * lq];
-        for (t, &v) in s.iter().enumerate() {
-            out_vals[block_start + t] = v;
+        for li in 0..lq {
+            for t in 0..lq {
+                out_vals[((li * h) + hi) * lq + t] = s[li * lq + t];
+            }
         }
+
+        let n = lq * lq;
+        let (sg, sx, sout, abs_x, abs_out, rem) = requant_cells(&y, &s, recip_q);
 
         let mut cells = SegmentCells::new();
         for (name, vals) in [("q", &q_vals), ("k", &k_vals), ("out", &out_vals)] {
@@ -686,17 +754,6 @@ mod tests {
             let m: Vec<Fp> = vals.iter().map(|&x| fp(x)).collect();
             cells.cell_fp(name, vals.len(), 1, m);
         }
-
-        // The requant cells for s = requant(y, RECIP_Q).
-        let sg: Vec<i64> = y.iter().map(|&v| if v < 0 { 1 } else { 0 }).collect();
-        let sx: Vec<i64> = (0..lq).map(|i| sg[i] * y[i]).collect();
-        let sout: Vec<i64> = (0..lq).map(|i| sg[i] * s[i]).collect();
-        let abs_x: Vec<i64> = (0..lq).map(|i| y[i] - 2 * sx[i]).collect();
-        let abs_out: Vec<i64> = (0..lq).map(|i| s[i] - 2 * sout[i]).collect();
-        let half = 1i64 << (recip_q - 1);
-        let rem: Vec<i64> = (0..lq)
-            .map(|i| abs_x[i] - abs_out[i] * (1i64 << recip_q) + half)
-            .collect();
         for (name, vals) in [
             ("rs", &sg),
             ("sx", &sx),
@@ -708,8 +765,8 @@ mod tests {
             let m: Vec<Fp> = vals.iter().map(|&x| fp(x)).collect();
             cells.cell_fp(name, vals.len(), 1, m);
         }
-        add_decomp(&mut cells, "bit", &rem, Decomp::bits(recip_q), lq);
-        add_decomp(&mut cells, "dig", &y, Decomp::signed_bytes(1), lq);
+        add_decomp(&mut cells, "bit", &rem, Decomp::bits(recip_q), n);
+        add_decomp(&mut cells, "dig", &y, Decomp::signed_bytes(1), n);
 
         let mut seg = cells.seal(Params::default());
         let com = seg.commitment();
@@ -744,9 +801,8 @@ mod tests {
             hc.clone(),
             dims,
             hi,
-            (block_start, block_start),
             Fp::new(inv_q as u64),
-            (lq, recip_q, 1),
+            (n, recip_q, 1),
             &mut tr,
         );
         let claims = seg.claims().to_vec();
@@ -759,15 +815,15 @@ mod tests {
             &proof,
             dims,
             hi,
-            (block_start, block_start),
             Fp::new(inv_q as u64),
-            (lq, recip_q, 1),
+            (n, recip_q, 1),
             &mut vtr
         ));
 
-        // A wrong output block is rejected at the `s ↔ out` check.
+        // A wrong output entry is rejected at the `s <-> out` check.
         let mut bad_out = out_vals.clone();
-        bad_out[block_start] += 1;
+        // Perturb *this* head's block (index 0 belongs to head 0).
+        bad_out[hi * lq] += 1;
         let mut bad_cells = SegmentCells::new();
         for (name, vals) in [("q", &q_vals), ("k", &k_vals), ("out", &bad_out)] {
             let m: Vec<Fp> = vals.iter().map(|&x| fp(x)).collect();
@@ -788,18 +844,18 @@ mod tests {
             let m: Vec<Fp> = vals.iter().map(|&x| fp(x)).collect();
             bad_cells.cell_fp(name, vals.len(), 1, m);
         }
-        add_decomp(&mut bad_cells, "bit", &rem, Decomp::bits(recip_q), lq);
-        add_decomp(&mut bad_cells, "dig", &y, Decomp::signed_bytes(1), lq);
+        add_decomp(&mut bad_cells, "bit", &rem, Decomp::bits(recip_q), n);
+        add_decomp(&mut bad_cells, "dig", &y, Decomp::signed_bytes(1), n);
 
         let mut bad = bad_cells.seal(Params::default());
         let bad_com = bad.commitment();
         let bad_hc = HeadCells {
-            q: hc.q,
-            k: hc.k,
-            out: hc.out,
-            dot: hc.dot,
-            y: hc.y,
-            s: hc.s,
+            q: bad.id("q"),
+            k: bad.id("k"),
+            out: bad.id("out"),
+            dot: bad.id("dot"),
+            y: bad.id("y"),
+            s: bad.id("s"),
             requant: RequantCells {
                 x: bad.id("y"),
                 out: bad.id("s"),
@@ -818,9 +874,8 @@ mod tests {
             bad_hc,
             dims,
             hi,
-            (block_start, block_start),
             Fp::new(inv_q as u64),
-            (lq, recip_q, 1),
+            (n, recip_q, 1),
             &mut Transcript::new(&new_challenger()),
         );
         let bad_claims = bad.claims().to_vec();
@@ -833,10 +888,10 @@ mod tests {
             &bad_proof,
             dims,
             hi,
-            (block_start, block_start),
             Fp::new(inv_q as u64),
-            (lq, recip_q, 1),
+            (n, recip_q, 1),
             &mut vtr
         ));
     }
+
 }

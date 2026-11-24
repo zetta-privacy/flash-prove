@@ -31,8 +31,11 @@ fn interpolate_deg2(y0: Ext, y1: Ext, y2: Ext) -> RoundPoly {
     RoundPoly([y0, b, c])
 }
 
-/// The GKR round polynomial for `Σ_k p(k)·q(k)`: at variable `i` it is
-/// `g_i(t) = Σ_{k_{>i}} p̃(r_<i, t, k_>i) · q̃(r_<i, t, k_>i)`.
+/// The GKR round polynomial for `Σ_k p(k)·q(k)`: `g_i(t) = Σ_{k_{>i}} p̃(r_<i, t, k_>i)·q̃(r_<i, t, k_>i)`.
+///
+/// Both operands are linear in `t` (they are MLEs evaluated at a point with only the
+/// `i`-th coordinate varying), so this folds in `O(2^n)` per round instead of
+/// re-evaluating both MLEs at every suffix point.
 pub(crate) fn round_poly_product(
     p: &[Ext],
     q: &[Ext],
@@ -41,26 +44,52 @@ pub(crate) fn round_poly_product(
     r_prefix: &[Ext],
 ) -> RoundPoly {
     let suffix = lm - i - 1;
-    let mut y = [Ext::ZERO; 3];
-    let samples = [Ext::ZERO, Ext::ONE, Ext::from(Fp::new(2))];
-    for (idx, t) in samples.iter().enumerate() {
-        let mut acc = Ext::ZERO;
-        for sb in 0..(1 << suffix) {
-            let mut point = vec![Ext::ZERO; lm];
-            point[..i].copy_from_slice(r_prefix);
-            point[i] = *t;
-            for b in 0..suffix {
-                point[i + 1 + b] = if (sb >> b) & 1 == 1 {
-                    Ext::ONE
-                } else {
-                    Ext::ZERO
-                };
-            }
-            acc += mle_eval(p, &point) * mle_eval(q, &point);
+    let head = i + 1;
+    let d = 1usize << suffix;
+    debug_assert_eq!(p.len(), 1 << lm);
+    debug_assert_eq!(q.len(), 1 << lm);
+    debug_assert_eq!(r_prefix.len(), i);
+
+    // Partial MLEs over the suffix, with the first `head` coordinates fixed at
+    // `t = 0` and `t = 1`.
+    let mut pa0 = vec![Ext::ZERO; d];
+    let mut pa1 = vec![Ext::ZERO; d];
+    let mut pb0 = vec![Ext::ZERO; d];
+    let mut pb1 = vec![Ext::ZERO; d];
+    for h in 0..(1usize << head) {
+        let mut w = Ext::ONE;
+        for k in 0..i {
+            w *= if (h >> k) & 1 == 1 {
+                r_prefix[k]
+            } else {
+                Ext::ONE - r_prefix[k]
+            };
         }
-        y[idx] = acc;
+        let (ta, tb) = if (h >> i) & 1 == 1 {
+            (&mut pa1, &mut pb1)
+        } else {
+            (&mut pa0, &mut pb0)
+        };
+        for sb in 0..d {
+            let idx = h + (sb << head);
+            ta[sb] += w * p[idx];
+            tb[sb] += w * q[idx];
+        }
     }
-    interpolate_deg2(y[0], y[1], y[2])
+
+    let ev = |t: Ext| -> Ext {
+        let mut acc = Ext::ZERO;
+        for sb in 0..d {
+            acc += (pa0[sb] + t * (pa1[sb] - pa0[sb]))
+                * (pb0[sb] + t * (pb1[sb] - pb0[sb]));
+        }
+        acc
+    };
+    interpolate_deg2(
+        ev(Ext::ZERO),
+        ev(Ext::ONE),
+        ev(Ext::from(Fp::new(2))),
+    )
 }
 
 fn interpolate_deg3(y0: Ext, y1: Ext, y2: Ext, y3: Ext) -> RoundPoly3 {

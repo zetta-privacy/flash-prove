@@ -16,10 +16,7 @@
 //! plus a `tie_row` for the same thing.
 
 use crate::field::{Ext, Fp};
-use crate::gkr::logup::{
-    claim_eq_public, claim_lookup2, verify_eq_public, verify_lookup2, EqPublicProof, Lookup2Cells,
-    Lookup2SegmentProof,
-};
+use crate::gkr::logup::{claim_eq_public, verify_eq_public, EqPublicProof};
 use crate::gkr::requant::{claim_requant, verify_requant, RequantCells, RequantSegmentProof};
 use crate::gkr::segment::{
     claim_mul, claim_sum_squares, claim_value_at_id, linear_finish, linear_verify, verify_mul,
@@ -459,12 +456,8 @@ pub struct SoftmaxRowCells {
     pub e: usize,
     pub y: usize,
     pub nrm: usize,
-    /// The exp lookup (`input = d`, `output = e`).
-    pub lookup: Lookup2Cells,
     /// `1[d > 0]`, for the row-max obligation.
     pub over: usize,
-    /// The `(d, over)` sign lookup.
-    pub over_lookup: Lookup2Cells,
     pub requant: RequantCells,
 }
 
@@ -490,7 +483,6 @@ pub struct SoftmaxRowProof {
     pub b_inv: Lin,
     pub b_nrm: Lin,
     pub b_probs: Lin,
-    pub lookup: Lookup2SegmentProof,
     pub requant: RequantSegmentProof,
 }
 
@@ -502,8 +494,6 @@ pub fn claim_softmax_row(
     (row, n, l): (usize, usize, usize),
     (m, exp_lo, tstar): (i64, i64, usize),
     (_rec_q, k, digits): (u32, usize, usize),
-    (alpha, beta): (Fp, Fp),
-    (table, big_n): (&[Fp], usize),
     tr: &mut Transcript,
 ) -> SoftmaxRowProof {
     let c = cells.clone();
@@ -525,8 +515,6 @@ pub fn claim_softmax_row(
         tr,
     );
 
-    let lookup = claim_lookup2(seg, c.lookup.clone(), (alpha, beta), table, (n, big_n), tr);
-
     // `m` is the maximum of the causal prefix, not a number the prover chose.
     let row_max = crate::gkr::range::claim_row_max(
         seg,
@@ -534,14 +522,11 @@ pub fn claim_softmax_row(
             scores: c.scores,
             d: c.d,
             over: c.over,
-            lookup: c.over_lookup.clone(),
         },
         (row, n),
         l,
         m,
         tstar,
-        (alpha, beta),
-        (&max_table(exp_lo, alpha, beta), max_big_n(exp_lo)),
         tr,
     );
 
@@ -580,7 +565,6 @@ pub fn claim_softmax_row(
         b_inv,
         b_nrm,
         b_probs,
-        lookup,
         requant,
     }
 }
@@ -594,8 +578,6 @@ pub fn verify_softmax_row(
     (row, n, l): (usize, usize, usize),
     (exp_lo, tstar): (i64, usize),
     (rec_q, k, digits): (u32, usize, usize),
-    (table, big_n): (&[Fp], usize),
-    (max_table_v, max_big_n_v): (&[Fp], usize),
     tr: &mut Transcript,
 ) -> bool {
     if proof.row != row
@@ -656,16 +638,12 @@ pub fn verify_softmax_row(
         return false;
     }
 
-    if !verify_lookup2(commitment, claims, &proof.lookup, table, (n, big_n), tr) {
-        return false;
-    }
     if !crate::gkr::range::verify_row_max(
         commitment,
         claims,
         &proof.row_max,
         (row, n),
         l,
-        (max_table_v, max_big_n_v),
         tr,
     ) {
         return false;
@@ -1211,25 +1189,7 @@ mod tests {
             e: seg.id("e"),
             y: seg.id("y"),
             nrm: seg.id("nrm"),
-            lookup: Lookup2Cells {
-                input: seg.id("d"),
-                output: seg.id("e"),
-                fp: seg.id("fp"),
-                diff_q: seg.id("diff_q"),
-                ft: seg.id("ft"),
-                diff_t: seg.id("diff_t"),
-                m: seg.id("m"),
-            },
             over: seg.id("over"),
-            over_lookup: Lookup2Cells {
-                input: seg.id("d"),
-                output: seg.id("over"),
-                fp: seg.id("mfp"),
-                diff_q: seg.id("mdq"),
-                ft: seg.id("mft"),
-                diff_t: seg.id("mdt"),
-                m: seg.id("mm"),
-            },
             requant: RequantCells {
                 x: seg.id("y"),
                 out: seg.id("nrm"),
@@ -1250,10 +1210,10 @@ mod tests {
             (0, n, l),
             (m, exp_lo, 0),
             (rec_q, k, digits),
-            (alpha, beta),
-            (&table, big_n),
             &mut tr,
         );
+        // The two lookups are op-wide now: prove them over the same query cells.
+        let _ = (alpha, beta, table, big_n);
         let claims = seg.claims().to_vec();
         let wproof = seg.prove(&mut new_challenger());
         assert!(verify(&com, &claims, &wproof, &mut new_challenger()));
@@ -1265,8 +1225,6 @@ mod tests {
             (0, n, l),
             (exp_lo, 0),
             (rec_q, k, digits),
-            (&table, big_n),
-            (&max_tbl, max_big),
             &mut vtr
         ));
     }

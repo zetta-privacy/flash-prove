@@ -30,6 +30,7 @@ bincode = "1.3"
 
 # cli
 clap = { version = "4", features = ["derive"] }
+metal = "0.33.0"
 
 [profile.release]
 opt-level = 3

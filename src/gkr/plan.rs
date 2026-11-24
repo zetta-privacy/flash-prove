@@ -155,6 +155,10 @@ impl Plan {
 
     /// Plan `out = requant(x, k)`: the sign/magnitude columns, the remainder, and
     /// both range decompositions.
+    ///
+    /// The digit width is the *smallest* that reconstructs every value (capped by
+    /// `digits`): a narrower decomposition is a strictly tighter range check, so this
+    /// only ever costs the prover less.
     pub fn requant(
         &mut self,
         prefix: &str,
@@ -191,14 +195,11 @@ impl Plan {
         }
         let rem_name = name("rem");
         let bits = self.decomp(&format!("{prefix}.bit"), &rem_name, &rem, Decomp::bits(k));
-        let digits_d = self.decomp(
-            &format!("{prefix}.dig"),
-            x,
-            &xs,
-            Decomp::signed_bytes(digits),
-        );
+        let dbytes = signed_bytes_needed(&xs, digits);
+        let digits_d = self.decomp(&format!("{prefix}.dig"), x, &xs, Decomp::signed_bytes(dbytes));
 
         RequantNames {
+            dbytes,
             x: x.to_string(),
             out: out.to_string(),
             s: name("s"),
@@ -211,6 +212,27 @@ impl Plan {
             digits: digits_d,
         }
     }
+}
+
+/// The fewest signed base-256 digits that reconstruct every value, capped by `cap`.
+fn signed_bytes_needed(values: &[i64], cap: usize) -> usize {
+    let cap = cap.max(1);
+    let mut d = 1;
+    while d < cap {
+        let dec = Decomp::signed_bytes(d);
+        if values.iter().all(|&v| {
+            let ds = dec.split(v);
+            let mut acc = 0i64;
+            for (j, &digit) in ds.iter().enumerate() {
+                acc += digit * 256i64.pow(j as u32);
+            }
+            acc == v
+        }) {
+            return d;
+        }
+        d += 1;
+    }
+    cap
 }
 
 /// Cell names for one decomposition.
@@ -241,6 +263,8 @@ impl DecompNames {
 /// Cell names for one requant.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RequantNames {
+    /// The signed-byte width actually used for the value decomposition.
+    pub dbytes: usize,
     pub x: String,
     pub out: String,
     pub s: String,

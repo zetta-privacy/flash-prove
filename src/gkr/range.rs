@@ -344,8 +344,6 @@ pub struct RowMaxCells {
     pub d: usize,
     /// `1` where `scores[i] > m`, else `0`.
     pub over: usize,
-    /// The lookup over `(d, over)`.
-    pub lookup: crate::gkr::logup::Lookup2Cells,
 }
 
 /// A "`m` is the maximum of this row" proof.
@@ -364,7 +362,6 @@ pub struct RowMaxProof {
     pub count: (Ext, LinearClaimProof),
     /// `scores(tstar)`, which must equal `m`.
     pub tok_val: Ext,
-    pub lookup: crate::gkr::logup::Lookup2SegmentProof,
 }
 
 /// The shifted sign table `{1, 2}` for the `over` indicator.
@@ -396,8 +393,6 @@ pub fn claim_row_max(
     prefix: usize,
     m: i64,
     tstar: usize,
-    (alpha, beta): (Fp, Fp),
-    (table, big_n): (&[Fp], usize),
     tr: &mut Transcript,
 ) -> RowMaxProof {
     assert!(
@@ -446,15 +441,6 @@ pub fn claim_row_max(
     let tok_val = seg.claim_id(cells.scores, &[0], &tok_point)[0];
     assert_eq!(tok_val, m_ext, "tstar achieves the maximum");
 
-    let lookup = crate::gkr::logup::claim_lookup2(
-        seg,
-        cells.lookup.clone(),
-        (alpha, beta),
-        table,
-        (n, big_n),
-        tr,
-    );
-
     RowMaxProof {
         n,
         row,
@@ -466,7 +452,6 @@ pub fn claim_row_max(
         scores_v,
         count,
         tok_val,
-        lookup,
     }
 }
 
@@ -478,7 +463,6 @@ pub fn verify_row_max(
     proof: &RowMaxProof,
     (row, n): (usize, usize),
     prefix: usize,
-    (table, big_n): (&[Fp], usize),
     tr: &mut Transcript,
 ) -> bool {
     if proof.n != n || proof.row != row || prefix >= n || proof.tstar > prefix {
@@ -552,7 +536,7 @@ pub fn verify_row_max(
         return false;
     }
 
-    crate::gkr::logup::verify_lookup2(commitment, claims, &proof.lookup, table, (n, big_n), tr)
+    true
 }
 
 #[cfg(test)]
@@ -755,8 +739,8 @@ mod tests {
             scores: seg.id("scores"),
             d: seg.id("d"),
             over: seg.id("over"),
-            lookup: lk,
         };
+        let _ = &lk;
         let mut tr = Transcript::new(&new_challenger());
         let proof = claim_row_max(
             &mut seg,
@@ -765,8 +749,6 @@ mod tests {
             prefix,
             m,
             tstar,
-            (alpha, beta),
-            (&table, big_n),
             &mut tr,
         );
         let claims = seg.claims().to_vec();
@@ -779,7 +761,6 @@ mod tests {
             &proof,
             (row, n),
             prefix,
-            (&table, big_n),
             &mut vtr
         ));
 
@@ -793,7 +774,6 @@ mod tests {
             &bad,
             (row, n),
             prefix,
-            (&table, big_n),
             &mut vtr
         ));
     }

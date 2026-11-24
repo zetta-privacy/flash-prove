@@ -145,7 +145,9 @@ pub fn verify_requant(
     (n, k, digits): (usize, usize, usize),
     tr: &mut Transcript,
 ) -> bool {
-    if proof.n != n || proof.k != k || proof.digits != digits {
+    // `digits` is the public *cap*: a narrower decomposition is a tighter range
+    // check, so any `proof.digits <= digits` is sound and a wider one is not.
+    if proof.n != n || proof.k != k || proof.digits > digits || proof.digits == 0 {
         return false;
     }
     let c = proof.cells.clone();

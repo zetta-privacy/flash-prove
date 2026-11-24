@@ -337,11 +337,20 @@ impl SegmentProver {
         let values: Vec<EF> = cols
             .iter()
             .map(|&c| {
-                t.column(c)
-                    .values()
-                    .enumerate()
-                    .map(|(row, v)| crate::field::eq(&padded_point, row) * EF::from(v))
-                    .sum()
+                if padded_m >= crate::backend::GPU_MIN.trailing_zeros() as usize {
+                    // Big table: hand the reduction to the backend (GPU when enabled).
+                    let col: Vec<F> = t.column(c).values().collect();
+                    let n = 1usize << padded_m;
+                    let mut col = col;
+                    col.resize(n, F::ZERO);
+                    crate::backend::mle_eval(&col, &padded_point)
+                } else {
+                    t.column(c)
+                        .values()
+                        .enumerate()
+                        .map(|(row, v)| crate::field::eq(&padded_point, row) * EF::from(v))
+                        .sum()
+                }
             })
             .collect();
 

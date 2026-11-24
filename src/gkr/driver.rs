@@ -53,7 +53,11 @@ pub enum SegmentOpProof {
     /// One proof per row of the normalised cell.
     Norm(Vec<crate::gkr::nonlinear::NormRowProof>),
     /// One proof per row of the attention scores.
-    Softmax(Vec<crate::gkr::nonlinear::SoftmaxRowProof>),
+    Softmax {
+        rows: Vec<crate::gkr::nonlinear::SoftmaxRowProof>,
+        lookup: crate::gkr::logup::Lookup2SegmentProof,
+        over_lookup: crate::gkr::logup::Lookup2SegmentProof,
+    },
     /// `rot = R·inp` plus the requant lookup.
     Rope(crate::gkr::nonlinear::RopeSegmentProof),
     /// `out = emb[window]`, read from the embedding's own root.
@@ -966,43 +970,44 @@ pub fn prove_segment_full(
                 let inv_q = ((1i64 << crate::model::spec::RECIP_Q) as f64 / *scale).round() as i64;
                 let qs = plan.values(q).to_vec();
                 let ks = plan.values(k).to_vec();
-                let mut per_head = Vec::with_capacity(lq * h);
-                for li in 0..lq {
-                    for hi in 0..h {
-                        // dot[t] = q[li,hi,·] · k[t,hi,·]
-                        let dot: Vec<i64> = (0..lq)
-                            .map(|t| {
-                                (0..d)
-                                    .map(|j| qs[((li * h) + hi) * d + j] * ks[(t * h + hi) * d + j])
-                                    .sum()
-                            })
-                            .collect();
-                        let y: Vec<i64> = dot.iter().map(|&v| v * inv_q).collect();
-                        let sr: Vec<i64> = y
-                            .iter()
-                            .map(|&v| crate::model::spec::requant(v, crate::model::spec::RECIP_Q))
-                            .collect();
-                        let pre = format!("__sc.{i}.{li}.{hi}");
-                        plan.add(&format!("{pre}.dot"), lq, 1, dot);
-                        plan.add(&format!("{pre}.y"), lq, 1, y);
-                        plan.add(&format!("{pre}.s"), lq, 1, sr);
-                        let requant = plan.requant(
-                            &format!("{pre}.rq"),
-                            &format!("{pre}.y"),
-                            &format!("{pre}.s"),
-                            crate::model::spec::RECIP_Q as usize,
-                            digits,
-                        );
-                        per_head.push(ScoresPlan {
-                            li,
-                            hi,
-                            inv_q,
-                            dot: format!("{pre}.dot"),
-                            y: format!("{pre}.y"),
-                            s: format!("{pre}.s"),
-                            requant,
-                        });
+                // One cell set per head covering **every** query position: the head's
+                // whole `lq × lq` score matrix. This is the unit the claim works on.
+                let mut per_head = Vec::with_capacity(h);
+                for hi in 0..h {
+                    let mut dot = Vec::with_capacity(lq * lq);
+                    for li in 0..lq {
+                        for t in 0..lq {
+                            let mut acc = 0i64;
+                            for j in 0..d {
+                                acc += qs[(li * h + hi) * d + j] * ks[(t * h + hi) * d + j];
+                            }
+                            dot.push(acc);
+                        }
                     }
+                    let y: Vec<i64> = dot.iter().map(|&v| v * inv_q).collect();
+                    let sr: Vec<i64> = y
+                        .iter()
+                        .map(|&v| crate::model::spec::requant(v, crate::model::spec::RECIP_Q))
+                        .collect();
+                    let pre = format!("__sc.{i}.{hi}");
+                    plan.add(&format!("{pre}.dot"), lq * lq, 1, dot);
+                    plan.add(&format!("{pre}.y"), lq * lq, 1, y);
+                    plan.add(&format!("{pre}.s"), lq * lq, 1, sr);
+                    let requant = plan.requant(
+                        &format!("{pre}.rq"),
+                        &format!("{pre}.y"),
+                        &format!("{pre}.s"),
+                        crate::model::spec::RECIP_Q as usize,
+                        digits,
+                    );
+                    per_head.push(ScoresPlan {
+                        hi,
+                        inv_q,
+                        dot: format!("{pre}.dot"),
+                        y: format!("{pre}.y"),
+                        s: format!("{pre}.s"),
+                        requant,
+                    });
                 }
                 let _ = output;
                 planned.push(Some(PlannedOp::Scores(per_head)));
@@ -1017,40 +1022,39 @@ pub fn prove_segment_full(
                 }
                 let vs = plan.values(v).to_vec();
                 let ws = plan.values(weights).to_vec();
-                let mut per_head = Vec::with_capacity(lq * h);
-                for li in 0..lq {
-                    for hi in 0..h {
-                        let acc: Vec<i64> = (0..d)
-                            .map(|i| {
-                                (0..lq)
-                                    .map(|t| {
-                                        vs[(t * h + hi) * d + i] * ws[((li * h) + hi) * lq + t]
-                                    })
-                                    .sum()
-                            })
-                            .collect();
-                        let ob: Vec<i64> = acc
-                            .iter()
-                            .map(|&x| crate::model::spec::requant(x, 15))
-                            .collect();
-                        let pre = format!("__wv.{i}.{li}.{hi}");
-                        plan.add(&format!("{pre}.acc"), d, 1, acc);
-                        plan.add(&format!("{pre}.ob"), d, 1, ob);
-                        let requant = plan.requant(
-                            &format!("{pre}.rq"),
-                            &format!("{pre}.acc"),
-                            &format!("{pre}.ob"),
-                            15,
-                            digits,
-                        );
-                        per_head.push(WeightedVPlan {
-                            li,
-                            hi,
-                            acc: format!("{pre}.acc"),
-                            ob: format!("{pre}.ob"),
-                            requant,
-                        });
+                // One cell set per head, covering every query position.
+                let mut per_head = Vec::with_capacity(h);
+                for hi in 0..h {
+                    let mut acc = Vec::with_capacity(lq * d);
+                    for li in 0..lq {
+                        for i in 0..d {
+                            let mut sum = 0i64;
+                            for t in 0..lq {
+                                sum += vs[(t * h + hi) * d + i] * ws[((li * h) + hi) * lq + t];
+                            }
+                            acc.push(sum);
+                        }
                     }
+                    let ob: Vec<i64> = acc
+                        .iter()
+                        .map(|&x| crate::model::spec::requant(x, 15))
+                        .collect();
+                    let pre = format!("__wv.{i}.{hi}");
+                    plan.add(&format!("{pre}.acc"), lq * d, 1, acc);
+                    plan.add(&format!("{pre}.ob"), lq * d, 1, ob);
+                    let requant = plan.requant(
+                        &format!("{pre}.rq"),
+                        &format!("{pre}.acc"),
+                        &format!("{pre}.ob"),
+                        15,
+                        digits,
+                    );
+                    per_head.push(WeightedVPlan {
+                        hi,
+                        acc: format!("{pre}.acc"),
+                        ob: format!("{pre}.ob"),
+                        requant,
+                    });
                 }
                 planned.push(Some(PlannedOp::WeightedV(per_head)));
             }
@@ -1106,6 +1110,12 @@ pub fn prove_segment_full(
                 let max_big = crate::gkr::nonlinear::max_big_n(bounds.exp_lo);
                 let xs = plan.values(input).to_vec();
                 let mut per_row = Vec::with_capacity(rows);
+                // The two lookup tables are the same for every row, so the queries are
+                // collected op-wide and looked up once (one LogUp per table, not one per
+                // row): the table arity is ~2^18, which used to be paid `rows` times.
+                let mut d_all: Vec<i64> = Vec::with_capacity(rows * n);
+                let mut e_all: Vec<i64> = Vec::with_capacity(rows * n);
+                let mut over_all: Vec<i64> = Vec::with_capacity(rows * n);
                 for row in 0..rows {
                     let l = row.min(n - 1);
                     let m = (0..=l).map(|i| xs[row * n + i]).max().unwrap_or(0);
@@ -1133,23 +1143,10 @@ pub fn prove_segment_full(
                     plan.add(&format!("{pre}.y"), n, 1, y.clone());
                     plan.add(&format!("{pre}.nrm"), n, 1, nrm.clone());
                     let over: Vec<i64> = d.iter().map(|&x| if x > 0 { 1 } else { 0 }).collect();
-                    plan.add(&format!("{pre}.over"), n, 1, over);
-                    let lookup = plan.lookup2(
-                        &format!("{pre}.lk"),
-                        &format!("{pre}.d"),
-                        &format!("{pre}.e"),
-                        (alpha, beta),
-                        &table,
-                        big_n,
-                    );
-                    let over_lookup = plan.lookup2(
-                        &format!("{pre}.olk"),
-                        &format!("{pre}.d"),
-                        &format!("{pre}.over"),
-                        (alpha, beta),
-                        &max_tbl,
-                        max_big,
-                    );
+                    plan.add(&format!("{pre}.over"), n, 1, over.clone());
+                    d_all.extend_from_slice(&d);
+                    e_all.extend_from_slice(&e);
+                    over_all.extend_from_slice(&over);
                     let requant = plan.requant(
                         &format!("{pre}.rq"),
                         &format!("{pre}.y"),
@@ -1162,16 +1159,41 @@ pub fn prove_segment_full(
                         e: format!("{pre}.e"),
                         y: format!("{pre}.y"),
                         nrm: format!("{pre}.nrm"),
-                        lookup,
                         requant,
                         over: format!("{pre}.over"),
-                        over_lookup,
                         m,
                         tstar,
                     });
                 }
+                let op = format!("__sm.{i}");
+                let d_all_name = format!("{op}.d");
+                let e_all_name = format!("{op}.e");
+                let over_all_name = format!("{op}.over");
+                plan.add(&d_all_name, rows * n, 1, d_all);
+                plan.add(&e_all_name, rows * n, 1, e_all);
+                plan.add(&over_all_name, rows * n, 1, over_all);
+                let lookup = plan.lookup2(
+                    &format!("{op}.lk"),
+                    &d_all_name,
+                    &e_all_name,
+                    (alpha, beta),
+                    &table,
+                    big_n,
+                );
+                let over_lookup = plan.lookup2(
+                    &format!("{op}.olk"),
+                    &d_all_name,
+                    &over_all_name,
+                    (alpha, beta),
+                    &max_tbl,
+                    max_big,
+                );
                 let _ = output;
-                planned.push(Some(PlannedOp::Softmax(per_row)));
+                planned.push(Some(PlannedOp::Softmax {
+                    rows_plan: per_row,
+                    lookup,
+                    over_lookup,
+                }));
             }
             Op::TopK {
                 input, choice, k, ..
@@ -1391,7 +1413,7 @@ pub fn prove_segment_full(
                 let rq = crate::gkr::requant::claim_requant(
                     &mut seg,
                     rq_cells,
-                    (n, *shift as usize, digits),
+                    (n, *shift as usize, rq.dbytes),
                     &mut tr,
                 );
                 proofs.push(SegmentOpProof::Matmul { mm, rq });
@@ -1456,7 +1478,7 @@ pub fn prove_segment_full(
                         &mut seg,
                         cells,
                         (row, hidden),
-                        (hidden, crate::model::spec::RECIP_Q as usize, digits),
+                        (hidden, crate::model::spec::RECIP_Q as usize, rqs[row].dbytes),
                         (rec_q, eps),
                         &gamma_pub,
                         &mut tr,
@@ -1483,13 +1505,12 @@ pub fn prove_segment_full(
                         ob: seg.id(&hp.ob),
                         requant: hp.requant.cells(&seg),
                     };
-                    let block_start = ((hp.li * h) + hp.hi) * d;
                     out.push(crate::gkr::attention::claim_weighted_v(
                         &mut seg,
                         cells,
                         (log_l, log_d, log_h),
-                        (hp.hi, block_start),
-                        (d, 15, digits),
+                        hp.hi,
+                        (lq * d, 15, hp.requant.dbytes),
                         &mut tr,
                     ));
                 }
@@ -1515,29 +1536,31 @@ pub fn prove_segment_full(
                         s: seg.id(&hp.s),
                         requant: hp.requant.cells(&seg),
                     };
-                    let q_start = ((hp.li * h) + hp.hi) * d;
-                    let out_start = ((hp.li * h) + hp.hi) * lq;
                     out.push(crate::gkr::attention::claim_scores(
                         &mut seg,
                         cells,
                         (log_l, log_d, log_h),
                         hp.hi,
-                        (q_start, out_start),
                         Fp::new(hp.inv_q as u64),
-                        (lq, crate::model::spec::RECIP_Q as usize, digits),
+                        (lq * lq, crate::model::spec::RECIP_Q as usize, hp.requant.dbytes),
                         &mut tr,
                     ));
                 }
                 proofs.push(SegmentOpProof::Scores(out));
             }
-            (Op::CausalSoftmax { input, output }, PlannedOp::Softmax(per_row)) => {
+            (
+                Op::CausalSoftmax { input, output },
+                PlannedOp::Softmax {
+                    rows_plan: per_row,
+                    lookup,
+                    over_lookup,
+                },
+            ) => {
                 let (ci, co) = (seg.id(input), seg.id(output));
                 let (rows, n) = {
                     let m = seg.cells_meta(ci);
                     (m.logical_rows, m.logical_cols)
                 };
-                let table = bounds.exp_table(alpha, beta);
-                let big_n = bounds.exp_big_n();
                 let mut row_proofs = Vec::with_capacity(rows);
                 for (row, pc) in per_row.iter().enumerate() {
                     let cells = crate::gkr::nonlinear::SoftmaxRowCells {
@@ -1547,9 +1570,7 @@ pub fn prove_segment_full(
                         e: seg.id(&pc.e),
                         y: seg.id(&pc.y),
                         nrm: seg.id(&pc.nrm),
-                        lookup: pc.lookup.cells(&seg),
                         over: seg.id(&pc.over),
-                        over_lookup: pc.over_lookup.cells(&seg),
                         requant: pc.requant.cells(&seg),
                     };
                     let l = row.min(n - 1);
@@ -1558,13 +1579,34 @@ pub fn prove_segment_full(
                         cells,
                         (row, n, l),
                         (pc.m, bounds.exp_lo, pc.tstar),
-                        (rec_q, crate::model::spec::RECIP_Q as usize, digits),
-                        (alpha, beta),
-                        (&table, big_n),
+                        (rec_q, crate::model::spec::RECIP_Q as usize, pc.requant.dbytes),
                         &mut tr,
                     ));
                 }
-                proofs.push(SegmentOpProof::Softmax(row_proofs));
+                // One LogUp per table over every row's query.
+                let lc = lookup.cells(&seg);
+                let exp_lookup = crate::gkr::logup::claim_lookup2(
+                    &mut seg,
+                    lc,
+                    (alpha, beta),
+                    &bounds.exp_table(alpha, beta),
+                    (rows * n, bounds.exp_big_n()),
+                    &mut tr,
+                );
+                let olc = over_lookup.cells(&seg);
+                let over_lk = crate::gkr::logup::claim_lookup2(
+                    &mut seg,
+                    olc,
+                    (alpha, beta),
+                    &crate::gkr::nonlinear::max_table(bounds.exp_lo, alpha, beta),
+                    (rows * n, crate::gkr::nonlinear::max_big_n(bounds.exp_lo)),
+                    &mut tr,
+                );
+                proofs.push(SegmentOpProof::Softmax {
+                    rows: row_proofs,
+                    lookup: exp_lookup,
+                    over_lookup: over_lk,
+                });
             }
             (
                 Op::TopK {
@@ -1632,7 +1674,7 @@ pub fn prove_segment_full(
                     ci,
                     (rows, dims.heads, d),
                     *theta,
-                    (crate::model::spec::RECIP_Q as usize, digits),
+                    (crate::model::spec::RECIP_Q as usize, rp.requant.dbytes),
                     &mut tr,
                 )));
             }
@@ -1717,10 +1759,8 @@ struct SoftmaxPlan {
     e: String,
     y: String,
     nrm: String,
-    lookup: crate::gkr::plan::Lookup2Names,
     requant: crate::gkr::plan::RequantNames,
     over: String,
-    over_lookup: crate::gkr::plan::Lookup2Names,
     m: i64,
     tstar: usize,
 }
@@ -1736,7 +1776,13 @@ enum PlannedOp {
     /// Per-row requant names.
     Norm(Vec<crate::gkr::plan::RequantNames>),
     /// Per-row softmax names.
-    Softmax(Vec<SoftmaxPlan>),
+    Softmax {
+        rows_plan: Vec<SoftmaxPlan>,
+        /// The exp table's lookup, over every row's query at once.
+        lookup: crate::gkr::plan::Lookup2Names,
+        /// The `(d, over)` sign table's lookup, likewise.
+        over_lookup: crate::gkr::plan::Lookup2Names,
+    },
     /// Per-head names.
     WeightedV(Vec<WeightedVPlan>),
     /// Per-head names.
@@ -1757,7 +1803,6 @@ struct RopePlan {
 /// What a `scores` head needed at plan time.
 #[allow(dead_code)]
 struct ScoresPlan {
-    li: usize,
     hi: usize,
     inv_q: i64,
     dot: String,
@@ -1769,7 +1814,6 @@ struct ScoresPlan {
 /// What a `weighted_v` head needed at plan time.
 #[allow(dead_code)]
 struct WeightedVPlan {
-    li: usize,
     hi: usize,
     acc: String,
     ob: String,
@@ -2007,22 +2051,20 @@ pub fn verify_segment_with_head(
                     d.trailing_zeros() as usize,
                     h.trailing_zeros() as usize,
                 );
-                if per_head.len() != lq * h {
+                if per_head.len() != h {
                     return false;
                 }
-                for (n, hp) in per_head.iter().enumerate() {
-                    let (li, hi) = (n / h, n % h);
-                    if hp.cells.out != co || hp.cells.v != cv {
+                for (hi, hp) in per_head.iter().enumerate() {
+                    if hp.cells.out != co || hp.cells.v != cv || hp.head != hi {
                         return false;
                     }
-                    let block_start = ((li * h) + hi) * d;
                     if !crate::gkr::attention::verify_weighted_v(
                         &bundle.segment.commitment,
                         &bundle.segment.claims,
                         hp,
                         (log_l, log_d, log_h),
-                        (hi, block_start),
-                        (d, 15, digits),
+                        hi,
+                        (lq * d, 15, digits),
                         &mut tr,
                     ) {
                         return false;
@@ -2044,33 +2086,36 @@ pub fn verify_segment_with_head(
                     d.trailing_zeros() as usize,
                     h.trailing_zeros() as usize,
                 );
-                if per_head.len() != lq * h {
+                if per_head.len() != h {
                     return false;
                 }
-                for (n, hp) in per_head.iter().enumerate() {
-                    let (li, hi) = (n / h, n % h);
+                for (hi, hp) in per_head.iter().enumerate() {
                     let c = &hp.cells;
                     if c.q != cq || c.k != ck || c.out != co || hp.head != hi {
                         return false;
                     }
-                    let q_start = ((li * h) + hi) * d;
-                    let out_start = ((li * h) + hi) * lq;
                     if !crate::gkr::attention::verify_scores(
                         &bundle.segment.commitment,
                         &bundle.segment.claims,
                         hp,
                         (log_l, log_d, log_h),
                         hi,
-                        (q_start, out_start),
                         hp.inv_q,
-                        (lq, crate::model::spec::RECIP_Q as usize, digits),
+                        (lq * lq, crate::model::spec::RECIP_Q as usize, digits),
                         &mut tr,
                     ) {
                         return false;
                     }
                 }
             }
-            (Op::CausalSoftmax { input, output }, SegmentOpProof::Softmax(row_proofs)) => {
+            (
+                Op::CausalSoftmax { input, output },
+                SegmentOpProof::Softmax {
+                    rows: row_proofs,
+                    lookup,
+                    over_lookup,
+                },
+            ) => {
                 let (Some(ci), Some(co)) = (
                     bundle.segment.commitment.cell(input),
                     bundle.segment.commitment.cell(output),
@@ -2081,8 +2126,6 @@ pub fn verify_segment_with_head(
                     let m = &bundle.segment.commitment.cells[co];
                     (m.logical_rows, m.logical_cols)
                 };
-                let table = bounds.exp_table(alpha, beta);
-                let big_n = bounds.exp_big_n();
                 if row_proofs.len() != rows {
                     return false;
                 }
@@ -2099,15 +2142,30 @@ pub fn verify_segment_with_head(
                         (row, n, l),
                         (bounds.exp_lo, rp.row_max.tstar),
                         (rec_q, crate::model::spec::RECIP_Q as usize, digits),
-                        (&table, big_n),
-                        (
-                            &crate::gkr::nonlinear::max_table(bounds.exp_lo, alpha, beta),
-                            crate::gkr::nonlinear::max_big_n(bounds.exp_lo),
-                        ),
                         &mut tr,
                     ) {
                         return false;
                     }
+                }
+                if !crate::gkr::logup::verify_lookup2(
+                    &bundle.segment.commitment,
+                    &bundle.segment.claims,
+                    lookup,
+                    &bounds.exp_table(alpha, beta),
+                    (rows * n, bounds.exp_big_n()),
+                    &mut tr,
+                ) {
+                    return false;
+                }
+                if !crate::gkr::logup::verify_lookup2(
+                    &bundle.segment.commitment,
+                    &bundle.segment.claims,
+                    over_lookup,
+                    &crate::gkr::nonlinear::max_table(bounds.exp_lo, alpha, beta),
+                    (rows * n, crate::gkr::nonlinear::max_big_n(bounds.exp_lo)),
+                    &mut tr,
+                ) {
+                    return false;
                 }
             }
             (
