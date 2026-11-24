@@ -412,12 +412,23 @@ pub fn claim_value_at_id(
     cell: usize,
     point: &[Ext],
 ) -> Option<Ext> {
+    claim_value_at_col(commitment, claims, cell, 0, point)
+}
+
+/// The value a claim recorded for `cell`'s column `col` at `point`.
+pub fn claim_value_at_col(
+    commitment: &CellSegmentCommitment,
+    claims: &[CellClaim],
+    cell: usize,
+    col: usize,
+    point: &[Ext],
+) -> Option<Ext> {
     if commitment.cells.get(cell).is_none() {
         return None;
     }
     claims
         .iter()
-        .find(|c| c.cell == cell && c.point == point && c.cols.len() == 1)
+        .find(|c| c.cell == cell && c.point == point && c.cols.as_slice() == [col])
         .map(|c| c.values[0])
 }
 

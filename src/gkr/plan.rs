@@ -119,13 +119,6 @@ impl Plan {
         }
         all.resize(all_d, Fp::ONE);
 
-        let mut digits = Vec::with_capacity(decomp.digits);
-        for (j, c) in cols.into_iter().enumerate() {
-            let name = format!("{prefix}.d{j}");
-            self.sc.cell_fp(&name, d, 1, c);
-            digits.push(name);
-        }
-
         let table = decomp.table();
         let ft_d = table.len().next_power_of_two();
         let mut counts = vec![0usize; table.len()];
@@ -152,7 +145,6 @@ impl Plan {
 
         DecompNames {
             value: value_name.to_string(),
-            digits,
             all: format!("{prefix}.all"),
             diff_q: format!("{prefix}.dq"),
             ft: format!("{prefix}.ft"),
@@ -225,7 +217,6 @@ impl Plan {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DecompNames {
     pub value: String,
-    pub digits: Vec<String>,
     pub all: String,
     pub diff_q: String,
     pub ft: String,
@@ -238,7 +229,6 @@ impl DecompNames {
     pub fn cells(&self, seg: &CellSegment) -> DecompCells {
         DecompCells {
             value: seg.id(&self.value),
-            digits: self.digits.iter().map(|n| seg.id(n)).collect(),
             all_digits: seg.id(&self.all),
             diff_q: seg.id(&self.diff_q),
             ft: seg.id(&self.ft),

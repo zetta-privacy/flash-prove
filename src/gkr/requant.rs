@@ -24,8 +24,8 @@ use crate::gkr::segment::{
     claim_mul, claim_value_at_id, linear_finish, linear_verify, verify_mul, CellClaim, CellSegment,
     CellSegmentCommitment, MulSegmentProof,
 };
-use crate::pcs::transcript::Transcript;
 use crate::pcs::linear_claim::{LinearClaimProof, LinearH};
+use crate::pcs::transcript::Transcript;
 use p3_field::PrimeCharacteristicRing;
 
 /// The cells a requant occupies inside the segment.
@@ -293,9 +293,6 @@ mod tests {
         }
         all.resize(all_d, Fp::ONE);
 
-        for (j, c) in cols.into_iter().enumerate() {
-            cells.cell_fp(&format!("{prefix}{j}"), d, 1, c);
-        }
         let table = decomp.table();
         let ft_d = table.len().next_power_of_two();
         let mut counts = vec![0usize; table.len()];
@@ -322,12 +319,9 @@ mod tests {
         cells.cell_fp(&format!("{prefix}m"), ft_d, 1, m);
     }
 
-    fn decomp_cells(seg: &CellSegment, prefix: &str, digits: usize) -> DecompCells {
+    fn decomp_cells(seg: &CellSegment, prefix: &str, _digits: usize) -> DecompCells {
         DecompCells {
             value: seg.id(&format!("{}", if prefix == "bit" { "rem" } else { "x" })),
-            digits: (0..digits)
-                .map(|j| seg.id(&format!("{prefix}{j}")))
-                .collect(),
             all_digits: seg.id(&format!("{prefix}all")),
             diff_q: seg.id(&format!("{prefix}dq")),
             ft: seg.id(&format!("{prefix}ft")),

@@ -60,12 +60,23 @@ pub struct Decomp {
 }
 
 impl Decomp {
-    /// Unsigned binary decomposition: `value ∈ [0, 2^k)`.
+    /// Unsigned decomposition of `value ∈ [0, 2^k)`.
+    ///
+    /// Uses bytes when `k` is a multiple of 8 (a byte table covers the same interval
+    /// with `k/8` lookups instead of `k`), and bits otherwise.
     pub fn bits(k: usize) -> Self {
-        Self {
-            radix: 2,
-            digits: k,
-            signed: false,
+        if k >= 8 && k % 8 == 0 {
+            Self {
+                radix: 256,
+                digits: k / 8,
+                signed: false,
+            }
+        } else {
+            Self {
+                radix: 2,
+                digits: k,
+                signed: false,
+            }
         }
     }
 
@@ -87,13 +98,11 @@ impl Decomp {
         }
     }
 
-    /// The public, shifted table the digits are looked up in.
+    /// The public, shifted digit table the digits are looked up in.
+    ///
+    /// Shifted so that no entry is zero, which the fraction LogUp needs.
     pub fn table(&self) -> Vec<Fp> {
-        if self.signed {
-            (1..=self.radix).map(Fp::new).collect()
-        } else {
-            vec![Fp::ONE, Fp::new(2)]
-        }
+        (1..=self.radix).map(Fp::new).collect()
     }
 
     /// `radix^j`, the weight of digit position `j`.
@@ -118,8 +127,10 @@ impl Decomp {
         if self.signed {
             signed_digits(value, self.digits, self.radix as i64)
         } else {
+            // `radix` is a power of two, so digit `j` starts at bit `j·log2(radix)`.
+            let width = self.radix.trailing_zeros() as usize;
             (0..self.digits)
-                .map(|j| (value >> j) & (self.radix as i64 - 1))
+                .map(|j| (value >> (width * j)) & (self.radix as i64 - 1))
                 .collect()
         }
     }
@@ -149,14 +160,42 @@ fn signed_digits(value: i64, n: usize, radix: i64) -> Vec<i64> {
 pub struct DecompCells {
     /// The value being decomposed and range-checked.
     pub value: usize,
-    /// One cell per digit position, least significant first.
-    pub digits: Vec<usize>,
-    /// The flattened, shifted digits (`digit + shift`).
+    /// The flattened, shifted digits (`digit_j + shift`), digit-major:
+    /// entry `j·n + i` is digit `j` of value `i`.
     pub all_digits: usize,
     pub diff_q: usize,
     pub ft: usize,
     pub diff_t: usize,
     pub m: usize,
+}
+
+/// The public linear map that reconstructs the value from the shifted digits.
+///
+/// With `r` the same random combination the value claim uses, `value = Σ_j radix^j·digit_j`
+/// becomes the scalar identity
+///
+/// ```text
+///   ⟨h, shifted digits⟩ = ⟨r, value⟩ + shift·Σ_j radix^j·Σ_i r_i,
+///   h[j·n + i] = radix^j · r_i      (zero on the padding)
+/// ```
+/// so one linear claim over `all_digits` replaces the per-digit claims.
+fn reconstruct_h(decomp: Decomp, n: usize, m_all: usize, r: &[Fp]) -> LinearH {
+    let mut h = vec![Fp::ZERO; 1usize << m_all];
+    for j in 0..decomp.digits {
+        let w = decomp.weight(j);
+        for (i, &ri) in r.iter().enumerate().take(n) {
+            h[j * n + i] = w * ri;
+        }
+    }
+    LinearH::Dense(h)
+}
+
+/// `shift · Σ_j radix^j · Σ_i r_i`, the public offset `reconstruct_h` introduces.
+fn reconstruct_offset(decomp: Decomp, n: usize, r: &[Fp]) -> Fp {
+    let shift = Fp::new(decomp.shift() as u64);
+    let r_sum: Fp = r.iter().take(n).copied().sum();
+    let w_sum: Fp = (0..decomp.digits).map(|j| decomp.weight(j)).sum();
+    shift * w_sum * r_sum
 }
 
 /// A decomposition / range-check proof.
@@ -168,8 +207,8 @@ pub struct DecompSegmentProof {
     /// The RLC vector, `n` entries zero-extended to the value cell's arity.
     pub r: Vec<Fp>,
     pub b_value: (Ext, LinearClaimProof),
-    /// `⟨r, digit_j⟩`, least significant first.
-    pub b_digits: Vec<(Ext, LinearClaimProof)>,
+    /// `⟨reconstruct_h, shifted digits⟩` — the value plus the public offset.
+    pub b_words: (Ext, LinearClaimProof),
     pub logup: LogUpSegmentProof,
 }
 
@@ -181,15 +220,12 @@ pub fn claim_decomp(
     (n, _digits): (usize, usize),
     tr: &mut Transcript,
 ) -> DecompSegmentProof {
-    assert_eq!(cells.digits.len(), decomp.digits, "one cell per digit");
+    let m_all = seg.cells_meta(cells.all_digits).m();
     let m = seg.cells_meta(cells.value).m();
     let d = 1usize << m;
     assert!(n <= d, "value cell too small");
 
     tr.observe_val(Fp::new(cells.value as u64));
-    for &c in &cells.digits {
-        tr.observe_val(Fp::new(c as u64));
-    }
     tr.observe_val(Fp::new(cells.all_digits as u64));
 
     let mut r: Vec<Fp> = (0..n).map(|_| tr.sample_val()).collect();
@@ -197,10 +233,17 @@ pub fn claim_decomp(
     let h = LinearH::Dense(r.clone());
 
     let b_value = seg.claim_linear_id(cells.value, 0, &h, tr);
-    let mut b_digits = Vec::with_capacity(decomp.digits);
-    for &c in &cells.digits {
-        b_digits.push(seg.claim_linear_id(c, 0, &h, tr));
-    }
+    let b_words = seg.claim_linear_id(
+        cells.all_digits,
+        0,
+        &reconstruct_h(decomp, n, m_all, &r),
+        tr,
+    );
+    debug_assert_eq!(
+        b_words.0,
+        b_value.0 + Ext::from(reconstruct_offset(decomp, n, &r)),
+        "digits reconstruct the value"
+    );
 
     let table = decomp.table();
     let logup = claim_logup(
@@ -218,7 +261,7 @@ pub fn claim_decomp(
         cells,
         r,
         b_value,
-        b_digits,
+        b_words,
         logup,
     }
 }
@@ -233,22 +276,21 @@ pub fn verify_decomp(
 ) -> bool {
     let decomp = proof.decomp;
     let cells = proof.cells.clone();
-    if proof.n != n || proof.b_digits.len() != decomp.digits || cells.digits.len() != decomp.digits
-    {
-        return false;
-    }
     let Some(meta) = commitment.cells.get(cells.value) else {
         return false;
     };
+    let Some(m_all) = commitment.cells.get(cells.all_digits).map(|c| c.m()) else {
+        return false;
+    };
+    if proof.n != n {
+        return false;
+    }
     let d = 1usize << meta.m();
     if proof.r.len() != d || n > d {
         return false;
     }
 
     tr.observe_val(Fp::new(cells.value as u64));
-    for &c in &cells.digits {
-        tr.observe_val(Fp::new(c as u64));
-    }
     tr.observe_val(Fp::new(cells.all_digits as u64));
     let mut r: Vec<Fp> = (0..n).map(|_| tr.sample_val()).collect();
     r.resize(d, Fp::ZERO);
@@ -267,21 +309,18 @@ pub fn verify_decomp(
         return false;
     }
 
-    let mut sum = Ext::ZERO;
-    for (j, &c) in cells.digits.iter().enumerate() {
-        let (bval, ref cl) = proof.b_digits[j];
-        let Some((z, cf)) = linear_verify(cl, bval, tr) else {
-            return false;
-        };
-        let Some(v) = claim_value_at_id(commitment, claims, c, &z) else {
-            return false;
-        };
-        if !linear_finish(&h, &z, cf, v) {
-            return false;
-        }
-        sum += Ext::from(decomp.weight(j)) * bval;
+    let (b_words, ref cl) = proof.b_words;
+    let Some((z, cf)) = linear_verify(cl, b_words, tr) else {
+        return false;
+    };
+    let Some(v) = claim_value_at_id(commitment, claims, cells.all_digits, &z) else {
+        return false;
+    };
+    if !linear_finish(&reconstruct_h(decomp, n, m_all, &proof.r), &z, cf, v) {
+        return false;
     }
-    if sum != proof.b_value.0 {
+    // The digits reconstruct the value, up to the public shift offset.
+    if b_words != proof.b_value.0 + Ext::from(reconstruct_offset(decomp, n, &proof.r)) {
         return false;
     }
 
@@ -563,9 +602,6 @@ mod tests {
             v.resize(d, Fp::ZERO);
             v
         });
-        for (j, col) in cols.into_iter().enumerate() {
-            cells.cell_fp(&format!("d{j}"), d, 1, col);
-        }
         let ft_d = table.len().next_power_of_two();
         let mut ft = table.clone();
         ft.resize(ft_d, Fp::ONE);
@@ -587,9 +623,6 @@ mod tests {
         let com = seg.commitment();
         let cells = DecompCells {
             value: seg.id("value"),
-            digits: (0..decomp.digits)
-                .map(|j| seg.id(&format!("d{j}")))
-                .collect(),
             all_digits: seg.id("all"),
             diff_q: seg.id("diff_q"),
             ft: seg.id("ft"),
@@ -632,76 +665,8 @@ mod tests {
             Decomp::signed_bytes(3)
         ));
 
-        // A corrupted digit column must break reconstruction.
-        let decomp = Decomp::signed_bytes(2);
-        let vals = [300i64, -700];
-        let mut cells = plan(&vals, decomp);
-        // Rebuild with a tampered first digit column.
-        let cols = decomp.columns(&vals, vals.len().next_power_of_two());
-        let d = vals.len().next_power_of_two();
-        let mut all: Vec<Fp> = Vec::new();
-        for col in &cols {
-            for &x in col.iter().take(vals.len()) {
-                all.push(x + Fp::new(decomp.shift() as u64));
-            }
-        }
-        let all_d = (vals.len() * decomp.digits).next_power_of_two();
-        all.resize(all_d, Fp::ONE);
-        let table = decomp.table();
-        let mut counts = vec![0usize; table.len()];
-        for &v in all.iter().take(vals.len() * decomp.digits) {
-            counts[v.as_canonical_u64() as usize - 1] += 1;
-        }
-        let mut m: Vec<Fp> = counts.iter().map(|&c| Fp::new(c as u64)).collect();
-        m.resize(table.len(), Fp::ONE);
-        let diff_q: Vec<Fp> = all.iter().map(|&x| x.inverse()).collect();
-        let diff_t: Vec<Fp> = m
-            .iter()
-            .zip(&table)
-            .map(|(&a, &b)| a * b.inverse())
-            .collect();
-        let ft_d = table.len().next_power_of_two();
-        let mut ft = table.clone();
-        ft.resize(ft_d, Fp::ONE);
-        let mut diff_t = diff_t;
-        diff_t.resize(ft_d, Fp::ONE);
-        cells.cell_fp("all", all_d, 1, all);
-        cells.cell_fp("diff_q", all_d, 1, diff_q);
-        cells.cell_fp("ft", ft_d, 1, ft);
-        cells.cell_fp("diff_t", ft_d, 1, diff_t);
-        cells.cell_fp("m", ft_d, 1, m);
-        let _ = d;
-
-        let mut seg = cells.seal(Params::default());
-        let com = seg.commitment();
-        let c = DecompCells {
-            value: seg.id("value"),
-            // Swap two digit columns: reconstruction no longer matches.
-            digits: vec![seg.id("d1"), seg.id("d0")],
-            all_digits: seg.id("all"),
-            diff_q: seg.id("diff_q"),
-            ft: seg.id("ft"),
-            diff_t: seg.id("diff_t"),
-            m: seg.id("m"),
-        };
-        let proof = claim_decomp(
-            &mut seg,
-            c,
-            decomp,
-            (vals.len(), decomp.digits),
-            &mut Transcript::new(&new_challenger()),
-        );
-        let claims = seg.claims().to_vec();
-        let wproof = seg.prove(&mut new_challenger());
-        assert!(verify(&com, &claims, &wproof, &mut new_challenger()));
-        let mut vtr = Transcript::new(&new_challenger());
-        assert!(!verify_decomp(
-            &com,
-            &claims,
-            &proof,
-            (vals.len(), decomp.digits),
-            &mut vtr
-        ));
+        // Too few digits for the value: the reconstruction identity fails.
+        assert!(!run(&[300], Decomp::signed_bytes(1)));
     }
 
     #[test]

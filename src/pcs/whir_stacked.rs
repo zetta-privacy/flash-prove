@@ -217,11 +217,15 @@ impl Committer {
         let witness = Witness::new(tables, FOLDING);
         let m = witness.num_variables();
         eprintln!(
-            "  stack: {} tables, max 2^{}, stacked 2^{} ({} values)",
+            "  stack: {} tables, max 2^{}, cells 2^{:.1}, stacked 2^{}",
             shapes.len(),
             shapes.iter().map(|s| s.m).max().unwrap_or(0),
-            m,
-            if m < 63 { 1usize << m } else { 0 }
+            (shapes
+                .iter()
+                .map(|s| (s.width as f64) * (1u64 << s.m) as f64)
+                .sum::<f64>())
+            .log2(),
+            m
         );
         let (root, pd) = with_prover(m, params, |p| {
             let mut ch = new_challenger();

@@ -894,9 +894,6 @@ mod tests {
             }
         }
         all.resize(all_d, Fp::ONE);
-        for (j, c) in cols.into_iter().enumerate() {
-            cells.cell_fp(&format!("{prefix}{j}"), d, 1, c);
-        }
         let table = dec.table();
         let ft_d = table.len().next_power_of_two();
         let mut counts = vec![0usize; table.len()];
@@ -926,13 +923,10 @@ mod tests {
         seg: &CellSegment,
         prefix: &str,
         value: &str,
-        digits: usize,
+        _digits: usize,
     ) -> crate::gkr::range::DecompCells {
         crate::gkr::range::DecompCells {
             value: seg.id(value),
-            digits: (0..digits)
-                .map(|j| seg.id(&format!("{prefix}{j}")))
-                .collect(),
             all_digits: seg.id(&format!("{prefix}all")),
             diff_q: seg.id(&format!("{prefix}dq")),
             ft: seg.id(&format!("{prefix}ft")),
