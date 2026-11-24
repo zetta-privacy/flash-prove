@@ -2,7 +2,7 @@
 //! commitment plumbing they share.
 
 pub mod attention;
-pub mod commit;
+pub mod bounds;
 pub mod driver;
 pub mod head;
 pub mod logup;

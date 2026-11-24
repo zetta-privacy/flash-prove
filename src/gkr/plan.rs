@@ -272,7 +272,7 @@ mod tests {
     use crate::gkr::requant::{claim_requant, verify_requant};
     use crate::gkr::segment::verify;
     use crate::model::spec::requant as requant_i64;
-    use crate::pcs::fri::{new_challenger, Transcript};
+    use crate::pcs::transcript::{new_challenger, Transcript};
 
     #[test]
     fn planned_requant_is_provable() {

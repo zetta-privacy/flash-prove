@@ -1,7 +1,17 @@
 //! Multilinear extension evaluation and the round-polynomial types used by GKR.
 
-use crate::field::{eq, Ext};
+use crate::field::{eq, Ext, Fp};
 use p3_field::PrimeCharacteristicRing;
+
+/// The MLE of a base-field vector at a field point (prover-side; the prover holds
+/// `v` in the clear).
+pub fn mle_value(v: &[Fp], point: &[Ext]) -> Ext {
+    debug_assert_eq!(v.len(), 1 << point.len());
+    v.iter()
+        .enumerate()
+        .map(|(j, &vj)| eq(point, j) * Ext::from(vj))
+        .sum()
+}
 
 /// Evaluate the multilinear extension of `f` (given by its `2^n` evaluations,
 /// indexed by the Boolean point of `j`) at an arbitrary point `point ∈ E^n`.

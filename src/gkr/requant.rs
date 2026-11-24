@@ -24,7 +24,7 @@ use crate::gkr::segment::{
     claim_mul, claim_value_at_id, linear_finish, linear_verify, verify_mul, CellClaim, CellSegment,
     CellSegmentCommitment, MulSegmentProof,
 };
-use crate::pcs::fri::Transcript;
+use crate::pcs::transcript::Transcript;
 use crate::pcs::linear_claim::{LinearClaimProof, LinearH};
 use p3_field::PrimeCharacteristicRing;
 
@@ -227,7 +227,7 @@ mod tests {
     use super::*;
     use crate::gkr::segment::{verify, SegmentCells};
     use crate::model::spec::requant as requant_i64;
-    use crate::pcs::fri::new_challenger;
+    use crate::pcs::transcript::new_challenger;
     use crate::pcs::whir_stacked::Params;
     use p3_field::{Field, PrimeField64};
 

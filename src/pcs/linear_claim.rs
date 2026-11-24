@@ -1,11 +1,10 @@
 //! Linear claims `⟨h, v⟩ = b` on committed data, via multilinear sumcheck.
 //!
 //! The op graph is full of *linear* claims that are not point evaluations: most
-//! importantly the row-slice ties of [`crate::gkr::commit::tie_row`], where an
-//! ephemeral slice `row` must be shown to be a contiguous block of a committed
-//! cell `full`.
+//! importantly the row-slice ties, where an ephemeral slice `row` must be shown
+//! to be a contiguous block of a committed cell `full`.
 //!
-//! The FRI layer answered these with the univariate constant-coefficient trick
+//! The original layer answered these with the univariate constant-coefficient trick
 //! (`p = h⊙v`, `q = (P−c₀)/X`, check `P(α) = c₀ + α·Q(α)`). That needs committed
 //! *products*, which a WHIR/FRI point-opening scheme cannot express without
 //! extra roots. The multilinear answer needs none:
@@ -23,7 +22,7 @@
 
 use crate::field::sumcheck::RoundPoly;
 use crate::field::{eq, Ext, Fp};
-use crate::pcs::fri::Transcript;
+use crate::pcs::transcript::Transcript;
 use p3_field::PrimeCharacteristicRing;
 
 /// A quadratic sumcheck for one linear claim, in round order.
@@ -190,8 +189,8 @@ pub fn finish(h: &LinearH, z: &[Ext], claim: Ext, v_at_z: Ext) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pcs::fri::new_challenger;
-    use crate::pcs::zk::mle_value;
+    use crate::field::sumcheck::mle_value;
+    use crate::pcs::transcript::new_challenger;
     use rand::rngs::StdRng;
     use rand::{RngExt, SeedableRng};
 

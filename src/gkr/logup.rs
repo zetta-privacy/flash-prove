@@ -16,8 +16,8 @@
 //! | the table inverses are `m/ft` | [`claim_mul`] |
 //! | balance `Σ diff_q = Σ diff_t`, and `Σ m = n` | two/one `LinearH::Dense` claims |
 //!
-//! The FRI version ([`crate::lookup::logup`]) additionally committed `g_q = r⊙fq`
-//! and `g_t = r⊙ft` and ran two committed IPAs because it could not express a
+//! The pre-WHIR version additionally committed `g_q = r⊙fq` and `g_t = r⊙ft`
+//! and ran two committed inner-product arguments because it could not express a
 //! pointwise product; [`claim_mul`] removes all of that.
 //!
 //! # Ordering
@@ -34,8 +34,8 @@ use crate::gkr::segment::{
     claim_value_at_id, linear_finish, linear_verify, CellClaim, CellSegment, CellSegmentCommitment,
     MulSegmentProof,
 };
-use crate::pcs::fri::Transcript;
 use crate::pcs::linear_claim::{LinearClaimProof, LinearH};
+use crate::pcs::transcript::Transcript;
 use p3_field::PrimeCharacteristicRing;
 
 /// One cell proven equal to a public vector at a random point.
@@ -390,7 +390,6 @@ fn fp_i64(x: i64) -> Ext {
     })
 }
 
-
 /// The LogUp fingerprint challenge pair.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Fingerprint {
@@ -492,7 +491,7 @@ pub fn verify_link(
 mod tests {
     use super::*;
     use crate::gkr::segment::{verify, SegmentCells};
-    use crate::pcs::fri::new_challenger;
+    use crate::pcs::transcript::new_challenger;
     use crate::pcs::whir_stacked::Params;
     use p3_field::Field;
 

@@ -1,8 +1,9 @@
 //! Segment-level **stacked** WHIR commitment.
 //!
-//! `basefold.rs` commits one vector per root. That is fine for a single claim,
-//! but the op-graph walk produces thousands of claims per segment, and one root
-//! per claim is exactly the memory and FS problem the FRI layer had.
+//! The earlier BaseFold layer commits one vector per root. That is fine for a
+//! single claim, but the op-graph walk produces thousands of claims per segment,
+//! and one root per claim is exactly the memory and FS problem a per-claim
+//! commitment has.
 //!
 //! This module is the segment-level alternative the paper's architecture calls
 //! for: **every table of one segment is stacked into a single WHIR commitment**,
@@ -34,7 +35,7 @@ use std::collections::HashMap;
 
 use crate::field::{Ext, Fp};
 use crate::pcs::blake3_mmcs::{Blake3Compress, Blake3Hasher};
-use crate::pcs::fri::{new_challenger, Challenger};
+use crate::pcs::transcript::{new_challenger, Challenger};
 use p3_commit::MultilinearPcs;
 use p3_dft::Radix2DitParallel;
 use p3_field::PrimeCharacteristicRing;
@@ -269,8 +270,13 @@ impl SegmentProver {
         table: usize,
         col: usize,
         h: &crate::pcs::linear_claim::LinearH,
-        tr: &mut crate::pcs::fri::Transcript,
-    ) -> (Ext, crate::pcs::linear_claim::LinearClaimProof, Vec<Ext>, Ext) {
+        tr: &mut crate::pcs::transcript::Transcript,
+    ) -> (
+        Ext,
+        crate::pcs::linear_claim::LinearClaimProof,
+        Vec<Ext>,
+        Ext,
+    ) {
         let n = 1usize << self.table_m(table);
         assert_eq!(h.len(), n, "`h` must be padded to the column length");
         let v = self.column_logical(table, col);

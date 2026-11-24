@@ -9,9 +9,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::Parser;
-use flashprove::gkr::driver::{
-    ops_per_segment, verify_segment_with_head, HeadSpec, ProvedModel,
-};
+use flashprove::gkr::driver::{ops_per_segment, verify_segment_with_head, HeadSpec, ProvedModel};
 use flashprove::model::spec::ModelSpec;
 use flashprove::pcs::whir_stacked::SegmentCommitment;
 
@@ -37,8 +35,7 @@ struct Args {
 fn main() -> ExitCode {
     let args = Args::parse();
     let spec: ModelSpec = common::load(&args.spec);
-    // The pre-shared map: one root per weight tensor, as `cp_commit --whir-out`
-    // wrote it.
+    // The pre-shared map: one root per weight tensor, as `cp_commit` wrote it.
     let commits: Vec<(String, SegmentCommitment)> = common::load_bin(&args.commit);
     let published: HashMap<String, SegmentCommitment> = commits.into_iter().collect();
     let file: ProvedModel = common::load_bin(&args.proof);
@@ -48,7 +45,14 @@ fn main() -> ExitCode {
     let segment_cells: Vec<Vec<String>> = file
         .segments
         .iter()
-        .map(|b| b.segment.commitment.cells.iter().map(|c| c.name.clone()).collect())
+        .map(|b| {
+            b.segment
+                .commitment
+                .cells
+                .iter()
+                .map(|c| c.name.clone())
+                .collect()
+        })
         .collect();
     let Some(per_segment) = ops_per_segment(&spec.ops, &segment_cells).ok() else {
         println!("reject (ops do not map to segments)");
@@ -73,7 +77,13 @@ fn main() -> ExitCode {
             &published,
             &[],
             &spec.dims,
-            (args.digits, flashprove::field::Fp::new(11), flashprove::field::Fp::new(5), args.rec_q, args.eps),
+            (
+                args.digits,
+                flashprove::field::Fp::new(11),
+                flashprove::field::Fp::new(5),
+                args.rec_q,
+                args.eps,
+            ),
             &file.bounds,
             &file.window,
             head.as_ref(),

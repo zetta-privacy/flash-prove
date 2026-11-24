@@ -20,7 +20,7 @@
 //! which soundly forces the two committed boundary vectors to agree.
 
 use flashprove::field::{Ext, Fp};
-use flashprove::pcs::fri::{new_challenger, Challenger};
+use flashprove::pcs::transcript::{new_challenger, Challenger};
 use flashprove::pcs::whir_stacked::{
     observe_root, sample_point, verify, Claim, Committer, Params, Proof, SegmentCommitment,
 };

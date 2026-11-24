@@ -26,7 +26,7 @@ use crate::gkr::segment::{
     verify_sum_squares, CellClaim, CellSegment, CellSegmentCommitment, MulSegmentProof,
     SumSquaresProof, View,
 };
-use crate::pcs::fri::Transcript;
+use crate::pcs::transcript::Transcript;
 use crate::pcs::linear_claim::{LinearClaimProof, LinearH};
 use p3_field::PrimeCharacteristicRing;
 
@@ -856,7 +856,7 @@ pub fn verify_embed(
             values: vec![proof.weight.value],
         }],
         w_proof,
-        &mut crate::pcs::fri::new_challenger(),
+        &mut crate::pcs::transcript::new_challenger(),
     );
     opened
         && linear_finish(&h, &zw, cfw, proof.weight.value)
@@ -869,7 +869,7 @@ mod tests {
     use crate::gkr::range::Decomp;
     use crate::gkr::segment::{verify, SegmentCells};
     use crate::model::spec::requant as requant_i64;
-    use crate::pcs::fri::new_challenger;
+    use crate::pcs::transcript::new_challenger;
     use crate::pcs::whir_stacked::Params;
     use p3_field::{Field, PrimeCharacteristicRing};
 

@@ -1,7 +1,7 @@
 # FlashProve (Rust)
 
 A Rust reimplementation of **FlashProve** — hash-based proofs of LLM inference — built on the
-**GKR + LogUp + FRI** stack. It lets a prover convince a verifier that a quantized
+**GKR + LogUp + WHIR** stack. It lets a prover convince a verifier that a quantized
 Mixture-of-Experts language model (e.g. OLMoE-1B-7B) emitted a particular token, without the
 verifier ever running the model or seeing its weights.
 
@@ -52,15 +52,20 @@ The model is not a monolithic function; it's a graph of small, well-understood o
 The prover commits every cell and every weight to a polynomial commitment. Each op then becomes a
 constraint *between committed values* that the verifier must check.
 
-### 2. Commitment — FRI
+### 2. Commitment — stacked WHIR
 
-Every cell and weight is committed with **FRI** (a fast Reed–Solomon-style IOP of proximity): the
-data is laid out as evaluations of a polynomial over a finite field, and the commitment is a Merkle
-tree root over those evaluations. FRI lets the prover *open* the polynomial at a point and prove
-the opened value is consistent with the commitment, in `O(log n)`.
+A whole **segment** (one slice of the op graph: a few layers, or one layer split in pieces) is
+committed as **one** WHIR root. Every cell of that segment is a table in a *stacked* commitment —
+one Merkle tree over all the tables — so a segment costs exactly one root and one WHIR proof, no
+matter how many claims the ops inside it make.
 
-The base field is **Goldilocks** (`p = 2⁶⁴ − 2³² + 1`), and challenges live in its cubic extension.
-There is **no trusted setup** — it's all Merkle trees and hashing.
+WHIR is a BaseFold-style multilinear IOP of proximity: the tables are Reed–Solomon encoded over a
+larger domain, Merkle-committed, and opened at a point with a folding argument. The verifier's
+proximity check is `O(log n)` — it never reads the `n` encoded entries.
+
+The base field is **Goldilocks** (`p = 2⁶⁴ − 2³² + 1`), challenges live in its cubic extension, and
+the hasher is BLAKE3 over SIMD-batched field leaves. There is **no trusted setup** — it's all Merkle
+trees and hashing.
 
 ### 3. Reduction — the three ways each op is checked
 
@@ -70,7 +75,8 @@ small field checks:
 - **Matmul → GKR sumcheck.** To check `C = A·B` the verifier samples random points `(r, s)`,
   forms the single claim `C̃(r,s) = Σ_k Ã(r,k)·B̃(k,s)`, and runs a **sumcheck** over the
   contraction index `k`. `log n` rounds later the claim is a product of *two* MLE evaluations
-  at one point — each opened through FRI. The verifier never touches the `n` entries of `C`.
+  at one point — each opened against the segment's WHIR root. The verifier never touches the `n`
+  entries of `C`.
 
 - **Nonlinearity → LogUp lookup.** `out[i] = f(in[i])` for a public `f` (SiLU, `exp`, `top-k`
   sign). The prover proves each `(in[i], out[i])` is a row of a public table of `(x, f(x))` via a
@@ -93,16 +99,16 @@ vocab-scaled top-`k` delta, so it stays small.
 
 ---
 
-## One FRI proof to rule them all
+## One WHIR proof per segment
 
-Every check above ends in an *opening* of some committed polynomial at a field point. The prover
-doesn't produce a FRI proof per opening — it records them all into a transcript and emits a
-**single shared FRI proof** at the end. The verifier replays the exact same transcript (same
-challenge derivation order), accumulates the same openings, and checks the one FRI proof.
+Every check above ends in an *opening* of a committed table at a field point. The prover does not
+produce a proof per opening: it records every claim against the segment's stacked root, then
+emits a **single WHIR proof for the segment** at the end. The verifier replays the same transcript
+(same challenge derivation order), accumulates the same claims, and checks the one WHIR proof.
 
 All challenges are derived by **Fiat–Shamir**: hashing the prover's transcript with Poseidon2. The
 opening *order* is load-bearing — prove and verify must walk the op graph and sample challenges in
-identical sequence, or the single batch check fails.
+identical sequence, or the batch check fails.
 
 ---
 
@@ -110,11 +116,12 @@ identical sequence, or the single batch check fails.
 
 The three programs split the work the way the paper does:
 
-1. **`cp_commit`** commits the model weights *once* (offline) and publishes the roots.
-2. **`cp_prove`** re-derives the same (deterministic) commitments, commits the request's trace,
-   and proves. The proof embeds `name → commitment` for every weight.
-3. **`cp_verify`** checks that the proof's weight commitments **equal the pre-shared roots** —
-   this is what *binds* the proof to the real model — then verifies.
+1. **`cp_commit`** commits every weight tensor to its own WHIR root *once* (offline, dropping each
+tensor's witness as soon as its root exists) and publishes the `name → root` map.
+2. **`cp_prove`** commits the request's trace and proves. Weights are never copied into the
+activation segments: each weight claim is opened against its pre-shared root.
+3. **`cp_verify`** checks that the roots the proof opens against **equal the pre-shared map** —
+this is what *binds* the proof to the real model — then verifies each segment.
 
 That binding is the soundness core: a malicious prover who swaps in different weights produces a
 different commitment, which won't match the published one, so the proof is rejected. The verifier
@@ -125,7 +132,7 @@ holds only the small weight commitment + one proof, and needs no GPU.
 ## Why the verifier is cheap
 
 The verifier's work is, per op, a few sumcheck rounds or one lookup — each `O(log n)` — plus one
-FRI proof check. It never materializes the `n`-sized matrices or activations, and never
+WHIR proof check per segment. It never materializes the `n`-sized matrices or activations, and never
 recomputes a single matmul. Total: `O(depth · log n)`. The prover, meanwhile, does the full
 inference plus the proof generation (committing and opening everything), which is the expensive
 side — as intended.
@@ -134,7 +141,7 @@ side — as intended.
 
 ## Status
 
-Research prototype. FRI parameters (`log_blowup = 1`, `num_queries = 10`) are far below the
-paper's 128-bit security target; the scheme is **not zero-knowledge** (openings leak linear
-combinations); and there is no cross-request batching, segmentation, or link-proof amortization.
-The Lean formalization from the paper is out of scope.
+Research prototype. The WHIR parameters are chosen for a first working integration and are below
+the paper's 128-bit security target; the scheme is **not zero-knowledge** (openings leak linear
+combinations); and there is no cross-request batching or link-proof amortization. The Lean
+formalization from the paper is out of scope.

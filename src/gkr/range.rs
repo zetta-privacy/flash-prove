@@ -17,10 +17,9 @@
 //! 3. the digits reconstruct the value: at one random `r`,
 //!    `r̃·value = Σ_d radix^d · (r̃·digit_d)`.
 //!
-//! The FRI versions committed the value, every digit column and the flattened
-//! digit vector separately ([`crate::lookup::range_check`],
-//! [`crate::lookup::requant::BitDecompProof`]); here they are cells of one
-//! segment, so the whole check costs one WHIR proof.
+//! Digit decomposition used to need extra commitments — the value, every digit
+//! column and the flattened digit vector as separate roots. Here they are cells
+//! of one segment, so the whole check costs one WHIR proof.
 
 use crate::field::{Ext, Fp};
 use crate::gkr::logup::{claim_logup, verify_logup, LogUpSegmentProof};
@@ -28,8 +27,8 @@ use crate::gkr::segment::{
     claim_value_at_id, linear_finish, linear_verify, CellClaim, CellSegment, CellSegmentCommitment,
     View,
 };
-use crate::pcs::fri::Transcript;
 use crate::pcs::linear_claim::{LinearClaimProof, LinearH};
+use crate::pcs::transcript::Transcript;
 
 /// A signed integer as a base-field element.
 fn fp_i64(x: i64) -> Fp {
@@ -297,7 +296,6 @@ pub fn verify_decomp(
     )
 }
 
-
 /// Cells for a "this is the maximum of a row" claim.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RowMaxCells {
@@ -363,7 +361,10 @@ pub fn claim_row_max(
     (table, big_n): (&[Fp], usize),
     tr: &mut Transcript,
 ) -> RowMaxProof {
-    assert!(prefix < n && tstar <= prefix, "the maximum must lie in the prefix");
+    assert!(
+        prefix < n && tstar <= prefix,
+        "the maximum must lie in the prefix"
+    );
     let log_n = n.trailing_zeros() as usize;
     let mask: Vec<Fp> = (0..n)
         .map(|i| if i <= prefix { Fp::ONE } else { Fp::ZERO })
@@ -504,26 +505,22 @@ pub fn verify_row_max(
     }
 
     let row_blk = View::block(m_scores, row * n, log_n);
-    let tok_point = row_blk.point(&crate::field::arith::bool_point(proof.tstar, log_n), m_scores);
+    let tok_point = row_blk.point(
+        &crate::field::arith::bool_point(proof.tstar, log_n),
+        m_scores,
+    );
     if claim_value_at_id(commitment, claims, c.scores, &tok_point) != Some(m_ext) {
         return false;
     }
 
-    crate::gkr::logup::verify_lookup2(
-        commitment,
-        claims,
-        &proof.lookup,
-        table,
-        (n, big_n),
-        tr,
-    )
+    crate::gkr::logup::verify_lookup2(commitment, claims, &proof.lookup, table, (n, big_n), tr)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::gkr::segment::{verify, SegmentCells};
-    use crate::pcs::fri::new_challenger;
+    use crate::pcs::transcript::new_challenger;
     use crate::pcs::whir_stacked::Params;
     use p3_field::{Field, PrimeField64};
 
@@ -711,7 +708,7 @@ mod tests {
     fn row_max_is_an_upper_bound_and_is_achieved() {
         use crate::gkr::logup::Lookup2Cells;
         use crate::gkr::segment::{verify, SegmentCells};
-        use crate::pcs::fri::{new_challenger, Transcript};
+        use crate::pcs::transcript::{new_challenger, Transcript};
         use crate::pcs::whir_stacked::Params;
         use p3_field::Field;
 
@@ -728,7 +725,13 @@ mod tests {
         let beta = Fp::new(5);
 
         let d: Vec<i64> = (0..n)
-            .map(|i| if i <= prefix { scores[row * n + i] - m } else { 0 })
+            .map(|i| {
+                if i <= prefix {
+                    scores[row * n + i] - m
+                } else {
+                    0
+                }
+            })
             .collect();
         let over: Vec<i64> = d.iter().map(|&x| if x > 0 { 1 } else { 0 }).collect();
         let fp_of = |x: i64, s: i64| alpha + beta * fp_i64(x) + beta * beta * fp_i64(s);
@@ -758,7 +761,12 @@ mod tests {
         let diff_q: Vec<Fp> = fpv.iter().map(|&v| v.inverse()).collect();
 
         let mut cells = SegmentCells::new();
-        cells.cell_fp("scores", rows * n, 1, scores.iter().map(|&x| fp_i64(x)).collect());
+        cells.cell_fp(
+            "scores",
+            rows * n,
+            1,
+            scores.iter().map(|&x| fp_i64(x)).collect(),
+        );
         cells.cell_fp("d", n, 1, d.iter().map(|&x| fp_i64(x)).collect());
         cells.cell_fp("over", n, 1, over.iter().map(|&x| fp_i64(x)).collect());
         cells.cell_fp("fp", n, 1, fpv);
@@ -786,14 +794,28 @@ mod tests {
         };
         let mut tr = Transcript::new(&new_challenger());
         let proof = claim_row_max(
-            &mut seg, cells2, (row, n), prefix, m, tstar, (alpha, beta), (&table, big_n), &mut tr,
+            &mut seg,
+            cells2,
+            (row, n),
+            prefix,
+            m,
+            tstar,
+            (alpha, beta),
+            (&table, big_n),
+            &mut tr,
         );
         let claims = seg.claims().to_vec();
         let wproof = seg.prove(&mut new_challenger());
         assert!(verify(&com, &claims, &wproof, &mut new_challenger()));
         let mut vtr = Transcript::new(&new_challenger());
         assert!(verify_row_max(
-            &com, &claims, &proof, (row, n), prefix, (&table, big_n), &mut vtr
+            &com,
+            &claims,
+            &proof,
+            (row, n),
+            prefix,
+            (&table, big_n),
+            &mut vtr
         ));
 
         // An `m` that is too small is rejected: some score exceeds it.
@@ -801,7 +823,13 @@ mod tests {
         bad.m -= 1;
         let mut vtr = Transcript::new(&new_challenger());
         assert!(!verify_row_max(
-            &com, &claims, &bad, (row, n), prefix, (&table, big_n), &mut vtr
+            &com,
+            &claims,
+            &bad,
+            (row, n),
+            prefix,
+            (&table, big_n),
+            &mut vtr
         ));
     }
 }

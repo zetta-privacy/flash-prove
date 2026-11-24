@@ -16,7 +16,7 @@
 use flashprove::field::{Ext, Fp};
 use flashprove::gkr::segment::{claim_value_at, linear_finish, linear_verify, verify, CellSegment};
 use flashprove::model::{Cell, WeightMatrix};
-use flashprove::pcs::fri::{new_challenger, Transcript};
+use flashprove::pcs::transcript::{new_challenger, Transcript};
 use flashprove::pcs::linear_claim::LinearH;
 use flashprove::pcs::whir_stacked::{observe_root, Params};
 use p3_field::PrimeCharacteristicRing;

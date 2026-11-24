@@ -21,7 +21,7 @@ use crate::gkr::segment::{
     claim_value_at_id, linear_finish, linear_verify, CellClaim, CellSegment, CellSegmentCommitment,
     View,
 };
-use crate::pcs::fri::Transcript;
+use crate::pcs::transcript::Transcript;
 use crate::pcs::linear_claim::{LinearClaimProof, LinearH};
 use p3_field::PrimeCharacteristicRing;
 
@@ -222,7 +222,7 @@ pub fn verify_head(
 mod tests {
     use super::*;
     use crate::gkr::segment::{verify, SegmentCells};
-    use crate::pcs::fri::new_challenger;
+    use crate::pcs::transcript::new_challenger;
     use crate::pcs::whir_stacked::Params;
     use p3_field::Field;
 

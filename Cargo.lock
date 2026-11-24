@@ -215,16 +215,10 @@ dependencies = [
  "p3-commit",
  "p3-dft",
  "p3-field",
- "p3-fri",
- "p3-gkr",
  "p3-goldilocks",
- "p3-keccak",
  "p3-matrix",
- "p3-maybe-rayon",
- "p3-mds",
  "p3-merkle-tree",
  "p3-multilinear-util",
- "p3-poseidon2",
  "p3-sumcheck",
  "p3-symmetric",
  "p3-whir",
@@ -446,42 +440,6 @@ dependencies = [
  "rand",
  "serde",
  "tracing",
-]
-
-[[package]]
-name = "p3-fri"
-version = "0.8.0"
-source = "git+https://github.com/Plonky3/Plonky3?rev=0d80373#0d803737b681774186cd283b1fd2d8e493655c82"
-dependencies = [
- "itertools",
- "p3-challenger",
- "p3-commit",
- "p3-dft",
- "p3-field",
- "p3-matrix",
- "p3-maybe-rayon",
- "p3-security",
- "p3-util",
- "rand",
- "serde",
- "spin",
- "thiserror",
- "tracing",
-]
-
-[[package]]
-name = "p3-gkr"
-version = "0.8.0"
-source = "git+https://github.com/Plonky3/Plonky3?rev=0d80373#0d803737b681774186cd283b1fd2d8e493655c82"
-dependencies = [
- "p3-challenger",
- "p3-field",
- "p3-maybe-rayon",
- "p3-multilinear-util",
- "p3-security",
- "p3-sumcheck",
- "serde",
- "thiserror",
 ]
 
 [[package]]

@@ -1,10 +1,10 @@
 //! BLAKE3 Merkle hasher and compressor over Goldilocks, using the SIMD batch path.
 //!
-//! `p3-blake3` hashes bytes; the FRI MMCS commits field elements. This bridges the
-//! two: serialise Goldilocks elements to little-endian bytes, hash with BLAKE3
+//! `p3-blake3` hashes bytes; the WHIR MMCS hashes field elements. This bridges
+//! the two: serialise Goldilocks elements to little-endian bytes, hash with BLAKE3
 //! (using its batched SIMD `hash_many` for many leaves), and pack the 128-bit
-//! digest back into two Goldilocks. The digest stays field-typed, so the FRI
-//! challenger is unchanged.
+//! digest back into two Goldilocks. The digest stays field-typed, so the stacked
+//! WHIR challenger is unchanged.
 
 use crate::field::Fp;
 use p3_blake3::Blake3;

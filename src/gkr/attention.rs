@@ -25,7 +25,7 @@ use crate::gkr::segment::{
     claim_matmul, claim_value_at_id, linear_finish, linear_verify, verify_matmul, CellClaim,
     CellSegment, CellSegmentCommitment, MatmulSegmentProof, View,
 };
-use crate::pcs::fri::Transcript;
+use crate::pcs::transcript::Transcript;
 use crate::pcs::linear_claim::{LinearClaimProof, LinearH};
 
 /// The cells one attention head touches.
@@ -403,7 +403,7 @@ mod tests {
     use crate::gkr::range::Decomp;
     use crate::gkr::segment::{verify, SegmentCells};
     use crate::model::spec::requant as requant_i64;
-    use crate::pcs::fri::new_challenger;
+    use crate::pcs::transcript::new_challenger;
     use crate::pcs::whir_stacked::Params;
     use p3_field::{Field, PrimeCharacteristicRing, PrimeField64};
 

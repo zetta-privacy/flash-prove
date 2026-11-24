@@ -28,7 +28,7 @@ use crate::gkr::segment::{
 use crate::field::Fp;
 use crate::model::spec::Op;
 use crate::model::Cell;
-use crate::pcs::fri::{new_challenger, Transcript};
+use crate::pcs::transcript::{new_challenger, Transcript};
 use crate::model::WeightMatrix;
 use crate::pcs::whir_stacked::{self, Params, SegmentProver};
 use p3_field::PrimeCharacteristicRing;
@@ -563,9 +563,9 @@ impl LookupBounds {
         (self.score_hi - self.score_lo + 1) as usize
     }
 
-    /// Derive the bounds from a trace, exactly as the FRI config does.
+    /// Derive the bounds from a trace, exactly as [`crate::gkr::bounds::CommittedConfig`] does.
     pub fn derive(spec: &crate::model::spec::ModelSpec, trace: &crate::model::Trace) -> Self {
-        let c = crate::gkr::commit::CommittedConfig::derive(spec, trace);
+        let c = crate::gkr::bounds::CommittedConfig::derive(spec, trace);
         Self {
             silu_lo: c.silu_lo,
             silu_hi: c.silu_hi,
@@ -2295,7 +2295,7 @@ mod tests {
         assert_eq!(head.len(), b.score_big_n().next_power_of_two());
         assert_ne!(head, b.head_table(4, alpha, beta));
 
-        // Bound derivation agrees with the FRI config it wraps.
+        // Bound derivation agrees with the bounds struct it wraps.
         let spec = crate::model::spec::ModelSpec {
             dims: crate::model::spec::Dims {
                 hidden: 4,

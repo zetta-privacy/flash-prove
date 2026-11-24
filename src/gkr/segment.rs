@@ -29,8 +29,8 @@ use crate::field::sumcheck::{mle_eval, RoundPoly, RoundPoly3};
 use crate::field::{Ext, Fp};
 use crate::gkr::protocol::{concat, eq_partial, matrix_mle, round_poly3_mul, round_poly_product};
 use crate::model::{Cell, WeightMatrix};
-use crate::pcs::fri::{Challenger, Transcript};
 use crate::pcs::linear_claim::{self, LinearClaimProof, LinearH};
+use crate::pcs::transcript::{Challenger, Transcript};
 use crate::pcs::whir_stacked::{self, Committer, Params, SegmentProver};
 use p3_field::PrimeCharacteristicRing;
 use serde::{Deserialize, Serialize};
@@ -47,6 +47,29 @@ pub(crate) fn signed(x: i64) -> Fp {
 /// Variables of the padded row count: `ceil(log2 rows)`.
 fn padded_m(rows: usize) -> usize {
     rows.next_power_of_two().trailing_zeros() as usize
+}
+
+/// Commit every weight tensor to its own WHIR root (the **pre-shared map**).
+///
+/// This is the commit phase's output, and it is what the verifier passes as
+/// `published` to [`crate::gkr::driver::verify_segment_with_weights`]. The roots are
+/// computed with the one-flat-column convention of
+/// [`CellSegment::weight_segment`], so the prover's lazily committed tensors
+/// reproduce them exactly.
+///
+/// Each tensor's witness is dropped as soon as its root is computed, so the commit
+/// phase's peak memory is one tensor.
+pub fn commit_weights_whir(
+    weights: &[WeightMatrix],
+    params: Params,
+) -> Vec<(String, whir_stacked::SegmentCommitment)> {
+    weights
+        .iter()
+        .map(|w| {
+            let seg = CellSegment::weight_segment(w, params);
+            (w.name.clone(), seg.commitment().clone())
+        })
+        .collect()
 }
 
 /// Public description of one committed cell.
@@ -460,7 +483,13 @@ impl SegmentCells {
 
     /// Reserve a cell **flattened to one column** of `rows·cols` entries, keeping the
     /// logical extents in the metadata.
-    pub fn cell_logical(&mut self, name: &str, rows: usize, cols: usize, values: Vec<i64>) -> usize {
+    pub fn cell_logical(
+        &mut self,
+        name: &str,
+        rows: usize,
+        cols: usize,
+        values: Vec<i64>,
+    ) -> usize {
         assert_eq!(values.len(), rows * cols, "cell length");
         let n = rows * cols;
         let d = n.next_power_of_two();
@@ -694,8 +723,6 @@ pub fn verify_sum_squares(
     v * v == claim
 }
 
-
-
 /// An opening of a **pre-shared weight tensor** at a point.
 ///
 /// This is the (c) mechanism: a weight operand is opened against its own root, so
@@ -862,9 +889,13 @@ pub fn verify_mul_weight(
         point: proof.w.point.clone(),
         values: vec![proof.w.value],
     };
-    whir_stacked::verify(w_com, &[w_claim], w_proof, &mut crate::pcs::fri::new_challenger())
+    whir_stacked::verify(
+        w_com,
+        &[w_claim],
+        w_proof,
+        &mut crate::pcs::transcript::new_challenger(),
+    )
 }
-
 
 /// `C = W·B` with `W` a pre-shared weight tensor (step 5 of the port).
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -1034,11 +1065,9 @@ pub fn verify_matmul_weight(
         w_com,
         &[w_claim],
         w_proof,
-        &mut crate::pcs::fri::new_challenger(),
+        &mut crate::pcs::transcript::new_challenger(),
     )
 }
-
-
 
 /// One chunk of a row-chunked weight, with the chunk index that fixes its `eq`
 /// weight in the composition.
@@ -1257,7 +1286,7 @@ pub fn verify_matmul_weight_chunked(
             com,
             &[w_claim],
             proof_c,
-            &mut crate::pcs::fri::new_challenger(),
+            &mut crate::pcs::transcript::new_challenger(),
         ) {
             return false;
         }
@@ -2028,7 +2057,7 @@ pub fn values_by_name<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pcs::fri::new_challenger;
+    use crate::pcs::transcript::new_challenger;
     use rand::rngs::StdRng;
     use rand::{RngExt, SeedableRng};
 
@@ -2074,7 +2103,7 @@ mod tests {
                     }
                 })
                 .collect();
-            let expect = crate::pcs::zk::mle_value(&col, &z);
+            let expect = crate::field::sumcheck::mle_value(&col, &z);
             assert_eq!(va[j], expect);
         }
 
@@ -2145,7 +2174,7 @@ mod tests {
                     }
                 })
                 .collect();
-            assert_eq!(v[j], crate::pcs::zk::mle_value(&col, &z));
+            assert_eq!(v[j], crate::field::sumcheck::mle_value(&col, &z));
         }
 
         let claims = seg.claims().to_vec();
@@ -2157,8 +2186,8 @@ mod tests {
     #[test]
     fn linear_claim_tie_row_to_full_cell() {
         // The `tie_row` shape: `row` is `full[start..start + d]`.
-        use crate::pcs::fri::Transcript;
         use crate::pcs::linear_claim::LinearH;
+        use crate::pcs::transcript::Transcript;
 
         let mut rng = StdRng::seed_from_u64(5);
         let full_vals: Vec<i64> = (0..8).map(|_| rng.random::<i64>() % 50).collect();
@@ -2849,7 +2878,12 @@ mod tests {
 
         // The weight lives in its own segment (the cp_commit output).
         let mut wc = Committer::new();
-        wc.add_vec(&w_vals.iter().map(|&x| Fp::new(x as u64)).collect::<Vec<_>>());
+        wc.add_vec(
+            &w_vals
+                .iter()
+                .map(|&x| Fp::new(x as u64))
+                .collect::<Vec<_>>(),
+        );
         let mut w_prov = wc.seal(Params::default());
         let w_com = w_prov.commitment().clone();
 
@@ -2880,15 +2914,17 @@ mod tests {
         let mut bad_c = c_vals.clone();
         bad_c[1] += 1;
         let mut bad = CellSegment::seal(
-            &[
-                Cell::new("a", 4, 1, a_vals),
-                Cell::new("c", 4, 1, bad_c),
-            ],
+            &[Cell::new("a", 4, 1, a_vals), Cell::new("c", 4, 1, bad_c)],
             Params::default(),
         );
         let bad_com = bad.commitment();
         let mut wc2 = Committer::new();
-        wc2.add_vec(&w_vals.iter().map(|&x| Fp::new(x as u64)).collect::<Vec<_>>());
+        wc2.add_vec(
+            &w_vals
+                .iter()
+                .map(|&x| Fp::new(x as u64))
+                .collect::<Vec<_>>(),
+        );
         let mut w_prov2 = wc2.seal(Params::default());
         let bad_proof = claim_mul_weight(
             &mut bad,
@@ -2902,7 +2938,12 @@ mod tests {
         let bad_claims = bad.claims().to_vec();
         let mut vtr = Transcript::new(&new_challenger());
         assert!(!verify_mul_weight(
-            &bad_com, &bad_claims, &w_com, &wt_proof, &bad_proof, &mut vtr
+            &bad_com,
+            &bad_claims,
+            &w_com,
+            &wt_proof,
+            &bad_proof,
+            &mut vtr
         ));
     }
 
@@ -2913,10 +2954,18 @@ mod tests {
         // W: 2x2, B: 2x1, C = W·B.
         let w_vals = vec![1i64, 2, 3, 4];
         let b_vals = vec![2i64, 3];
-        let c_vals = vec![w_vals[0] * b_vals[0] + w_vals[1] * b_vals[1], w_vals[2] * b_vals[0] + w_vals[3] * b_vals[1]];
+        let c_vals = vec![
+            w_vals[0] * b_vals[0] + w_vals[1] * b_vals[1],
+            w_vals[2] * b_vals[0] + w_vals[3] * b_vals[1],
+        ];
 
         let mut wc = Committer::new();
-        wc.add_vec(&w_vals.iter().map(|&x| Fp::new(x as u64)).collect::<Vec<_>>());
+        wc.add_vec(
+            &w_vals
+                .iter()
+                .map(|&x| Fp::new(x as u64))
+                .collect::<Vec<_>>(),
+        );
         let mut w_prov = wc.seal(Params::default());
         let w_com = w_prov.commitment().clone();
 
@@ -2931,7 +2980,16 @@ mod tests {
         let (cb, cc) = (seg.id("b"), seg.id("c"));
 
         let mut tr = Transcript::new(&new_challenger());
-        let proof = claim_matmul_weight(&mut seg, &mut w_prov, 0, &View::Whole, (cb, cc), "W", &mut tr, (1, 1, 0));
+        let proof = claim_matmul_weight(
+            &mut seg,
+            &mut w_prov,
+            0,
+            &View::Whole,
+            (cb, cc),
+            "W",
+            &mut tr,
+            (1, 1, 0),
+        );
 
         let claims = seg.claims().to_vec();
         let wproof = seg.prove(&mut new_challenger());
@@ -2940,7 +2998,13 @@ mod tests {
         assert!(verify(&com, &claims, &wproof, &mut new_challenger()));
         let mut vtr = Transcript::new(&new_challenger());
         assert!(verify_matmul_weight(
-            &com, &claims, &w_com, &wt_proof, &View::Whole, &proof, &mut vtr
+            &com,
+            &claims,
+            &w_com,
+            &wt_proof,
+            &View::Whole,
+            &proof,
+            &mut vtr
         ));
 
         // A wrong product is rejected.
@@ -2952,16 +3016,33 @@ mod tests {
         );
         let bad_com = bad.commitment();
         let mut wc2 = Committer::new();
-        wc2.add_vec(&w_vals.iter().map(|&x| Fp::new(x as u64)).collect::<Vec<_>>());
+        wc2.add_vec(
+            &w_vals
+                .iter()
+                .map(|&x| Fp::new(x as u64))
+                .collect::<Vec<_>>(),
+        );
         let mut w_prov2 = wc2.seal(Params::default());
         let bad_proof = claim_matmul_weight(
-            &mut bad, &mut w_prov2, 0, &View::Whole, (cb, cc), "W",
-            &mut Transcript::new(&new_challenger()), (1, 1, 0),
+            &mut bad,
+            &mut w_prov2,
+            0,
+            &View::Whole,
+            (cb, cc),
+            "W",
+            &mut Transcript::new(&new_challenger()),
+            (1, 1, 0),
         );
         let bad_claims = bad.claims().to_vec();
         let mut vtr = Transcript::new(&new_challenger());
         assert!(!verify_matmul_weight(
-            &bad_com, &bad_claims, &w_com, &wt_proof, &View::Whole, &bad_proof, &mut vtr
+            &bad_com,
+            &bad_claims,
+            &w_com,
+            &wt_proof,
+            &View::Whole,
+            &bad_proof,
+            &mut vtr
         ));
     }
 
@@ -2976,7 +3057,12 @@ mod tests {
         let c_vals = vec![1 * 2 + 2 * 3, 3 * 2 + 4 * 3];
 
         let mut wc = Committer::new();
-        wc.add_vec(&w_vals.iter().map(|&x| Fp::new(x as u64)).collect::<Vec<_>>());
+        wc.add_vec(
+            &w_vals
+                .iter()
+                .map(|&x| Fp::new(x as u64))
+                .collect::<Vec<_>>(),
+        );
         let mut w_prov = wc.seal(Params::default());
         let w_com = w_prov.commitment().clone();
         let m_w = w_prov.table_m(0);
@@ -2996,7 +3082,14 @@ mod tests {
 
         let mut tr = Transcript::new(&new_challenger());
         let proof = claim_matmul_weight(
-            &mut seg, &mut w_prov, 0, &view, (cb, cc), "W", &mut tr, (1, 1, 0),
+            &mut seg,
+            &mut w_prov,
+            0,
+            &view,
+            (cb, cc),
+            "W",
+            &mut tr,
+            (1, 1, 0),
         );
         let claims = seg.claims().to_vec();
         let wproof = seg.prove(&mut new_challenger());
@@ -3011,22 +3104,22 @@ mod tests {
         // The whole-matrix view is not what the proof used, so it is rejected.
         let mut vtr = Transcript::new(&new_challenger());
         assert!(!verify_matmul_weight(
-            &com, &claims, &w_com, &wt_proof, &View::Whole, &proof, &mut vtr
+            &com,
+            &claims,
+            &w_com,
+            &wt_proof,
+            &View::Whole,
+            &proof,
+            &mut vtr
         ));
     }
-
 
     #[test]
     fn chunked_weight_uses_eq_weights() {
         use crate::pcs::whir_stacked::Committer;
 
         // W is 4x2, split into two 2x2 chunk roots (embed/lm_head shape).
-        let w_rows = [
-            [1i64, 2],
-            [3, 4],
-            [5, 6],
-            [7, 8],
-        ];
+        let w_rows = [[1i64, 2], [3, 4], [5, 6], [7, 8]];
         let b_vals = vec![2i64, 3];
         let c_vals: Vec<i64> = (0..4)
             .map(|i| w_rows[i][0] * b_vals[0] + w_rows[i][1] * b_vals[1])
@@ -3071,19 +3164,26 @@ mod tests {
             .into_iter()
             .map(|p| p.prove(&mut new_challenger()))
             .collect();
-        let parts: Vec<(&whir_stacked::SegmentCommitment, &whir_stacked::Proof)> =
-            coms.iter().zip(proofs.iter()).map(|(c, p)| (c, p)).collect();
+        let parts: Vec<(&whir_stacked::SegmentCommitment, &whir_stacked::Proof)> = coms
+            .iter()
+            .zip(proofs.iter())
+            .map(|(c, p)| (c, p))
+            .collect();
 
         assert!(verify(&com, &claims, &wproof, &mut new_challenger()));
         let mut vtr = Transcript::new(&new_challenger());
-        assert!(verify_matmul_weight_chunked(&com, &claims, &parts, &proof, &mut vtr));
+        assert!(verify_matmul_weight_chunked(
+            &com, &claims, &parts, &proof, &mut vtr
+        ));
 
         // A proof that composed the chunks with a plain sum instead of eq weights
         // would fail here: the verifier recomputes eq from `r`.
         let mut bad = proof.clone();
         bad.a_val += Ext::ONE;
         let mut vtr = Transcript::new(&new_challenger());
-        assert!(!verify_matmul_weight_chunked(&com, &claims, &parts, &bad, &mut vtr));
+        assert!(!verify_matmul_weight_chunked(
+            &com, &claims, &parts, &bad, &mut vtr
+        ));
 
         // Dropping a chunk root is rejected.
         let mut vtr = Transcript::new(&new_challenger());

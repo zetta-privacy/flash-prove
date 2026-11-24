@@ -19,7 +19,7 @@ pub fn from_u64(v: u64) -> Fp {
 ///
 /// NOTE: the paper's E is F[ϑ]/(ϑ³ − 2), an isomorphic-but-different degree-3
 /// extension. This uses Plonky3's native cubic extension so the OOD samples and
-/// the FRI challenge field are the *same* field.
+/// the WHIR challenge field are the *same* field.
 pub type Ext = CubicTrinomialExtensionField<Fp>;
 
 /// The multilinear equality polynomial `eq(z, j) = ∏_k (z_k·j_k + (1−z_k)(1−j_k))`
