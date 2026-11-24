@@ -258,6 +258,29 @@ impl SegmentProver {
         self.pd.table(table).column(col).values().collect()
     }
 
+    /// Record the linear claim `⟨h, col⟩` on this segment's table `id`.
+    ///
+    /// This is the weight-side counterpart of a cell segment's `claim_linear`: the
+    /// quadratic sumcheck reduces the claim to one point evaluation, which is
+    /// recorded here and paid for by this tensor's proof. Used by `embed`, whose
+    /// operand is a sparse gather of the embedding rows.
+    pub fn claim_linear(
+        &mut self,
+        table: usize,
+        col: usize,
+        h: &crate::pcs::linear_claim::LinearH,
+        tr: &mut crate::pcs::fri::Transcript,
+    ) -> (Ext, crate::pcs::linear_claim::LinearClaimProof, Vec<Ext>, Ext) {
+        let n = 1usize << self.table_m(table);
+        assert_eq!(h.len(), n, "`h` must be padded to the column length");
+        let v = self.column_logical(table, col);
+        assert_eq!(v.len(), n);
+        let (proof, z, b) = crate::pcs::linear_claim::prove(&v, h, tr);
+        let opened = self.claim(table, &[col], &z);
+        assert_eq!(opened.len(), 1);
+        (b, proof, z, opened[0])
+    }
+
     /// The arity `m` of table `id` (log `2` of its logical length).
     pub fn table_m(&self, table: usize) -> usize {
         self.commitment.tables[table].m

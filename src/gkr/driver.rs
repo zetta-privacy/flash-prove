@@ -54,6 +54,10 @@ pub enum SegmentOpProof {
     Norm(Vec<crate::gkr::nonlinear::NormRowProof>),
     /// One proof per row of the attention scores.
     Softmax(Vec<crate::gkr::nonlinear::SoftmaxRowProof>),
+    /// `rot = R·inp` plus the requant lookup.
+    Rope(crate::gkr::nonlinear::RopeSegmentProof),
+    /// `out = emb[window]`, read from the embedding's own root.
+    Embed(crate::gkr::nonlinear::EmbedSegmentProof),
     /// Per-row selection plus the global sign lookup.
     TopK {
         /// Resolved ids, carried in the proof so the verifier never rebuilds names.
@@ -74,6 +78,8 @@ pub struct SegmentOutput {
     pub claims: Vec<CellClaim>,
     pub proof: whir_stacked::Proof,
     pub ops: Vec<SegmentOpProof>,
+    /// The head argmax, when this segment carries it.
+    pub head: Option<crate::gkr::head::HeadSegmentProof>,
 }
 
 /// Why a segment could not be driven.
@@ -177,7 +183,44 @@ pub fn prove_segment(
         claims,
         proof,
         ops: proofs,
+        head: None,
     })
+}
+
+/// [`prove_segment_with_head`] without a head tail.
+#[allow(clippy::too_many_arguments)]
+pub fn prove_segment_with_weights(
+    ops: &[Op],
+    cells: &[Cell],
+    weights: &[WeightMatrix],
+    dims: &crate::model::spec::Dims,
+    (k, digits, alpha, beta, rec_q, eps): (usize, usize, Fp, Fp, u32, f64),
+    bounds: &LookupBounds,
+    params: Params,
+    window: &[usize],
+) -> Result<SegmentBundle, DriverError> {
+    prove_segment_with_head(
+        ops, cells, weights, dims, (k, digits, alpha, beta, rec_q, eps), bounds, params, window,
+        None,
+    )
+}
+
+/// [`verify_segment_with_head`] without a head tail.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_segment_with_weights(
+    ops: &[Op],
+    bundle: &SegmentBundle,
+    published: &std::collections::HashMap<String, whir_stacked::SegmentCommitment>,
+    weights: &[WeightMatrix],
+    dims: &crate::model::spec::Dims,
+    (k, digits, alpha, beta, rec_q, eps): (usize, usize, Fp, Fp, u32, f64),
+    bounds: &LookupBounds,
+    window: &[usize],
+) -> bool {
+    verify_segment_with_head(
+        ops, bundle, published, weights, dims, (k, digits, alpha, beta, rec_q, eps), bounds, window,
+        None,
+    )
 }
 
 /// Verify a segment against the op list it was proved for.
@@ -446,6 +489,10 @@ pub struct LookupBounds {
     /// The head logits' range (the argmax sign table).
     pub score_lo: i64,
     pub score_hi: i64,
+    /// The rotated-value domain `[rope_lo, rope_hi]` (public; the caller must widen
+    /// it to cover the rotation it intends to prove).
+    pub rope_lo: i64,
+    pub rope_hi: i64,
 }
 
 impl LookupBounds {
@@ -485,6 +532,23 @@ impl LookupBounds {
         v
     }
 
+    /// The rotated-value table `α + β·x + β²·requant(x, k)` over `[rope_lo, rope_hi]`.
+    pub fn rope_table(&self, k: u32, alpha: Fp, beta: Fp) -> Vec<Fp> {
+        let n = self.rope_big_n();
+        let mut v: Vec<Fp> = (self.rope_lo..=self.rope_hi)
+            .map(|x| {
+                let out = crate::model::spec::requant(x, k);
+                alpha + beta * signed(x) + beta * beta * signed(out)
+            })
+            .collect();
+        v.resize(n.next_power_of_two(), Fp::ONE);
+        v
+    }
+
+    pub fn rope_big_n(&self) -> usize {
+        (self.rope_hi - self.rope_lo + 1).max(1) as usize
+    }
+
     /// The true (unpadded) size of a table, which the LogUp multiplicity offset needs.
     pub fn silu_big_n(&self) -> usize {
         (self.silu_hi - self.silu_lo + 1) as usize
@@ -510,6 +574,8 @@ impl LookupBounds {
             exp_lo: c.exp_lo,
             score_lo: c.score_lo,
             score_hi: c.score_hi,
+            rope_lo: 0,
+            rope_hi: 0,
         }
     }
 }
@@ -532,6 +598,15 @@ pub fn check_preshared(
 
 
 
+/// The head argmax, which is a segment *tail* rather than an `Op`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HeadSpec {
+    /// The logits cell; its last row is the one being checked.
+    pub logits: String,
+    pub token: usize,
+    pub max: i64,
+}
+
 /// A segment proved together with the weight roots it opened against.
 pub struct SegmentBundle {
     pub segment: SegmentOutput,
@@ -553,7 +628,7 @@ fn matvec(w: &WeightMatrix, x: &[i64]) -> Vec<i64> {
 /// `y = W·x` is a planned cell (its integer values are computed here, since the
 /// trace only carries the requantised output), so `claim_matmul_weight` binds `y` to
 /// the weight's own root and `claim_requant` binds the trace output to `y`.
-pub fn prove_segment_with_weights(
+pub fn prove_segment_with_head(
     ops: &[Op],
     cells: &[Cell],
     weights: &[WeightMatrix],
@@ -561,8 +636,10 @@ pub fn prove_segment_with_weights(
     (k, digits, alpha, beta, rec_q, eps): (usize, usize, Fp, Fp, u32, f64),
     bounds: &LookupBounds,
     params: Params,
+    window: &[usize],
+    head: Option<&HeadSpec>,
 ) -> Result<SegmentBundle, DriverError> {
-    let _ = dims;
+    let _ = (dims, window, head);
     let by_name: std::collections::HashMap<&str, &WeightMatrix> =
         weights.iter().map(|w| (w.name.as_str(), w)).collect();
 
@@ -867,8 +944,68 @@ pub fn prove_segment_with_weights(
                     tstar,
                 })));
             }
+            Op::Rope { input, output, theta } => {
+                let Some((rows, d)) = plan.logical(input) else {
+                    return Err(DriverError::UnknownCell(input.clone()));
+                };
+                if d != dims.head_dim || dims.heads == 0 || rows % dims.heads != 0 {
+                    return Err(DriverError::UnknownCell(input.clone()));
+                }
+                let xs = plan.values(input).to_vec();
+                let rot = crate::gkr::nonlinear::rotate(&xs, rows, dims.heads, d, *theta);
+                let pre = format!("__rope.{i}");
+                let rot_name = format!("{pre}.rot");
+                plan.add(&rot_name, rows * d, 1, rot);
+                let requant = plan.requant(
+                    &format!("{pre}.rq"),
+                    &rot_name,
+                    output,
+                    crate::model::spec::RECIP_Q as usize,
+                    digits,
+                );
+                planned.push(Some(PlannedOp::Rope(RopePlan { rot: rot_name, requant })));
+            }
+            Op::Embed { weight, output } => {
+                let Some((l, hidden)) = plan.logical(output) else {
+                    return Err(DriverError::UnknownCell(output.clone()));
+                };
+                let w = by_name
+                    .get(weight.as_str())
+                    .ok_or_else(|| DriverError::UnknownCell(weight.clone()))?;
+                if w.cols != hidden {
+                    return Err(DriverError::UnknownCell(weight.clone()));
+                }
+                if window.len() != l || window.iter().any(|&t| t >= w.rows) {
+                    return Err(DriverError::Unsupported("embed: window outside the vocabulary"));
+                }
+                planned.push(Some(PlannedOp::Embed));
+            }
             other => return Err(DriverError::Unsupported(op_name(other))),
         }
+    }
+
+    // The head is a segment tail: its cells must be planned before the seal too.
+    let mut head_plan = None;
+    if let Some(h) = head {
+        let Some((rows, n)) = plan.logical(&h.logits) else {
+            return Err(DriverError::UnknownCell(h.logits.clone()));
+        };
+        let row = rows - 1;
+        let xs = plan.values(&h.logits).to_vec();
+        let scores: Vec<i64> = xs[row * n..(row + 1) * n].to_vec();
+        let prefix = "__head";
+        plan.add(&format!("{prefix}.scores"), n, 1, scores);
+        plan.add(&format!("{prefix}.ones"), n, 1, vec![1i64; n]);
+        let table = bounds.head_table(h.max, alpha, beta);
+        let lookup = plan.lookup2(
+            &format!("{prefix}.lk"),
+            &format!("{prefix}.scores"),
+            &format!("{prefix}.ones"),
+            (alpha, beta),
+            &table,
+            bounds.score_big_n(),
+        );
+        head_plan = Some((row, n, lookup));
     }
 
     let mut seg = plan.seal(params);
@@ -1140,9 +1277,63 @@ pub fn prove_segment_with_weights(
                 );
                 proofs.push(SegmentOpProof::TopK { cells, rows: row_proofs, lookup });
             }
+            (Op::Rope { input, output, theta }, PlannedOp::Rope(rp)) => {
+                let ci = seg.id(input);
+                let (rows, d) = {
+                    let m = seg.cells_meta(ci);
+                    (m.logical_rows, m.logical_cols)
+                };
+                let _ = output;
+                let rot = seg.id(&rp.rot);
+                let rq = rp.requant.cells(&seg);
+                proofs.push(SegmentOpProof::Rope(crate::gkr::nonlinear::claim_rope(
+                    &mut seg,
+                    rot,
+                    rq,
+                    ci,
+                    (rows, dims.heads, d),
+                    *theta,
+                    (crate::model::spec::RECIP_Q as usize, digits),
+                    &mut tr,
+                )));
+            }
+            (Op::Embed { weight, output }, PlannedOp::Embed) => {
+                let co = seg.id(output);
+                let (l, hidden) = {
+                    let m = seg.cells_meta(co);
+                    (m.logical_rows, m.logical_cols)
+                };
+                let w = by_name[weight.as_str()];
+                let wp = set.get_or_commit(weight)?;
+                let p = crate::gkr::nonlinear::claim_embed(
+                    &mut seg, co, window, (l, hidden, w.rows), wp, 0, weight, &mut tr,
+                );
+                proofs.push(SegmentOpProof::Embed(p));
+            }
             _ => return Err(DriverError::Unsupported(op_name(op))),
         }
     }
+
+    let head_proof = match (head, head_plan) {
+        (Some(h), Some((row, n, lookup))) => {
+            let logits = seg.id(&h.logits);
+            let lc = lookup.cells(&seg);
+            let ones = lc.output;
+            Some(crate::gkr::head::claim_head(
+                &mut seg,
+                lc,
+                ones,
+                (logits, row, n, h.token, h.max),
+                (alpha, beta),
+                (
+                    &bounds.head_table(h.max, alpha, beta),
+                    bounds.score_big_n(),
+                ),
+                &mut tr,
+            ))
+        }
+        _ => None,
+    };
 
     let commitment = seg.commitment();
     let claims = seg.claims().to_vec();
@@ -1153,6 +1344,7 @@ pub fn prove_segment_with_weights(
             claims,
             proof,
             ops: proofs,
+            head: head_proof,
         },
         weights: set.prove_all(),
     })
@@ -1197,6 +1389,14 @@ enum PlannedOp {
     /// Per-head names.
     Scores(Vec<ScoresPlan>),
     TopK(TopKPlan),
+    Rope(RopePlan),
+    Embed,
+}
+
+/// What a `rope` needed at plan time.
+struct RopePlan {
+    rot: String,
+    requant: crate::gkr::plan::RequantNames,
 }
 
 /// What a `scores` head needed at plan time.
@@ -1222,7 +1422,7 @@ struct WeightedVPlan {
 }
 
 /// Verify a [`SegmentBundle`] against the published weight roots.
-pub fn verify_segment_with_weights(
+pub fn verify_segment_with_head(
     ops: &[Op],
     bundle: &SegmentBundle,
     published: &std::collections::HashMap<String, whir_stacked::SegmentCommitment>,
@@ -1230,8 +1430,10 @@ pub fn verify_segment_with_weights(
     dims: &crate::model::spec::Dims,
     (k, digits, alpha, beta, rec_q, eps): (usize, usize, Fp, Fp, u32, f64),
     bounds: &LookupBounds,
+    window: &[usize],
+    head: Option<&HeadSpec>,
 ) -> bool {
-    let _ = dims;
+    let _ = (dims, window, head);
     if bundle.segment.ops.len() != ops.len() {
         return false;
     }
@@ -1525,7 +1727,7 @@ pub fn verify_segment_with_weights(
                         &bundle.segment.claims,
                         rp,
                         (row, n, l),
-                        (rp.row_max.m, bounds.exp_lo, rp.row_max.tstar),
+                        (bounds.exp_lo, rp.row_max.tstar),
                         (rec_q, k, digits),
                         (&table, big_n),
                         (
@@ -1612,7 +1814,88 @@ pub fn verify_segment_with_weights(
                     return false;
                 }
             }
+            (Op::Rope { input, theta, .. }, SegmentOpProof::Rope(rp)) => {
+                let Some(ci) = bundle.segment.commitment.cell(input) else {
+                    return false;
+                };
+                let (rows, d) = {
+                    let m = &bundle.segment.commitment.cells[ci];
+                    (m.logical_rows, m.logical_cols)
+                };
+                if rp.inp != ci {
+                    return false;
+                }
+                if !crate::gkr::nonlinear::verify_rope(
+                    &bundle.segment.commitment,
+                    &bundle.segment.claims,
+                    rp,
+                    (rows, dims.heads, d),
+                    *theta,
+                    (crate::model::spec::RECIP_Q as usize, digits),
+                    &mut tr,
+                ) {
+                    return false;
+                }
+            }
+            (Op::Embed { weight, output }, SegmentOpProof::Embed(p)) => {
+                let Some(co) = bundle.segment.commitment.cell(output) else {
+                    return false;
+                };
+                if p.out != co {
+                    return false;
+                }
+                let Some((w_com, w_proof)) = wmap.get(weight.as_str()) else {
+                    return false;
+                };
+                if !check_preshared(weight, w_com, published) {
+                    return false;
+                }
+                let (l, hidden) = {
+                    let m = &bundle.segment.commitment.cells[co];
+                    (m.logical_rows, m.logical_cols)
+                };
+                let Some(w) = weights.iter().find(|w| w.name == *weight) else {
+                    return false;
+                };
+                if !crate::gkr::nonlinear::verify_embed(
+                    &bundle.segment.commitment,
+                    &bundle.segment.claims,
+                    w_com,
+                    w_proof,
+                    p,
+                    window,
+                    (l, hidden, w.rows),
+                    &mut tr,
+                ) {
+                    return false;
+                }
+            }
             _ => return false,
+        }
+    }
+
+    // The head tail.
+    if let Some(h) = head {
+        let Some(hp) = bundle.segment.head.as_ref() else {
+            return false;
+        };
+        let Some(logits) = bundle.segment.commitment.cell(&h.logits) else {
+            return false;
+        };
+        let (rows, n) = {
+            let m = &bundle.segment.commitment.cells[logits];
+            (m.logical_rows, m.logical_cols)
+        };
+        let table = bounds.head_table(h.max, alpha, beta);
+        if !crate::gkr::head::verify_head(
+            &bundle.segment.commitment,
+            &bundle.segment.claims,
+            hp,
+            (logits, rows - 1, n, h.token),
+            (&table, bounds.score_big_n()),
+            &mut tr,
+        ) {
+            return false;
         }
     }
 
@@ -1863,6 +2146,8 @@ mod tests {
             exp_lo: -1,
             score_lo: 0,
             score_hi: 1,
+            rope_lo: -1,
+            rope_hi: 1,
         };
 
         let k = 1usize;
@@ -1882,7 +2167,7 @@ mod tests {
             shift: k as u32,
         }];
 
-        let bundle = prove_segment_with_weights(&ops, &cells, &[w.clone()], &dims, (k, 1, alpha, beta, 8, 0.0), &bounds, Params::default())
+        let bundle = prove_segment_with_weights(&ops, &cells, &[w.clone()], &dims, (k, 1, alpha, beta, 8, 0.0), &bounds, Params::default(), &[])
             .expect("drivable");
 
         // The published map is what `cp_commit` would hand over.
@@ -1894,7 +2179,7 @@ mod tests {
                 .into_iter()
                 .collect();
 
-        assert!(verify_segment_with_weights(&ops, &bundle, &published, &[], &dims, (k, 1, alpha, beta, 8, 0.0), &bounds));
+        assert!(verify_segment_with_weights(&ops, &bundle, &published, &[], &dims, (k, 1, alpha, beta, 8, 0.0), &bounds, &[]));
 
         // A published root that is not the tensor's is rejected.
         let wrong: std::collections::HashMap<String, whir_stacked::SegmentCommitment> =
@@ -1906,16 +2191,16 @@ mod tests {
         let other_seg = other.seal(Params::default());
         let mut wrong2 = wrong.clone();
         wrong2.insert("W".to_string(), other_seg.commitment().clone());
-        assert!(!verify_segment_with_weights(&ops, &bundle, &wrong2, &[], &dims, (k, 1, alpha, beta, 8, 0.0), &bounds));
+        assert!(!verify_segment_with_weights(&ops, &bundle, &wrong2, &[], &dims, (k, 1, alpha, beta, 8, 0.0), &bounds, &[]));
 
         // A wrong output breaks the requant link to `y`.
         let bad_cells = vec![
             Cell::new("x", 2, 1, x),
             Cell::new("out", 2, 1, vec![out[0] + 1, out[1]]),
         ];
-        let bad = prove_segment_with_weights(&ops, &bad_cells, &[w], &dims, (k, 1, alpha, beta, 8, 0.0), &bounds, Params::default())
+        let bad = prove_segment_with_weights(&ops, &bad_cells, &[w], &dims, (k, 1, alpha, beta, 8, 0.0), &bounds, Params::default(), &[])
             .unwrap();
-        assert!(!verify_segment_with_weights(&ops, &bad, &published, &[], &dims, (k, 1, alpha, beta, 8, 0.0), &bounds));
+        assert!(!verify_segment_with_weights(&ops, &bad, &published, &[], &dims, (k, 1, alpha, beta, 8, 0.0), &bounds, &[]));
     }
 
     #[test]
@@ -1928,6 +2213,8 @@ mod tests {
             exp_lo: -3,
             score_lo: 0,
             score_hi: 5,
+            rope_lo: -1,
+            rope_hi: 1,
         };
         let alpha = Fp::new(11);
         let beta = Fp::new(5);
@@ -1995,6 +2282,8 @@ mod tests {
             exp_lo: -1,
             score_lo: 0,
             score_hi: 1,
+            rope_lo: -1,
+            rope_hi: 1,
         };
         let cells = vec![
             Cell::new("x", 4, 1, x.clone()),
@@ -2013,6 +2302,7 @@ mod tests {
             (1, 1, alpha, beta, 8, 0.0),
             &bounds,
             Params::default(),
+            &[],
         )
         .expect("drivable");
         let published = std::collections::HashMap::new();
@@ -2023,7 +2313,8 @@ mod tests {
             &[],
             &dims,
             (1, 1, alpha, beta, 8, 0.0),
-            &bounds
+            &bounds,
+            &[],
         ));
 
         // A pair that is not on the silu graph is rejected.
@@ -2039,6 +2330,7 @@ mod tests {
             (1, 1, alpha, beta, 8, 0.0),
             &bounds,
             Params::default(),
+            &[],
         )
         .unwrap();
         assert!(!verify_segment_with_weights(
@@ -2048,7 +2340,8 @@ mod tests {
             &[],
             &dims,
             (1, 1, alpha, beta, 8, 0.0),
-            &bounds
+            &bounds,
+            &[],
         ));
 
         // Bounds that do not cover the table the prover used are rejected.
@@ -2061,7 +2354,8 @@ mod tests {
             &[],
             &dims,
             (1, 1, alpha, beta, 8, 0.0),
-            &narrow
+            &narrow,
+            &[]
         ));
     }
 
@@ -2089,6 +2383,8 @@ mod tests {
             exp_lo: -1,
             score_lo: 0,
             score_hi: 1,
+            rope_lo: -1,
+            rope_hi: 1,
         };
         let t0 = vec![1i64, 2, 3, 4];
         let t1 = vec![5i64, 6, 7, 8];
@@ -2112,6 +2408,7 @@ mod tests {
         }];
         let bundle = prove_segment_with_weights(
             &ops, &cells, &[], &dims, (1, 1, alpha, beta, 8, 0.0), &bounds, Params::default(),
+            &[],
         )
         .expect("drivable");
         let co = bundle.segment.commitment.cell("out").unwrap();
@@ -2119,7 +2416,8 @@ mod tests {
         assert_eq!(bundle.segment.commitment.cells[co].logical_cols, 2);
         let published = std::collections::HashMap::new();
         assert!(verify_segment_with_weights(
-            &ops, &bundle, &published, &[], &dims, (1, 1, alpha, beta, 8, 0.0), &bounds
+            &ops, &bundle, &published, &[], &dims, (1, 1, alpha, beta, 8, 0.0), &bounds,
+            &[],
         ));
     }
 
@@ -2136,6 +2434,8 @@ mod tests {
             exp_lo: -1,
             score_lo: 0,
             score_hi: 1,
+            rope_lo: -1,
+            rope_hi: 1,
         };
         let dims = crate::model::spec::Dims {
             hidden: 2,
@@ -2180,11 +2480,13 @@ mod tests {
             (k, digits, alpha, beta, rec_q, eps),
             &bounds,
             Params::default(),
+            &[],
         )
         .expect("drivable");
         let published = std::collections::HashMap::new();
         assert!(verify_segment_with_weights(
-            &ops, &bundle, &published, &weights, &dims, (k, digits, alpha, beta, rec_q, eps), &bounds
+            &ops, &bundle, &published, &weights, &dims, (k, digits, alpha, beta, rec_q, eps), &bounds,
+            &[],
         ));
 
         // A wrong output breaks the requant link to `y`.
@@ -2199,16 +2501,19 @@ mod tests {
             (k, digits, alpha, beta, rec_q, eps),
             &bounds,
             Params::default(),
+            &[],
         )
         .unwrap();
         assert!(!verify_segment_with_weights(
-            &ops, &bad, &published, &weights, &dims, (k, digits, alpha, beta, rec_q, eps), &bounds
+            &ops, &bad, &published, &weights, &dims, (k, digits, alpha, beta, rec_q, eps), &bounds,
+            &[],
         ));
 
         // A γ the verifier does not know is rejected: the copy is bound to it.
         let other = vec![WeightMatrix::new("g", 2, 1, vec![5, 7])];
         assert!(!verify_segment_with_weights(
-            &ops, &bundle, &published, &other, &dims, (k, digits, alpha, beta, rec_q, eps), &bounds
+            &ops, &bundle, &published, &other, &dims, (k, digits, alpha, beta, rec_q, eps), &bounds,
+            &[],
         ));
     }
 
@@ -2221,6 +2526,8 @@ mod tests {
             exp_lo: -3,
             score_lo: 0,
             score_hi: 1,
+            rope_lo: -1,
+            rope_hi: 1,
         }
     }
 
@@ -2257,11 +2564,13 @@ mod tests {
         let ops = vec![Op::WeightedV { weights: "w".into(), v: "v".into(), output: "out".into() }];
         let bundle = prove_segment_with_weights(
             &ops, &cells, &[], &dims, (1, 3, alpha, beta, 8, 0.0), &bounds, Params::default(),
+            &[],
         )
         .expect("drivable");
         let published = std::collections::HashMap::new();
         assert!(verify_segment_with_weights(
-            &ops, &bundle, &published, &[], &dims, (1, 3, alpha, beta, 8, 0.0), &bounds
+            &ops, &bundle, &published, &[], &dims, (1, 3, alpha, beta, 8, 0.0), &bounds,
+            &[],
         ));
 
         let mut bad = out.clone();
@@ -2273,10 +2582,12 @@ mod tests {
         ];
         let bad_bundle = prove_segment_with_weights(
             &ops, &bad_cells, &[], &dims, (1, 3, alpha, beta, 8, 0.0), &bounds, Params::default(),
+            &[],
         )
         .unwrap();
         assert!(!verify_segment_with_weights(
-            &ops, &bad_bundle, &published, &[], &dims, (1, 3, alpha, beta, 8, 0.0), &bounds
+            &ops, &bad_bundle, &published, &[], &dims, (1, 3, alpha, beta, 8, 0.0), &bounds,
+            &[],
         ));
     }
 
@@ -2315,11 +2626,13 @@ mod tests {
         let ops = vec![Op::Scores { q: "q".into(), k: "k".into(), output: "out".into(), scale: 1.0 }];
         let bundle = prove_segment_with_weights(
             &ops, &cells, &[], &dims, (1, 4, alpha, beta, 8, 0.0), &bounds, Params::default(),
+            &[],
         )
         .expect("drivable");
         let published = std::collections::HashMap::new();
         assert!(verify_segment_with_weights(
-            &ops, &bundle, &published, &[], &dims, (1, 4, alpha, beta, 8, 0.0), &bounds
+            &ops, &bundle, &published, &[], &dims, (1, 4, alpha, beta, 8, 0.0), &bounds,
+            &[],
         ));
 
         let mut bad = out.clone();
@@ -2331,10 +2644,12 @@ mod tests {
         ];
         let bad_bundle = prove_segment_with_weights(
             &ops, &bad_cells, &[], &dims, (1, 4, alpha, beta, 8, 0.0), &bounds, Params::default(),
+            &[],
         )
         .unwrap();
         assert!(!verify_segment_with_weights(
-            &ops, &bad_bundle, &published, &[], &dims, (1, 4, alpha, beta, 8, 0.0), &bounds
+            &ops, &bad_bundle, &published, &[], &dims, (1, 4, alpha, beta, 8, 0.0), &bounds,
+            &[],
         ));
     }
 
@@ -2372,11 +2687,13 @@ mod tests {
         let ops = vec![Op::CausalSoftmax { input: "scores".into(), output: "probs".into() }];
         let bundle = prove_segment_with_weights(
             &ops, &cells, &[], &dims, (k, digits, alpha, beta, rec_q, eps), &bounds, Params::default(),
+            &[],
         )
         .expect("drivable");
         let published = std::collections::HashMap::new();
         assert!(verify_segment_with_weights(
-            &ops, &bundle, &published, &[], &dims, (k, digits, alpha, beta, rec_q, eps), &bounds
+            &ops, &bundle, &published, &[], &dims, (k, digits, alpha, beta, rec_q, eps), &bounds,
+            &[],
         ));
 
         let mut bad = probs.clone();
@@ -2387,10 +2704,12 @@ mod tests {
         ];
         let bad_bundle = prove_segment_with_weights(
             &ops, &bad_cells, &[], &dims, (k, digits, alpha, beta, rec_q, eps), &bounds, Params::default(),
+            &[],
         )
         .unwrap();
         assert!(!verify_segment_with_weights(
-            &ops, &bad_bundle, &published, &[], &dims, (k, digits, alpha, beta, rec_q, eps), &bounds
+            &ops, &bad_bundle, &published, &[], &dims, (k, digits, alpha, beta, rec_q, eps), &bounds,
+            &[],
         ));
     }
 
@@ -2438,11 +2757,138 @@ mod tests {
         }];
         let bundle = prove_segment_with_weights(
             &ops, &cells, &[], &dims, (1, 1, alpha, beta, 8, 0.0), &bounds, Params::default(),
+            &[],
         )
         .expect("drivable");
         let published = std::collections::HashMap::new();
         assert!(verify_segment_with_weights(
-            &ops, &bundle, &published, &[], &dims, (1, 1, alpha, beta, 8, 0.0), &bounds
+            &ops, &bundle, &published, &[], &dims, (1, 1, alpha, beta, 8, 0.0), &bounds,
+            &[],
+        ));
+    }
+
+    #[test]
+    fn rope_driven_with_a_requant_lookup() {
+        let alpha = Fp::new(11);
+        let beta = Fp::new(5);
+        let dims = crate::model::spec::Dims {
+            hidden: 4, vocab: 2, layers: 1, heads: 2, head_dim: 2,
+            experts: 2, active: 1, intermediate: 4,
+        };
+        // [pos=2, head=2, dim=2] flattened.
+        let (rows, h, d) = (4usize, 2usize, 2usize);
+        // The rotated-value table is `O(rot range)`, and the rotation scale is
+        // 2^15, so a non-zero input would need a ~300k-entry table. This exercises
+        // the wiring with the smallest table the format allows; rope on real data
+        // needs `claim_requant` instead of a range lookup.
+        let inp = vec![1i64, 0, 0, 0, 0, 0, 0, 0];
+        let theta = 1.0f64;
+        let rot = crate::gkr::nonlinear::rotate(&inp, rows, h, d, theta);
+        let out: Vec<i64> = rot
+            .iter()
+            .map(|&v| crate::model::spec::requant(v, crate::model::spec::RECIP_Q))
+            .collect();
+        let bounds = base_bounds();
+
+        let cells = vec![
+            Cell::new("inp", rows, d, inp.clone()),
+            Cell::new("out", rows, d, out.clone()),
+        ];
+        let ops = vec![Op::Rope {
+            input: "inp".into(),
+            output: "out".into(),
+            theta,
+        }];
+        let bundle = prove_segment_with_weights(
+            &ops, &cells, &[], &dims, (1, 4, alpha, beta, 8, 0.0), &bounds, Params::default(),
+            &[],
+        )
+        .expect("drivable");
+        let published = std::collections::HashMap::new();
+        assert!(verify_segment_with_weights(
+            &ops, &bundle, &published, &[], &dims, (1, 4, alpha, beta, 8, 0.0), &bounds,
+            &[],
+        ));
+    }
+
+
+    #[test]
+    fn embed_driven_from_the_embedding_root() {
+        let alpha = Fp::new(11);
+        let beta = Fp::new(5);
+        let bounds = base_bounds();
+        let dims = crate::model::spec::Dims {
+            hidden: 2, vocab: 8, layers: 1, heads: 1, head_dim: 2,
+            experts: 2, active: 1, intermediate: 2,
+        };
+        let (vocab, hidden) = (4usize, 2usize);
+        let emb_vals: Vec<i8> = (0..(vocab * hidden) as i8).map(|i| i - 3).collect();
+        let emb = WeightMatrix::new("emb", vocab, hidden, emb_vals.clone());
+        let window = vec![2usize, 0, 3];
+        let l = window.len();
+        let out: Vec<i64> = window
+            .iter()
+            .flat_map(|&t| (0..hidden).map(|j| emb_vals[t * hidden + j] as i64).collect::<Vec<_>>())
+            .collect();
+        let cells = vec![Cell::new("out", l, hidden, out.clone())];
+        let ops = vec![Op::Embed { weight: "emb".into(), output: "out".into() }];
+        let weights = vec![emb.clone()];
+        let mut c = crate::pcs::whir_stacked::Committer::new();
+        c.add_vec(&emb_vals.iter().map(|&v| crate::gkr::segment::signed(v as i64)).collect::<Vec<_>>());
+        let pub_seg = c.seal(Params::default());
+        let published: std::collections::HashMap<String, whir_stacked::SegmentCommitment> =
+            [("emb".to_string(), pub_seg.commitment().clone())].into_iter().collect();
+        let bundle = prove_segment_with_weights(
+            &ops, &cells, &weights, &dims, (1, 1, alpha, beta, 8, 0.0), &bounds,
+            Params::default(), &window,
+        ).expect("drivable");
+        assert!(verify_segment_with_weights(
+            &ops, &bundle, &published, &weights, &dims, (1, 1, alpha, beta, 8, 0.0), &bounds, &window
+        ));
+    }
+
+    #[test]
+    fn head_tail_is_proven_on_the_last_logits_row() {
+        let alpha = Fp::new(11);
+        let beta = Fp::new(5);
+        let mut bounds = base_bounds();
+        bounds.score_lo = 0;
+        bounds.score_hi = 9;
+        let dims = crate::model::spec::Dims {
+            hidden: 2, vocab: 2, layers: 1, heads: 1, head_dim: 2,
+            experts: 2, active: 1, intermediate: 2,
+        };
+        // Two rows of four logits; the head is row 1, token 1 (score 9).
+        let rows = 2usize;
+        let n = 4usize;
+        let logits = vec![1i64, 4, 2, 3, 5, 9, 3, 7];
+        let token = 1usize;
+        let head_max = logits[(rows - 1) * n + token];
+        assert_eq!(head_max, 9);
+
+        let cells = vec![Cell::new("logits", rows, n, logits.clone())];
+        let ops: Vec<Op> = Vec::new();
+        let spec = HeadSpec {
+            logits: "logits".into(),
+            token,
+            max: head_max,
+        };
+        let bundle = prove_segment_with_head(
+            &ops, &cells, &[], &dims, (1, 1, alpha, beta, 8, 0.0), &bounds,
+            Params::default(), &[], Some(&spec),
+        )
+        .expect("drivable");
+        let published = std::collections::HashMap::new();
+        assert!(verify_segment_with_head(
+            &ops, &bundle, &published, &[], &dims, (1, 1, alpha, beta, 8, 0.0), &bounds,
+            &[], Some(&spec)
+        ));
+
+        // A token that is not the maximum of that row is rejected.
+        let bad = HeadSpec { token: 0, max: head_max, ..spec.clone() };
+        assert!(!verify_segment_with_head(
+            &ops, &bundle, &published, &[], &dims, (1, 1, alpha, beta, 8, 0.0), &bounds,
+            &[], Some(&bad)
         ));
     }
 }

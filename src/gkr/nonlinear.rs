@@ -274,12 +274,15 @@ fn replay(
 }
 
 /// `R·inp` for every row; the row's angle comes from `pos = row` and `theta`.
-pub fn rotate(inp: &[i64], rows: usize, d: usize, theta: f64) -> Vec<i64> {
+pub fn rotate(inp: &[i64], rows: usize, heads: usize, d: usize, theta: f64) -> Vec<i64> {
     let mut rot = vec![0i64; rows * d];
     for r in 0..rows {
+        // The rotation angle is the sequence position, i.e. `row / heads` in a
+        // `[pos, head, dim]` cell.
+        let pos = if heads == 0 { r } else { r / heads };
         for j in 0..(d / 2) {
             let i = r * d + 2 * j;
-            let angle = (r as f64) * theta.powf(-((2 * j) as f64) / d as f64);
+            let angle = (pos as f64) * theta.powf(-((2 * j) as f64) / d as f64);
             let c = (angle.cos() * 32768.0).round() as i64;
             let s = (angle.sin() * 32768.0).round() as i64;
             rot[i] = inp[i] * c - inp[i + 1] * s;
@@ -290,12 +293,13 @@ pub fn rotate(inp: &[i64], rows: usize, d: usize, theta: f64) -> Vec<i64> {
 }
 
 /// `Rᵀ·r`, block-diagonal per row (the verifier rebuilds this from `r` alone).
-fn rotate_t(r: &[Fp], rows: usize, d: usize, theta: f64) -> Vec<Fp> {
+fn rotate_t(r: &[Fp], rows: usize, heads: usize, d: usize, theta: f64) -> Vec<Fp> {
     let mut rt = vec![Fp::new(0); rows * d];
     for row in 0..rows {
+        let pos = if heads == 0 { row } else { row / heads };
         for j in 0..(d / 2) {
             let i = row * d + 2 * j;
-            let angle = (row as f64) * theta.powf(-((2 * j) as f64) / d as f64);
+            let angle = (pos as f64) * theta.powf(-((2 * j) as f64) / d as f64);
             let c = fp_i64((angle.cos() * 32768.0).round() as i64);
             let s = fp_i64((angle.sin() * 32768.0).round() as i64);
             rt[i] = r[i] * c + r[i + 1] * s;
@@ -314,54 +318,59 @@ fn fp_i64(x: i64) -> Fp {
     }
 }
 
-/// A `rot = R·inp` claim over the whole cell.
+/// A `rot = R·inp` claim over the whole cell, plus the rounding that produces `out`.
+///
+/// The rounding is `claim_requant`, the same relation `matmul`, `norm`, `scores` and
+/// `softmax` use — **not** a range lookup. A lookup table would be as wide as the
+/// rotated values (the rotation scale is 2^15), i.e. hundreds of thousands of
+/// entries and a product sumcheck to match; `claim_requant` is O(n) and needs no
+/// published domain.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct RopeSegmentProof {
     pub rows: usize,
+    pub heads: usize,
     pub d: usize,
-    /// The lookup: `input = rot`, `output = out`.
-    pub cells: Lookup2Cells,
-    /// The input cell the rotation reads.
     pub inp: usize,
+    pub rot: usize,
     pub r: Vec<Fp>,
     pub b_rot: Lin,
     pub b_inp: Lin,
-    pub lookup: Lookup2SegmentProof,
+    pub requant: RequantSegmentProof,
 }
 
 /// Claim `out = requant(R·inp)` for every row.
+#[allow(clippy::too_many_arguments)]
 pub fn claim_rope(
     seg: &mut CellSegment,
-    cells: Lookup2Cells,
+    rot: usize,
+    requant_cells: RequantCells,
     inp: usize,
-    (rows, d): (usize, usize),
+    (rows, heads, d): (usize, usize, usize),
     theta: f64,
-    (alpha, beta): (Fp, Fp),
-    (table, big_n): (&[Fp], usize),
+    (k, digits): (usize, usize),
     tr: &mut Transcript,
 ) -> RopeSegmentProof {
     let n = rows * d;
     tr.observe_val(Fp::new(inp as u64));
-    for id in [cells.input, cells.output, cells.fp] {
-        tr.observe_val(Fp::new(id as u64));
-    }
+    tr.observe_val(Fp::new(rot as u64));
 
     let r: Vec<Fp> = (0..n).map(|_| tr.sample_val()).collect();
-    let rt = rotate_t(&r, rows, d, theta);
-    let b_rot = seg.claim_linear_id(cells.input, 0, &LinearH::Dense(r.clone()), tr);
+    let rt = rotate_t(&r, rows, heads, d, theta);
+    let b_rot = seg.claim_linear_id(rot, 0, &LinearH::Dense(r.clone()), tr);
     let b_inp = seg.claim_linear_id(inp, 0, &LinearH::Dense(rt), tr);
 
-    let lookup = claim_lookup2(seg, cells.clone(), (alpha, beta), table, (n, big_n), tr);
+    let requant = claim_requant(seg, requant_cells, (n, k, digits), tr);
 
     RopeSegmentProof {
         rows,
+        heads,
         d,
-        cells,
         inp,
+        rot,
         r,
         b_rot,
         b_inp,
-        lookup,
+        requant,
     }
 }
 
@@ -371,31 +380,28 @@ pub fn verify_rope(
     commitment: &CellSegmentCommitment,
     claims: &[CellClaim],
     proof: &RopeSegmentProof,
-    (rows, d): (usize, usize),
+    (rows, heads, d): (usize, usize, usize),
     theta: f64,
-    (table, big_n): (&[Fp], usize),
+    (k, digits): (usize, usize),
     tr: &mut Transcript,
 ) -> bool {
-    if proof.rows != rows || proof.d != d {
+    let n = rows * d;
+    if proof.rows != rows || proof.heads != heads || proof.d != d || proof.r.len() != n {
         return false;
     }
-    let n = rows * d;
-    let cells = proof.cells.clone();
     tr.observe_val(Fp::new(proof.inp as u64));
-    for id in [cells.input, cells.output, cells.fp] {
-        tr.observe_val(Fp::new(id as u64));
-    }
+    tr.observe_val(Fp::new(proof.rot as u64));
 
     let r: Vec<Fp> = (0..n).map(|_| tr.sample_val()).collect();
     if r != proof.r {
         return false;
     }
-    let rt = rotate_t(&r, rows, d, theta);
+    let rt = rotate_t(&r, rows, heads, d, theta);
 
     let Some((z, cf)) = linear_verify(&proof.b_rot.1, proof.b_rot.0, tr) else {
         return false;
     };
-    let Some(v) = claim_value_at_id(commitment, claims, cells.input, &z) else {
+    let Some(v) = claim_value_at_id(commitment, claims, proof.rot, &z) else {
         return false;
     };
     if !linear_finish(&LinearH::Dense(r.clone()), &z, cf, v) {
@@ -412,22 +418,44 @@ pub fn verify_rope(
         return false;
     }
 
-    // `⟨r, rot⟩ = ⟨Rᵀr, inp⟩` is the rotation check.
+    // ⟨r, rot⟩ = ⟨Rᵀr, inp⟩ is the rotation check.
     if proof.b_rot.0 != proof.b_inp.0 {
         return false;
     }
 
-    verify_lookup2(commitment, claims, &proof.lookup, table, (n, big_n), tr)
+    verify_requant(commitment, claims, &proof.requant, (n, k, digits), tr)
 }
 
+
+/// The reference reciprocal `inv_q = round(2^Q / s)` for a softmax total `s`.
+pub fn softmax_inv_q(s: i64, rec_q: u32) -> i64 {
+    if s <= 0 {
+        return 0;
+    }
+    ((1i64 << (rec_q + 15)) as f64 / s as f64).round() as i64
+}
+
+/// The row-max sign table over the softmax `d` range `[exp_lo, 0]`.
+///
+/// `d = mask ⊙ (scores − m)` is always ≤ 0, so every entry's indicator is `0` and
+/// the lookup degenerates to the range check `d ∈ [exp_lo, 0]` — which is exactly
+/// what "every prefix score is at most `m`" needs, given `scores[tstar] = m`.
+pub fn max_table(exp_lo: i64, alpha: Fp, beta: Fp) -> Vec<Fp> {
+    let n = max_big_n(exp_lo);
+    let mut v: Vec<Fp> = (exp_lo..=0).map(|x| alpha + beta * fp_i64(x)).collect();
+    v.resize(n.next_power_of_two(), Fp::ONE);
+    v
+}
+
+pub fn max_big_n(exp_lo: i64) -> usize {
+    (0 - exp_lo + 1) as usize
+}
 
 /// The cells one causal-softmax row touches.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SoftmaxRowCells {
-    /// Shared trace cells (`rows × n`).
     pub scores: usize,
     pub probs: usize,
-    /// Per-row derived cells.
     pub d: usize,
     pub e: usize,
     pub y: usize,
@@ -447,19 +475,17 @@ pub struct SoftmaxRowProof {
     pub row: usize,
     pub n: usize,
     pub l: usize,
-    /// The exp domain's lower bound. The reference max lives in `row_max.m`, where
-    /// it is bound rather than asserted.
+    /// The exp domain's lower bound. The reference max lives in `row_max.m`.
     pub exp_lo: i64,
     /// `m = max(scores[0..=l])`, proven rather than taken on faith.
     pub row_max: crate::gkr::range::RowMaxProof,
-    pub rec_q: u32,
     pub cells: SoftmaxRowCells,
     pub r: Vec<Fp>,
     pub r2: Vec<Fp>,
     pub b_d: Lin,
     pub b_scores: Lin,
     pub b_e_mask: Lin,
-    /// `s = ⟨mask, e⟩`, the exponential total.
+    /// `s = ⟨mask, e⟩`.
     pub s: Ext,
     pub b_e: Lin,
     pub b_inv: Lin,
@@ -469,30 +495,6 @@ pub struct SoftmaxRowProof {
     pub requant: RequantSegmentProof,
 }
 
-/// The reference `inv_q` for a total `s`: `round(2^(Q+15)/s)`.
-pub fn softmax_inv_q(s: i64, rec_q: u32) -> i64 {
-    if s <= 0 {
-        return 0;
-    }
-    ((1i64 << (rec_q + 15)) as f64 / s as f64).round() as i64
-}
-
-/// The row-max sign table over the softmax `d` range `[exp_lo, 0]`.
-///
-/// `d = mask ⊙ (scores − m)` is always ≤ 0, so every table entry's indicator is `0`
-/// and the lookup degenerates to the range check `d ∈ [exp_lo, 0]` — which is exactly
-/// what "every prefix score is at most `m`" needs, given `scores[tstar] = m`.
-pub fn max_table(exp_lo: i64, alpha: Fp, beta: Fp) -> Vec<Fp> {
-    let n = max_big_n(exp_lo);
-    let mut v: Vec<Fp> = (exp_lo..=0).map(|x| alpha + beta * fp_i64(x)).collect();
-    v.resize(n.next_power_of_two(), Fp::ONE);
-    v
-}
-
-pub fn max_big_n(exp_lo: i64) -> usize {
-    (0 - exp_lo + 1) as usize
-}
-
 /// Claim one causal-softmax row.
 #[allow(clippy::too_many_arguments)]
 pub fn claim_softmax_row(
@@ -500,7 +502,7 @@ pub fn claim_softmax_row(
     cells: SoftmaxRowCells,
     (row, n, l): (usize, usize, usize),
     (m, exp_lo, tstar): (i64, i64, usize),
-    (rec_q, k, digits): (u32, usize, usize),
+    (_rec_q, k, digits): (u32, usize, usize),
     (alpha, beta): (Fp, Fp),
     (table, big_n): (&[Fp], usize),
     tr: &mut Transcript,
@@ -511,7 +513,6 @@ pub fn claim_softmax_row(
     }
     let log_n = n.trailing_zeros() as usize;
 
-    // 1. d = (i ≤ l ? scores[i] − m : exp_lo).
     let r: Vec<Fp> = (0..n).map(|_| tr.sample_val()).collect();
     let hm: Vec<Fp> = (0..n)
         .map(|i| if i <= l { r[i] } else { Fp::new(0) })
@@ -525,10 +526,9 @@ pub fn claim_softmax_row(
         tr,
     );
 
-    // 2. e = exp(d).
     let lookup = claim_lookup2(seg, c.lookup.clone(), (alpha, beta), table, (n, big_n), tr);
 
-    // 2b. `m` is the maximum of the causal prefix, not a number the prover chose.
+    // `m` is the maximum of the causal prefix, not a number the prover chose.
     let row_max = crate::gkr::range::claim_row_max(
         seg,
         crate::gkr::range::RowMaxCells {
@@ -546,10 +546,9 @@ pub fn claim_softmax_row(
         tr,
     );
 
-    // 3. s = ⟨mask, e⟩ and the scale pair.
     let mask = LinearH::Dense(
         (0..n)
-            .map(|i| if i <= l { Fp::new(1) } else { Fp::new(0) })
+            .map(|i| if i <= l { Fp::ONE } else { Fp::ZERO })
             .collect(),
     );
     let b_e_mask = seg.claim_linear_id(c.e, 0, &mask, tr);
@@ -560,7 +559,6 @@ pub fn claim_softmax_row(
     let b_e = seg.claim_linear_id(c.e, 0, &h2, tr);
     let b_inv = seg.claim_linear_id(c.y, 0, &h2, tr);
 
-    // 4. nrm = requant(y, Q), and nrm must equal probs' row block.
     let requant = claim_requant(seg, c.requant.clone(), (n, k, digits), tr);
     let b_nrm = seg.claim_linear_id(c.nrm, 0, &h2, tr);
     let m_probs = seg.cells_meta(c.probs).m();
@@ -577,7 +575,6 @@ pub fn claim_softmax_row(
         l,
         exp_lo,
         row_max,
-        rec_q,
         cells,
         r,
         r2,
@@ -601,21 +598,24 @@ pub fn verify_softmax_row(
     claims: &[CellClaim],
     proof: &SoftmaxRowProof,
     (row, n, l): (usize, usize, usize),
-    (_m, exp_lo, tstar): (i64, i64, usize),
+    (exp_lo, tstar): (i64, usize),
     (rec_q, k, digits): (u32, usize, usize),
     (table, big_n): (&[Fp], usize),
     (max_table_v, max_big_n_v): (&[Fp], usize),
     tr: &mut Transcript,
 ) -> bool {
-    if proof.row != row || proof.n != n || proof.l != l || proof.exp_lo != exp_lo
+    if proof.row != row
+        || proof.n != n
+        || proof.l != l
+        || proof.exp_lo != exp_lo
         || proof.row_max.tstar != tstar
     {
         return false;
     }
     let c = proof.cells.clone();
     let (Some(m_scores), Some(m_probs)) = (
-        commitment.cells.get(c.scores).map(|c| c.m()),
-        commitment.cells.get(c.probs).map(|c| c.m()),
+        commitment.cells.get(c.scores).map(|x| x.m()),
+        commitment.cells.get(c.probs).map(|x| x.m()),
     ) else {
         return false;
     };
@@ -624,7 +624,6 @@ pub fn verify_softmax_row(
     }
     let log_n = n.trailing_zeros() as usize;
 
-    // 1. `d`'s definition.
     let r: Vec<Fp> = (0..n).map(|_| tr.sample_val()).collect();
     if r != proof.r {
         return false;
@@ -666,7 +665,6 @@ pub fn verify_softmax_row(
     if !verify_lookup2(commitment, claims, &proof.lookup, table, (n, big_n), tr) {
         return false;
     }
-    // `m` comes from the row-max proof, so it is a bound rather than a claim.
     if !crate::gkr::range::verify_row_max(
         commitment,
         claims,
@@ -679,10 +677,9 @@ pub fn verify_softmax_row(
         return false;
     }
 
-    // 3. `s = ⟨mask, e⟩`, and `y = inv_q · e` with `inv_q` derived from `s`.
     let mask = LinearH::Dense(
         (0..n)
-            .map(|i| if i <= l { Fp::new(1) } else { Fp::new(0) })
+            .map(|i| if i <= l { Fp::ONE } else { Fp::ZERO })
             .collect(),
     );
     let Some((z, cf)) = linear_verify(&proof.b_e_mask.1, proof.b_e_mask.0, tr) else {
@@ -697,14 +694,12 @@ pub fn verify_softmax_row(
     if proof.b_e_mask.0 != proof.s {
         return false;
     }
-    // `s` must be a small non-negative integer so `inv_q` is well defined.
-    let coeffs = <Ext as p3_field::BasedVectorSpace<Fp>>::as_basis_coefficients_slice(&proof.s);
-    if coeffs[1..].iter().any(|&x| x != Fp::new(0))
-        || p3_field::PrimeField64::as_canonical_u64(&coeffs[0]) >= (1u64 << 62)
-    {
+    let Some(s_int) = small_int(proof.s) else {
+        return false;
+    };
+    if s_int <= 0 {
         return false;
     }
-    let s_int = p3_field::PrimeField64::as_canonical_u64(&coeffs[0]) as i64;
     let inv_q = fp_i64(softmax_inv_q(s_int, rec_q));
 
     let r2: Vec<Fp> = (0..n).map(|_| tr.sample_val()).collect();
@@ -738,7 +733,6 @@ pub fn verify_softmax_row(
         return false;
     }
 
-    // 4. `nrm` equals `probs`' row block.
     let Some((z, cf)) = linear_verify(&proof.b_nrm.1, proof.b_nrm.0, tr) else {
         return false;
     };
@@ -756,6 +750,117 @@ pub fn verify_softmax_row(
         return false;
     };
     linear_finish(&h2, &z, cf, v) && proof.b_nrm.0 == proof.b_probs.0
+}
+
+/// An `embed` claim: `out[b, ·] = emb[window[b], ·]`.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct EmbedSegmentProof {
+    pub out: usize,
+    pub weight: crate::gkr::segment::WeightOpen,
+    pub r: Vec<Fp>,
+    pub b_out: Lin,
+    pub b_emb: Lin,
+}
+
+/// Claim `out = emb[window]` for a whole activation row block.
+#[allow(clippy::too_many_arguments)]
+pub fn claim_embed(
+    seg: &mut CellSegment,
+    out: usize,
+    window: &[usize],
+    (l, hidden, vocab): (usize, usize, usize),
+    weight: &mut crate::pcs::whir_stacked::SegmentProver,
+    weight_cell: usize,
+    weight_name: &str,
+    tr: &mut Transcript,
+) -> EmbedSegmentProof {
+    let n = l * hidden;
+    assert_eq!(window.len(), l, "one window position per row");
+    tr.observe_val(Fp::new(out as u64));
+
+    let mut r: Vec<Fp> = (0..n).map(|_| tr.sample_val()).collect();
+    r.resize(n.next_power_of_two(), Fp::new(0));
+    let b_out = seg.claim_linear_id(out, 0, &LinearH::Dense(r.clone()), tr);
+
+    let h = LinearH::Sparse {
+        entries: (0..n)
+            .map(|i| (window[i / hidden] * hidden + i % hidden, r[i]))
+            .collect(),
+        len: vocab * hidden,
+    };
+    let (b_emb, proof, z_emb, opened_emb) = weight.claim_linear(weight_cell, 0, &h, tr);
+
+    EmbedSegmentProof {
+        out,
+        weight: crate::gkr::segment::WeightOpen {
+            name: weight_name.to_string(),
+            cell: weight_cell,
+            point: z_emb,
+            value: opened_emb,
+        },
+        r,
+        b_out,
+        b_emb: (b_emb, proof),
+    }
+}
+
+/// Verify an [`EmbedSegmentProof`]; `w_com`/`w_proof` are the tensor's.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_embed(
+    commitment: &CellSegmentCommitment,
+    claims: &[CellClaim],
+    w_com: &crate::pcs::whir_stacked::SegmentCommitment,
+    w_proof: &crate::pcs::whir_stacked::Proof,
+    proof: &EmbedSegmentProof,
+    window: &[usize],
+    (l, hidden, vocab): (usize, usize, usize),
+    tr: &mut Transcript,
+) -> bool {
+    let n = l * hidden;
+    let n_pad = n.next_power_of_two();
+    if window.len() != l || proof.r.len() != n_pad {
+        return false;
+    }
+    tr.observe_val(Fp::new(proof.out as u64));
+    let mut r: Vec<Fp> = (0..n).map(|_| tr.sample_val()).collect();
+    r.resize(n_pad, Fp::new(0));
+    if r != proof.r {
+        return false;
+    }
+
+    let Some((z, cf)) = linear_verify(&proof.b_out.1, proof.b_out.0, tr) else {
+        return false;
+    };
+    let Some(v) = claim_value_at_id(commitment, claims, proof.out, &z) else {
+        return false;
+    };
+    if !linear_finish(&LinearH::Dense(r.clone()), &z, cf, v) {
+        return false;
+    }
+
+    let h = LinearH::Sparse {
+        entries: (0..n)
+            .map(|i| (window[i / hidden] * hidden + i % hidden, r[i]))
+            .collect(),
+        len: vocab * hidden,
+    };
+    let Some((zw, cfw)) = linear_verify(&proof.b_emb.1, proof.b_emb.0, tr) else {
+        return false;
+    };
+    let opened = crate::pcs::whir_stacked::verify(
+        w_com,
+        &[crate::pcs::whir_stacked::Claim {
+            table: proof.weight.cell,
+            cols: vec![0],
+            point: proof.weight.point.clone(),
+            values: vec![proof.weight.value],
+        }],
+        w_proof,
+        &mut crate::pcs::fri::new_challenger(),
+    );
+    opened
+        && linear_finish(&h, &zw, cfw, proof.weight.value)
+        && proof.b_out.0 == proof.b_emb.0
 }
 
 #[cfg(test)]
@@ -933,126 +1038,6 @@ mod tests {
     }
 
     #[test]
-    fn rope_rotation_and_lookup() {
-        let (rows, d, k) = (2usize, 2usize, 1usize);
-        let theta = 1.0f64;
-        let alpha = Fp::new(11);
-        let beta = Fp::new(5);
-        let inp = vec![0i64, 0, 1, 0];
-        let rot = rotate(&inp, rows, d, theta);
-        let out: Vec<i64> = rot.iter().map(|&v| requant_i64(v, k as u32)).collect();
-
-        // The public table only has to contain the distinct `rot` values; the op's
-        // range semantics live in how the caller builds it, not in the primitive.
-        let mut distinct = rot.clone();
-        distinct.sort_unstable();
-        distinct.dedup();
-        let big_n = distinct.len();
-        let ft_d = big_n.next_power_of_two();
-        let fp_of = |x: i64| alpha + beta * fp(x) + beta * beta * fp(requant_i64(x, k as u32));
-        let mut table: Vec<Fp> = distinct.iter().map(|&x| fp_of(x)).collect();
-        table.resize(ft_d, Fp::ONE);
-        let fpv: Vec<Fp> = rot.iter().map(|&x| fp_of(x)).collect();
-        let mut counts = vec![0usize; big_n];
-        for &x in &rot {
-            counts[distinct.binary_search(&x).unwrap()] += 1;
-        }
-        let mut m: Vec<Fp> = counts.iter().map(|&c| Fp::new(c as u64)).collect();
-        m.resize(ft_d, Fp::ONE);
-        let mut diff_t: Vec<Fp> = counts
-            .iter()
-            .zip(table.iter().take(big_n))
-            .map(|(&c, &t)| Fp::new(c as u64) * t.inverse())
-            .collect();
-        diff_t.resize(ft_d, Fp::ONE);
-        let diff_q: Vec<Fp> = fpv.iter().map(|&v| v.inverse()).collect();
-
-        let mut cells = SegmentCells::new();
-        let col = |c: &mut SegmentCells, name: &str, v: &[i64]| {
-            c.cell_fp(name, v.len(), 1, v.iter().map(|&z| fp(z)).collect());
-        };
-        col(&mut cells, "inp", &inp);
-        col(&mut cells, "out", &out);
-        col(&mut cells, "rot", &rot);
-        cells.cell_fp("fp", rows * d, 1, fpv.clone());
-        cells.cell_fp("diff_q", rows * d, 1, diff_q.clone());
-        cells.cell_fp("ft", ft_d, 1, table.clone());
-        cells.cell_fp("diff_t", ft_d, 1, diff_t.clone());
-        cells.cell_fp("m", ft_d, 1, m.clone());
-
-        let mut seg = cells.seal(Params::default());
-        let com = seg.commitment();
-        let lc = Lookup2Cells {
-            input: seg.id("rot"),
-            output: seg.id("out"),
-            fp: seg.id("fp"),
-            diff_q: seg.id("diff_q"),
-            ft: seg.id("ft"),
-            diff_t: seg.id("diff_t"),
-            m: seg.id("m"),
-        };
-        let inp_id = seg.id("inp");
-        let mut tr = Transcript::new(&new_challenger());
-        let proof = claim_rope(
-            &mut seg,
-            lc,
-            inp_id,
-            (rows, d),
-            theta,
-            (alpha, beta),
-            (&table, big_n),
-            &mut tr,
-        );
-        let claims = seg.claims().to_vec();
-        let wproof = seg.prove(&mut new_challenger());
-        assert!(verify(&com, &claims, &wproof, &mut new_challenger()));
-        let mut vtr = Transcript::new(&new_challenger());
-        assert!(verify_rope(
-            &com, &claims, &proof, (rows, d), theta, (&table, big_n), &mut vtr
-        ));
-
-        // A wrong rotation is rejected: `rot` no longer satisfies the R·inp claim.
-        let mut bad_rot = rot.clone();
-        bad_rot[0] += 1;
-        let mut bad_cells = SegmentCells::new();
-        bad_cells.cell_fp("inp", inp.len(), 1, inp.iter().map(|&z| fp(z)).collect());
-        bad_cells.cell_fp("out", out.len(), 1, out.iter().map(|&z| fp(z)).collect());
-        bad_cells.cell_fp("rot", rot.len(), 1, bad_rot.iter().map(|&z| fp(z)).collect());
-        bad_cells.cell_fp("fp", rows * d, 1, fpv.clone());
-        bad_cells.cell_fp("diff_q", rows * d, 1, diff_q.clone());
-        bad_cells.cell_fp("ft", ft_d, 1, table.clone());
-        bad_cells.cell_fp("diff_t", ft_d, 1, diff_t.clone());
-        bad_cells.cell_fp("m", ft_d, 1, m.clone());
-        let mut bad = bad_cells.seal(Params::default());
-        let bad_com = bad.commitment();
-        let bad_lc = Lookup2Cells {
-            input: bad.id("rot"),
-            output: bad.id("out"),
-            fp: bad.id("fp"),
-            diff_q: bad.id("diff_q"),
-            ft: bad.id("ft"),
-            diff_t: bad.id("diff_t"),
-            m: bad.id("m"),
-        };
-        let bad_inp = bad.id("inp");
-        let bad_proof = claim_rope(
-            &mut bad,
-            bad_lc,
-            bad_inp,
-            (rows, d),
-            theta,
-            (alpha, beta),
-            (&table, big_n),
-            &mut Transcript::new(&new_challenger()),
-        );
-        let bad_claims = bad.claims().to_vec();
-        let mut vtr = Transcript::new(&new_challenger());
-        assert!(!verify_rope(
-            &bad_com, &bad_claims, &bad_proof, (rows, d), theta, (&table, big_n), &mut vtr
-        ));
-    }
-
-    #[test]
     fn one_softmax_row() {
         use crate::model::spec::exp_q15;
         let (n, l, rec_q, k, digits) = (2usize, 1usize, 1u32, 1usize, 3usize);
@@ -1213,7 +1198,7 @@ mod tests {
             &claims,
             &proof,
             (0, n, l),
-            (m, exp_lo, 0),
+            (exp_lo, 0),
             (rec_q, k, digits),
             (&table, big_n),
             (&max_tbl, max_big),
