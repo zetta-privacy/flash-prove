@@ -357,6 +357,34 @@ impl CellSegment {
         (b, proof)
     }
 
+    /// Record an opening of a **view** of `cell` at the logical point `z`.
+    ///
+    /// [`Self::claim_id`] evaluates the cell's whole `2^m`-entry MLE; when the point
+    /// pins the coordinates outside the view to Boolean values, the MLE collapses to
+    /// the view's `2^bits` slice, which is what this evaluates.
+    pub fn claim_id_view(&mut self, cell: usize, view: &View, z: &[Ext]) -> Vec<Ext> {
+        let m = self.cells[cell].m();
+        assert_eq!(view.bits(m), z.len(), "view arity");
+        let mut col = self.prover.column(cell, 0);
+        col.truncate(1usize << m);
+        let v = view.values(&col, m);
+        let value: Ext = v
+            .iter()
+            .enumerate()
+            .map(|(j, &x)| crate::field::eq(z, j) * Ext::from(x))
+            .sum();
+        let point = view.point(z, m);
+        self.prover
+            .claim_value(cell, &[0], &point, vec![value.clone()]);
+        self.claims.push(CellClaim {
+            cell,
+            cols: vec![0],
+            point,
+            values: vec![value.clone()],
+        });
+        vec![value]
+    }
+
     /// Same as [`Self::claim_linear`], addressed by cell id.
     pub fn claim_linear_id(
         &mut self,
@@ -1045,8 +1073,8 @@ pub fn claim_matmul_weight(
 
     let a_point = w_view.point(&concat(&kstar, &r), m_w);
     let opened_a = weight.claim(weight_cell, &[0], &a_point);
-    let opened_b = seg.claim_id(b, &[0], &b_view.point(&concat(&s, &kstar), m_b))[0];
-    let opened_c = seg.claim_id(c, &[0], &c_view.point(&concat(&s, &r), m_c))[0];
+    let opened_b = seg.claim_id_view(b, b_view, &concat(&s, &kstar))[0];
+    let opened_c = seg.claim_id_view(c, c_view, &concat(&s, &r))[0];
     assert_eq!(opened_a[0], a_val, "W opening matches the sumcheck");
     assert_eq!(opened_b, b_val, "B opening matches the sumcheck");
     assert_eq!(opened_c, c_val, "C opening matches the sumcheck");
@@ -2035,9 +2063,9 @@ pub fn claim_matmul(
 
     // The three surviving evaluations are now ordinary cell openings, at the
     // points the views translate to.
-    let opened_a = seg.claim_id(ca, &[0], &views.0.point(&concat(&kstar, &r), m_a))[0];
-    let opened_b = seg.claim_id(cb, &[0], &views.1.point(&concat(&s, &kstar), m_b))[0];
-    let opened_c = seg.claim_id(cc, &[0], &views.2.point(&concat(&s, &r), m_c))[0];
+    let opened_a = seg.claim_id_view(ca, views.0, &concat(&kstar, &r))[0];
+    let opened_b = seg.claim_id_view(cb, views.1, &concat(&s, &kstar))[0];
+    let opened_c = seg.claim_id_view(cc, views.2, &concat(&s, &r))[0];
     assert_eq!(opened_a, a_val, "A opening matches the sumcheck");
     assert_eq!(opened_b, b_val, "B opening matches the sumcheck");
     assert_eq!(opened_c, c_val, "C opening matches the sumcheck");

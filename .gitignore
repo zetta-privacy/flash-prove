@@ -5,3 +5,9 @@ __pycache__/
 olmoe/
 /data/*
 !/data/.gitkeep
+
+# GPU benchmark build artifacts
+bench/.mc/
+bench/.tmp/
+bench/gpu_bench
+bench/out.txt
