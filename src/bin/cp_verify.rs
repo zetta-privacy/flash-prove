@@ -9,12 +9,11 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::Parser;
-use flashprove::gkr::commit::WeightCommit;
-use flashprove::pcs::fri;
-use flashprove::gkr::succinct::verify_gkr_succinct;
+use flashprove::gkr::driver::{
+    ops_per_segment, verify_segment_with_head, HeadSpec, ProvedModel,
+};
 use flashprove::model::spec::ModelSpec;
-
-use common::GkrProofFile;
+use flashprove::pcs::whir_stacked::SegmentCommitment;
 
 #[derive(Parser)]
 struct Args {
@@ -24,35 +23,62 @@ struct Args {
     commit: PathBuf,
     #[arg(long)]
     proof: PathBuf,
-    #[arg(long, default_value_t = 1)]
-    log_blowup: usize,
-    #[arg(long, default_value_t = 10)]
-    num_queries: usize,
+    /// Requant digit-decomposition width (must match the proof).
+    #[arg(long, default_value_t = 6)]
+    digits: usize,
+    /// Softmax/reciprocal fixed-point exponent (must match the proof).
+    #[arg(long, default_value_t = 24)]
+    rec_q: u32,
+    /// `eps` for the RMSNorm denominator (must match the proof).
+    #[arg(long, default_value_t = 1e-6)]
+    eps: f64,
 }
 
 fn main() -> ExitCode {
     let args = Args::parse();
     let spec: ModelSpec = common::load(&args.spec);
-    let commits: Vec<WeightCommit> = common::load_bin(&args.commit);
-    let file: GkrProofFile = common::load_bin(&args.proof);
+    // The pre-shared map: one root per weight tensor, as `cp_commit --whir-out`
+    // wrote it.
+    let commits: Vec<(String, SegmentCommitment)> = common::load_bin(&args.commit);
+    let published: HashMap<String, SegmentCommitment> = commits.into_iter().collect();
+    let file: ProvedModel = common::load_bin(&args.proof);
 
-    // Bind: the proof's weight commitments must equal the pre-shared roots.
-    let committed: HashMap<String, fri::Commitment> =
-        commits.into_iter().map(|c| (c.name, c.com)).collect();
-    if committed != file.proof.weight_coms {
-        println!("reject (weight commitment mismatch)");
+    // Ops are assigned to segments by the cell names each segment committed, so the
+    // verifier never needs the trace.
+    let segment_cells: Vec<Vec<String>> = file
+        .segments
+        .iter()
+        .map(|b| b.segment.commitment.cells.iter().map(|c| c.name.clone()).collect())
+        .collect();
+    let Some(per_segment) = ops_per_segment(&spec.ops, &segment_cells).ok() else {
+        println!("reject (ops do not map to segments)");
         return ExitCode::FAILURE;
-    }
+    };
 
-    let (pcs, _) = fri::new_pcs(args.log_blowup, args.num_queries);
-    let ok = verify_gkr_succinct(
-        &pcs,
-        &spec,
-        &file.window,
-        Some(file.head_token),
-        &file.cfg,
-        &file.proof,
-    );
+    let mut ok = true;
+    for (s, bundle) in file.segments.iter().enumerate() {
+        let head = if s == file.head_segment {
+            let logits = segment_cells[s].last().cloned().unwrap_or_default();
+            Some(HeadSpec {
+                logits,
+                token: file.head_token,
+                max: file.head_max,
+            })
+        } else {
+            None
+        };
+        ok &= verify_segment_with_head(
+            &per_segment[s],
+            bundle,
+            &published,
+            &[],
+            &spec.dims,
+            (args.digits, flashprove::field::Fp::new(11), flashprove::field::Fp::new(5), args.rec_q, args.eps),
+            &file.bounds,
+            &file.window,
+            head.as_ref(),
+        );
+    }
 
     println!("{}", if ok { "accept" } else { "reject" });
     if ok {

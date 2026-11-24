@@ -1,5 +1,5 @@
-//! The GKR layer: the GKR protocol primitives, the succinct op-graph walker, and
-//! the shared commitment plumbing.
+//! The GKR layer: the op-graph segment driver, the per-op claims, and the
+//! commitment plumbing they share.
 
 pub mod attention;
 pub mod commit;
@@ -13,4 +13,3 @@ pub mod range;
 pub mod requant;
 pub mod segment;
 pub mod selection;
-pub mod succinct;

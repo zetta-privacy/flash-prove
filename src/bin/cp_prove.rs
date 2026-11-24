@@ -11,13 +11,14 @@ mod common;
 use std::path::PathBuf;
 
 use clap::Parser;
-use flashprove::gkr::commit::CommittedConfig;
-use flashprove::pcs::fri;
-use flashprove::gkr::succinct::prove_gkr_succinct;
+use flashprove::gkr::driver::{
+    ops_per_segment, prove_segment_with_head, DriverError, HeadSpec, LookupBounds, ProvedModel,
+    SegmentBundle,
+};
+use flashprove::field::Fp;
 use flashprove::model::Trace;
 use flashprove::model::spec::ModelSpec;
-
-use common::GkrProofFile;
+use flashprove::pcs::whir_stacked::Params;
 
 #[derive(Parser)]
 struct Args {
@@ -35,10 +36,15 @@ struct Args {
     fill: PathBuf,
     #[arg(long)]
     out: PathBuf,
-    #[arg(long, default_value_t = 1)]
-    log_blowup: usize,
-    #[arg(long, default_value_t = 10)]
-    num_queries: usize,
+    /// Requant digit-decomposition width (bytes per value).
+    #[arg(long, default_value_t = 6)]
+    digits: usize,
+    /// Softmax/reciprocal fixed-point exponent.
+    #[arg(long, default_value_t = 24)]
+    rec_q: u32,
+    /// `eps` for the RMSNorm denominator.
+    #[arg(long, default_value_t = 1e-6)]
+    eps: f64,
 }
 
 fn main() {
@@ -68,16 +74,59 @@ fn main() {
         Some(h) => h,
         None => panic!("trace has no head token"),
     };
-    let cfg = CommittedConfig::derive(&spec, &trace);
+    let head_max = {
+        let seg = trace.segments.last().expect("at least one segment");
+        let logits = seg.cells.last().expect("logits cell");
+        logits.values[(logits.rows - 1) * logits.cols + head_token]
+    };
+    let bounds = LookupBounds::derive(&spec, &trace);
 
-    let mut ctx = fri::Prover::new(args.log_blowup, args.num_queries);
-    let proof = prove_gkr_succinct(&mut ctx, &spec, &weights, &trace, &window, &cfg);
+    // Assign every op to the segment that owns its output cell.
+    let segment_cells: Vec<Vec<String>> = trace
+        .segments
+        .iter()
+        .map(|s| s.cells.iter().map(|c| c.name.clone()).collect())
+        .collect();
+    let per_segment = ops_per_segment(&spec.ops, &segment_cells).unwrap_or_else(|e| panic!("{e:?}"));
 
-    let file = GkrProofFile {
-        head_token,
+    let head_segment = trace.segments.len() - 1;
+    let mut segments: Vec<SegmentBundle> = Vec::with_capacity(trace.segments.len());
+    for (s, seg) in trace.segments.iter().enumerate() {
+        let head = if s == head_segment {
+            Some(HeadSpec {
+                logits: trace.segments[s]
+                    .cells
+                    .last()
+                    .map(|c| c.name.clone())
+                    .unwrap_or_default(),
+                token: head_token,
+                max: head_max,
+            })
+        } else {
+            None
+        };
+        let bundle = prove_segment_with_head(
+            &per_segment[s],
+            &seg.cells,
+            &weights,
+            &spec.dims,
+            (args.digits, Fp::new(11), Fp::new(5), args.rec_q, args.eps),
+            &bounds,
+            Params::default(),
+            &window,
+            head.as_ref(),
+        )
+        .unwrap_or_else(|e: DriverError| panic!("segment {s}: {e:?}"));
+        segments.push(bundle);
+    }
+
+    let file = ProvedModel {
+        segments,
         window,
-        cfg,
-        proof,
+        bounds,
+        head_token,
+        head_max,
+        head_segment,
     };
     common::save_bin(&args.out, &file);
     println!("proof -> {}", args.out.display());

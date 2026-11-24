@@ -1,18 +1,6 @@
 //! Shared helpers for the `cp_*` binaries.
 #![allow(dead_code)]
 
-use flashprove::gkr::commit::CommittedConfig;
-use flashprove::gkr::succinct::SuccinctGkrProof;
-
-/// The self-contained GKR proof file written by `cp_prove` and read by `cp_verify`:
-/// the proof, the reconstructed token window, the head token, and the public bounds.
-#[derive(serde::Serialize, serde::Deserialize)]
-pub struct GkrProofFile {
-    pub head_token: usize,
-    pub window: Vec<usize>,
-    pub cfg: CommittedConfig,
-    pub proof: SuccinctGkrProof,
-}
 
 /// Load the integer weights from the compact binary format (see
 /// `python/load_weights.py`): u32 count, then per tensor u16 name_len, name,
