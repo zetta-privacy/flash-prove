@@ -34,10 +34,9 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 
 use crate::field::{Ext, Fp};
-use crate::pcs::blake3_mmcs::{Blake3Compress, Blake3Hasher};
+use crate::pcs::gpu_mmcs::{GpuBlake3Compress, GpuBlake3Hasher};
 use crate::pcs::transcript::{new_challenger, Challenger};
 use p3_commit::MultilinearPcs;
-use p3_dft::Radix2DitParallel;
 use p3_field::PrimeCharacteristicRing;
 use p3_matrix::dense::RowMajorMatrix;
 use p3_merkle_tree::MerkleTreeMmcs;
@@ -50,8 +49,8 @@ use serde::{Deserialize, Serialize};
 
 type F = Fp;
 type EF = Ext;
-type Dft = Radix2DitParallel<F>;
-type MT = MerkleTreeMmcs<F, F, Blake3Hasher, Blake3Compress, 2, 2>;
+type Dft = crate::pcs::metal_dft::MetalDft;
+type MT = MerkleTreeMmcs<F, F, GpuBlake3Hasher, GpuBlake3Compress, 2, 2>;
 type Layout = SuffixProver<F, EF>;
 type Prover = WhirProver<EF, F, Dft, MT, Challenger, Layout>;
 
@@ -97,7 +96,7 @@ fn build_prover(m: usize, params: Params) -> Prover {
     WhirProver::new(
         config,
         Dft::default(),
-        MT::new(Blake3Hasher, Blake3Compress, 0),
+        MT::new(GpuBlake3Hasher, GpuBlake3Compress, 0),
     )
 }
 

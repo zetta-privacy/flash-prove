@@ -6,10 +6,10 @@ and the same silu/softmax/rope/rmsnorm lookups, so the emitted trace is accepted
 by the Rust verifier. The op graph is read from a spec (data), so this is
 model-agnostic.
 
-The transcendental functions are precomputed into lookup tables over the (bounded,
-clamped) integer domains. Every table entry is computed with `math.*` (C libm),
-which is bit-identical to Rust's `f64::{exp,cos,sin,powf,sqrt}` on the same
-platform, so this stays bit-exact while avoiding the per-element Python loop.
+Every op that produces a cell may carry an integer right shift (a *requant*), so
+all committed values stay small (`SHIFT_TARGET` bits). Shifts are per *role*
+(`layer.*.expert.*.gate_proj`), never per op instance: the terms of a
+`weighted_sum` must share a scale or the sum is meaningless.
 """
 
 import argparse
@@ -28,7 +28,10 @@ def round_half_away(x):
 
 
 # Fixed-point bits for the quantized reciprocal (matches `src/spec.rs::RECIP_Q`).
-RECIP_Q = 24
+RECIP_Q = 14
+
+# Bits every committed cell is calibrated to (see `python/calibrate.py`).
+SHIFT_TARGET = 11
 
 
 def exp_f64(x):
@@ -42,6 +45,34 @@ def exp_f64(x):
 def requant(x, k):
     half = 1 << (k - 1)
     return np.where(x >= 0, (x + half) >> k, -(((-x) + half) >> k)).astype(np.int64)
+
+
+def rq(x, k):
+    """`requant`, tolerating the no-op shift `k <= 0`."""
+    return x if k <= 0 else requant(x, k)
+
+
+def _norm(name: str) -> str:
+    """`layer.0.expert.12.gate_proj` -> `layer.*.expert.*.gate_proj`.
+
+    Only whole numeric path *components* are wildcarded: `residual_1` and
+    `residual_2` keep separate roles, because their pre-shift magnitudes differ by
+    2^6 in an uncalibrated model and one shared shift makes the calibration
+    oscillate.
+    """
+    return ".".join("*" if part.isdigit() else part for part in name.split("."))
+
+
+def op_role(op: dict) -> str:
+    """The shift-sharing role of an op: ops in one role use one shift."""
+    kind = op["op"]
+    if kind == "matmul":
+        return "mm:" + _norm(op["weight"])
+    if kind in ("mul", "add"):
+        return f"{kind}:" + _norm(op["output"])
+    if kind == "scores":
+        return "scores"
+    return kind
 
 
 # --- precomputed transcendental tables (bit-identical to Rust's f64 libm) ------
@@ -119,14 +150,26 @@ def rmsnorm(x, gamma, eps):
     return out.reshape(x.shape)
 
 
-def run(spec, weights, window, output_pos=None) -> dict:
+def run(spec, weights, window, output_pos=None, stats=None) -> dict:
+    """Run the op graph. With `stats`, record each role's largest pre-shift value
+    (used by `calibrate.py`; `stats["scores"]` holds the largest safe score shift).
+    """
     env = {}
+    if stats is None:
+        stats = {}
 
     def get(name):
         return env[name]
 
+    def note(role, values):
+        m = float(np.abs(values).max()) if np.size(values) else 0.0
+        # Always insert: a role whose values are all zero still needs a shift in the
+        # table, or `gen_spec` rejects the table as a typo on the next round.
+        stats[role] = max(stats.get(role, 0.0), m)
+
     for op in spec["ops"]:
         kind = op["op"]
+        role = op_role(op)
         if kind == "embed":
             t = weights[op["weight"]]  # [V, hidden]
             env[op["output"]] = t[window].astype(np.int64)
@@ -138,7 +181,8 @@ def run(spec, weights, window, output_pos=None) -> dict:
             # float64 matmul is BLAS-fast and exact: products/accumulations stay
             # far below 2^53, so the float64 result is the exact integer sum.
             acc = x.astype(np.float64) @ w.astype(np.float64).T
-            env[op["output"]] = round_half_away(acc / (1 << op["shift"])).astype(np.int64)
+            note(role, acc)
+            env[op["output"]] = rq(round_half_away(acc).astype(np.int64), int(op["shift"]))
         elif kind == "rope":
             v = get(op["input"]).astype(np.int64)  # [L, H, d] (or [L, d])
             L, d = v.shape[0], v.shape[-1]
@@ -165,8 +209,15 @@ def run(spec, weights, window, output_pos=None) -> dict:
             q = get(op["q"])  # [L, H, d]
             k = get(op["k"])
             dot = np.einsum("lhd,thd->lht", q.astype(np.float64), k.astype(np.float64))
-            inv_q = round_half_away_scalar((1 << RECIP_Q) / op["scale"])
-            env[op["output"]] = requant(dot.astype(np.int64) * inv_q, RECIP_Q)
+            shift = int(op.get("shift", RECIP_Q))
+            inv_q = round_half_away_scalar((1 << shift) / op["scale"])
+            prod = np.round(dot).astype(np.int64) * inv_q
+            note(role, prod)
+            m = float(np.abs(dot).max()) if dot.size else 1.0
+            safe = math.floor(math.log2((1 << 29) * op["scale"] / max(m, 1.0)))
+            safe = max(1, min(RECIP_Q, safe))
+            stats[role] = min(stats.get(role, RECIP_Q), safe)
+            env[op["output"]] = rq(prod, shift)
         elif kind == "causal_softmax":
             s = get(op["input"]).astype(np.int64)  # [L, H, L]
             L = s.shape[0]
@@ -188,15 +239,22 @@ def run(spec, weights, window, output_pos=None) -> dict:
             w = get(op["weights"]).astype(np.int64)  # [L, H, L]
             v = get(op["v"]).astype(np.int64)  # [L, H, d]
             # out[l,h,j] = sum_t w[l,h,t] v[t,h,j]
-            env[op["output"]] = requant(np.einsum("lht,thd->lhd", w, v), 15)
+            acc = np.einsum("lht,thd->lhd", w, v)
+            note(role, acc)
+            env[op["output"]] = requant(acc, 15)
         elif kind == "silu":
             env[op["output"]] = silu(get(op["input"]))
         elif kind == "mul":
-            env[op["output"]] = (get(op["a"]) * get(op["b"])).astype(np.int64)
+            prod = (get(op["a"]) * get(op["b"])).astype(np.int64)
+            assert "shift" in op, "calibrate the spec first: `mul` needs a shift"
+            note(role, prod)
+            env[op["output"]] = rq(prod, int(op["shift"] or 0))
         elif kind == "add":
-            env[op["output"]] = get(op["inputs"][0]).copy()
+            tot = get(op["inputs"][0]).copy()
             for rest in op["inputs"][1:]:
-                env[op["output"]] = env[op["output"]] + get(rest)
+                tot = tot + get(rest)
+            note(role, tot)
+            env[op["output"]] = rq(tot, int(op.get("shift") or 0))
         elif kind == "top_k":
             s = get(op["input"])  # [..., E]
             E = s.shape[-1]

@@ -34,6 +34,8 @@ pub struct Plan {
     /// Each cell's logical extents, as the model states them. A planned cell is
     /// stored flat, so the extent is not recoverable from the table height.
     logical: HashMap<String, (usize, usize)>,
+    /// `(cell, max |value|)` for cells that do not fit `FLASHPROVE_CHECK_BITS`.
+    over: Vec<(String, u64)>,
 }
 
 impl Plan {
@@ -49,10 +51,24 @@ impl Plan {
             // Flat table, logical extents kept in the metadata.
             sc.cell_logical(&c.name, c.rows, c.cols, c.values.clone());
         }
-        Self {
+        let mut this = Self {
             sc,
             trace: map,
             logical,
+            over: Vec::new(),
+        };
+        for c in trace {
+            this.note_bound(&c.name, &c.values);
+        }
+        this
+    }
+
+    /// Record a cell that would not fit the checked field width.
+    fn note_bound(&mut self, name: &str, values: &[i64]) {
+        if let Some(bits) = check_bits() {
+            if let Some((n, max)) = bound_violation(name, values, bits) {
+                self.over.push((n.to_string(), max));
+            }
         }
     }
 
@@ -68,6 +84,7 @@ impl Plan {
 
     /// Add a derived cell. First-writer-wins by name.
     pub fn add(&mut self, name: &str, rows: usize, cols: usize, values: Vec<i64>) -> usize {
+        self.note_bound(name, &values);
         // Register in both maps too, so `values()` and `logical()` read it back.
         self.trace
             .entry(name.to_string())
@@ -84,6 +101,7 @@ impl Plan {
     /// `cols`-wide table has only `log2(rows)` variables, while a flat cell has
     /// `log2(rows·cols)`.
     pub fn add_logical(&mut self, name: &str, rows: usize, cols: usize, values: Vec<i64>) -> usize {
+        self.note_bound(name, &values);
         self.trace
             .entry(name.to_string())
             .or_insert_with(|| values.clone());
@@ -93,6 +111,27 @@ impl Plan {
 
     /// Seal the whole plan into one segment.
     pub fn seal(self, params: Params) -> CellSegment {
+        if let Some(bits) = check_bits() {
+            let mut over = self.over.clone();
+            over.sort_by(|a, b| b.1.cmp(&a.1));
+            if over.is_empty() {
+                eprintln!("  field check ({bits} bits): every committed value fits");
+            } else {
+                eprintln!(
+                    "  field check ({bits} bits): {} of {} cells do not fit; worst:",
+                    over.len(),
+                    self.sc.len()
+                );
+                for (name, max) in over.iter().take(12) {
+                    eprintln!(
+                        "    {:<44} max |v| = {:>14} (2^{:.1})",
+                        name,
+                        max,
+                        (*max as f64).log2()
+                    );
+                }
+            }
+        }
         self.sc.seal(params)
     }
 
@@ -129,13 +168,14 @@ impl Plan {
         m.resize(ft_d, Fp::ONE);
         let mut ft = table.clone();
         ft.resize(ft_d, Fp::ONE);
+        let ft_inv = crate::backend::batch_invert(&table);
         let mut diff_t: Vec<Fp> = counts
             .iter()
-            .zip(&table)
-            .map(|(&c, &t)| Fp::new(c as u64) * t.inverse())
+            .zip(&ft_inv)
+            .map(|(&c, &t)| Fp::new(c as u64) * t)
             .collect();
         diff_t.resize(ft_d, Fp::ONE);
-        let diff_q: Vec<Fp> = all.iter().map(|&v| v.inverse()).collect();
+        let diff_q: Vec<Fp> = crate::backend::batch_invert(&all);
 
         self.sc.cell_fp(&format!("{prefix}.all"), all_d, 1, all);
         self.sc.cell_fp(&format!("{prefix}.dq"), all_d, 1, diff_q);
@@ -211,6 +251,35 @@ impl Plan {
             bits,
             digits: digits_d,
         }
+    }
+}
+
+/// With `FLASHPROVE_CHECK_BITS=k` set, every committed integer is checked against a
+/// `k`-bit field: signed values must satisfy `|v| < 2^(k-1)`, or the field element that
+/// represents them would differ from the integer the model computed.
+///
+/// This is the instrument for a field migration: it names the exact cells/ops that have to
+/// be re-quantised (or limb-split) before the field can shrink.
+pub fn check_bits() -> Option<u32> {
+    std::env::var("FLASHPROVE_CHECK_BITS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+}
+
+/// Report `(name, max |v|)` when a cell does not fit a `bits`-bit signed representation.
+pub fn bound_violation<'a>(name: &'a str, values: &[i64], bits: u32) -> Option<(&'a str, u64)> {
+    let limit = 1i128 << (bits - 1);
+    let mut max = 0i128;
+    for &v in values {
+        let a = (v as i128).abs();
+        if a > max {
+            max = a;
+        }
+    }
+    if max >= limit {
+        Some((name, max as u64))
+    } else {
+        None
     }
 }
 

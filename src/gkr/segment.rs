@@ -1031,6 +1031,8 @@ pub fn claim_matmul_weight(
         }
     };
     assert_eq!(wv.len(), 1 << (ln + lm), "W dimensions");
+    // CPU: measured ~4 ns per multiply-add here, and the GPU formulation (one thread
+    // per column, a 2^ln-long serial chain) is no faster — see `backend::contract`.
     let mut p = vec![Ext::ZERO; 1 << lm];
     for (n, rn) in (0..(1usize << ln))
         .map(|n| (n, crate::field::eq(&r, n)))

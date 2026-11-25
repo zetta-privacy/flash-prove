@@ -39,8 +39,22 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum SegmentOpProof {
     Add(AddSegmentProof),
+    /// A shifted `add`: the raw sum `y = Σ inputs` plus `out = requant(y, shift)`.
+    AddRq {
+        out: usize,
+        y: usize,
+        add: AddSegmentProof,
+        rq: RequantSegmentProof,
+    },
     Mul(MulSegmentProof),
     Reshape(ReshapeSegmentProof),
+    /// A shifted `mul`: the raw product `y = a·b` plus `out = requant(y, shift)`.
+    MulRq {
+        out: usize,
+        y: usize,
+        mul: crate::gkr::segment::MulSegmentProof,
+        rq: RequantSegmentProof,
+    },
     /// `y = W·x` plus the requant that produces the trace's output cell.
     Matmul {
         mm: MatmulWeightProof,
@@ -133,12 +147,12 @@ fn op_name(op: &Op) -> &'static str {
 /// Every cell name an op reads or writes.
 fn op_cells(op: &Op) -> Vec<&str> {
     match op {
-        Op::Add { inputs, output } => inputs
+        Op::Add { inputs, output, .. } => inputs
             .iter()
             .map(|s| s.as_str())
             .chain([output.as_str()])
             .collect(),
-        Op::Mul { a, b, output } => vec![a, b, output],
+        Op::Mul { a, b, output, .. } => vec![a, b, output],
         Op::Reshape { input, output, .. } => vec![input, output],
         _ => Vec::new(),
     }
@@ -171,14 +185,14 @@ pub fn prove_segment(
     let mut proofs = Vec::with_capacity(ops.len());
     for op in ops {
         match op {
-            Op::Add { inputs, output } => {
+            Op::Add { inputs, output, .. } => {
                 let ins: Vec<usize> = inputs.iter().map(|n| seg.id(n)).collect();
                 let out_id = seg.id(output);
                 proofs.push(SegmentOpProof::Add(claim_add(
                     &mut seg, out_id, &ins, &mut tr,
                 )));
             }
-            Op::Mul { a, b, output } => {
+            Op::Mul { a, b, output, .. } => {
                 let ids = (seg.id(a), seg.id(b), seg.id(output));
                 proofs.push(SegmentOpProof::Mul(claim_mul(&mut seg, ids, &mut tr)));
             }
@@ -265,7 +279,7 @@ pub fn verify_segment(ops: &[Op], out: &SegmentOutput) -> bool {
 
     for (op, proof) in ops.iter().zip(&out.ops) {
         match (op, proof) {
-            (Op::Add { inputs, output }, SegmentOpProof::Add(p)) => {
+            (Op::Add { inputs, output, .. }, SegmentOpProof::Add(p)) => {
                 let Some(out_id) = id(output) else {
                     return false;
                 };
@@ -283,7 +297,7 @@ pub fn verify_segment(ops: &[Op], out: &SegmentOutput) -> bool {
                     return false;
                 }
             }
-            (Op::Mul { a, b, output }, SegmentOpProof::Mul(p)) => {
+            (Op::Mul { a, b, output, .. }, SegmentOpProof::Mul(p)) => {
                 let (Some(ca), Some(cb), Some(cc)) = (id(a), id(b), id(output)) else {
                     return false;
                 };
@@ -375,7 +389,7 @@ impl Shapes {
             | Op::Silu { input, output, .. }
             | Op::CausalSoftmax { input, output } => self.copy_from(input, output),
             Op::Mul { a, output, .. } => self.copy_from(a, output),
-            Op::Add { inputs, output } => {
+            Op::Add { inputs, output, .. } => {
                 let first = inputs
                     .first()
                     .ok_or_else(|| DriverError::Unsupported("add with no inputs"))?;
@@ -472,7 +486,10 @@ impl WeightSet {
                 .ok_or_else(|| DriverError::UnknownCell(name.to_string()))?;
             let t0 = std::time::Instant::now();
             let prov = weight_prover(w, self.params);
-            eprintln!("  weight {name} committed in {:.1}s", t0.elapsed().as_secs_f64());
+            eprintln!(
+                "  weight {name} committed in {:.1}s",
+                t0.elapsed().as_secs_f64()
+            );
             self.provers.insert(name.to_string(), prov);
         }
         Ok(self.provers.get_mut(name).expect("just inserted"))
@@ -891,9 +908,64 @@ pub fn prove_segment_full(
         }
         match op {
             // Cell-to-cell linear ops: no derived cells, claimed directly.
-            Op::Add { .. } | Op::Mul { .. } | Op::Reshape { .. } => {
+            Op::Add { shift: None, .. } | Op::Reshape { .. } => {
                 planned.push(Some(PlannedOp::Plain))
             }
+            // A shifted `add` also rescales: plan the raw sum and its requant.
+            Op::Add {
+                inputs,
+                output,
+                shift: Some(k),
+            } => {
+                if *k == 0 {
+                    return Err(DriverError::Unsupported("add shift 0"));
+                }
+                let (rows, cols) = plan
+                    .logical(output)
+                    .ok_or_else(|| DriverError::UnknownCell(output.clone()))?;
+                let n = rows * cols;
+                let mut sum = vec![0i64; n];
+                for name in inputs {
+                    let v = plan.values(name);
+                    assert_eq!(v.len(), n, "add operands must match");
+                    for (s, x) in sum.iter_mut().zip(v) {
+                        *s += x;
+                    }
+                }
+                let y_name = format!("__add.{i}.y");
+                plan.add_logical(&y_name, rows, cols, sum);
+                let rq = plan.requant(
+                    &format!("__add.{i}.rq"),
+                    &y_name,
+                    output,
+                    *k as usize,
+                    digits,
+                );
+                planned.push(Some(PlannedOp::AddRq(rq)));
+            }
+            // A shifted `mul` also rescales: plan the raw product and its requant.
+            Op::Mul {
+                a,
+                b,
+                output,
+                shift: Some(k),
+            } => {
+                let av = plan.values(a).to_vec();
+                let bv = plan.values(b).to_vec();
+                assert_eq!(av.len(), bv.len(), "mul operands must match");
+                let prod: Vec<i64> = av.iter().zip(&bv).map(|(&x, &y)| x * y).collect();
+                let y_name = format!("__mul.{i}.y");
+                plan.add(&y_name, prod.len(), 1, prod);
+                let rq = plan.requant(
+                    &format!("__mul.{i}.rq"),
+                    &y_name,
+                    output,
+                    *k as usize,
+                    digits,
+                );
+                planned.push(Some(PlannedOp::MulRq(rq)));
+            }
+            Op::Mul { shift: None, .. } => planned.push(Some(PlannedOp::Plain)),
             Op::Silu { input, output } => {
                 let table = bounds.silu_table(alpha, beta);
                 planned.push(Some(PlannedOp::Silu(plan.lookup2(
@@ -959,6 +1031,7 @@ pub fn prove_segment_full(
                 k,
                 output,
                 scale,
+                shift,
             } => {
                 let (h, d) = (dims.heads, dims.head_dim);
                 let Some((lq, hd)) = plan.logical(q) else {
@@ -967,7 +1040,9 @@ pub fn prove_segment_full(
                 if hd != h * d {
                     return Err(DriverError::UnknownCell(q.clone()));
                 }
-                let inv_q = ((1i64 << crate::model::spec::RECIP_Q) as f64 / *scale).round() as i64;
+                let q_shift = shift.unwrap_or(crate::model::spec::RECIP_Q);
+                let inv_q = ((1i64 << q_shift) as f64 / *scale).round() as i64;
+
                 let qs = plan.values(q).to_vec();
                 let ks = plan.values(k).to_vec();
                 // One cell set per head covering **every** query position: the head's
@@ -987,7 +1062,7 @@ pub fn prove_segment_full(
                     let y: Vec<i64> = dot.iter().map(|&v| v * inv_q).collect();
                     let sr: Vec<i64> = y
                         .iter()
-                        .map(|&v| crate::model::spec::requant(v, crate::model::spec::RECIP_Q))
+                        .map(|&v| crate::model::spec::requant(v, q_shift))
                         .collect();
                     let pre = format!("__sc.{i}.{hi}");
                     plan.add(&format!("{pre}.dot"), lq * lq, 1, dot);
@@ -997,7 +1072,7 @@ pub fn prove_segment_full(
                         &format!("{pre}.rq"),
                         &format!("{pre}.y"),
                         &format!("{pre}.s"),
-                        crate::model::spec::RECIP_Q as usize,
+                        q_shift as usize,
                         digits,
                     );
                     per_head.push(ScoresPlan {
@@ -1257,11 +1332,13 @@ pub fn prove_segment_full(
                 let pre = format!("__rope.{i}");
                 let rot_name = format!("{pre}.rot");
                 plan.add(&rot_name, rows * d, 1, rot);
+                // The rotation's cos/sin tables are Q15 (`* 32768`), so the requant
+                // shift is 15 — the same on both sides (see `python/run_integer.py`).
                 let requant = plan.requant(
                     &format!("{pre}.rq"),
                     &rot_name,
                     output,
-                    crate::model::spec::RECIP_Q as usize,
+                    crate::gkr::nonlinear::ROPE_Q,
                     digits,
                 );
                 planned.push(Some(PlannedOp::Rope(RopePlan {
@@ -1323,19 +1400,98 @@ pub fn prove_segment_full(
     // Pass 2: claim, in spec order.
     let t_ops = std::time::Instant::now();
     for (i, op) in ops.iter().enumerate() {
-        eprintln!("  op {}/{}: {}  [t={:.1}s]", i, ops.len(), op_name(op), t_ops.elapsed().as_secs_f64());
+        eprintln!(
+            "  op {}/{}: {}  [t={:.1}s]",
+            i,
+            ops.len(),
+            op_name(op),
+            t_ops.elapsed().as_secs_f64()
+        );
         let names = planned[i].take().expect("planned in pass 1");
         match (op, names) {
-            (Op::Add { inputs, output }, PlannedOp::Plain) => {
+            (
+                Op::Add {
+                    inputs,
+                    output,
+                    shift: None,
+                    ..
+                },
+                PlannedOp::Plain,
+            ) => {
                 let ins: Vec<usize> = inputs.iter().map(|n| seg.id(n)).collect();
                 let out_id = seg.id(output);
                 proofs.push(SegmentOpProof::Add(claim_add(
                     &mut seg, out_id, &ins, &mut tr,
                 )));
             }
-            (Op::Mul { a, b, output }, PlannedOp::Plain) => {
+            (
+                Op::Add {
+                    inputs,
+                    output,
+                    shift: Some(k),
+                },
+                PlannedOp::AddRq(rq),
+            ) => {
+                let ins: Vec<usize> = inputs.iter().map(|n| seg.id(n)).collect();
+                let out_id = seg.id(output);
+                let y_id = seg.id(&format!("__add.{i}.y"));
+                let add = claim_add(&mut seg, y_id, &ins, &mut tr);
+                let rq_cells = rq.cells(&seg);
+                let y_meta = seg.cells_meta(y_id);
+                let n = y_meta.logical_rows * y_meta.logical_cols;
+                let rq = crate::gkr::requant::claim_requant(
+                    &mut seg,
+                    rq_cells,
+                    (n, *k as usize, rq.dbytes),
+                    &mut tr,
+                );
+                proofs.push(SegmentOpProof::AddRq {
+                    out: out_id,
+                    y: y_id,
+                    add,
+                    rq,
+                });
+            }
+
+            (
+                Op::Mul {
+                    a,
+                    b,
+                    output,
+                    shift: None,
+                },
+                PlannedOp::Plain,
+            ) => {
                 let ids = (seg.id(a), seg.id(b), seg.id(output));
                 proofs.push(SegmentOpProof::Mul(claim_mul(&mut seg, ids, &mut tr)));
+            }
+            (
+                Op::Mul {
+                    a,
+                    b,
+                    output,
+                    shift: Some(k),
+                },
+                PlannedOp::MulRq(rq),
+            ) => {
+                let (ia, ib, io) = (seg.id(a), seg.id(b), seg.id(output));
+                let y_id = seg.id(&format!("__mul.{i}.y"));
+                let mul = claim_mul(&mut seg, (ia, ib, y_id), &mut tr);
+                let rq_cells = rq.cells(&seg);
+                let y_meta = seg.cells_meta(y_id);
+                let n = y_meta.logical_rows * y_meta.logical_cols;
+                let rq = crate::gkr::requant::claim_requant(
+                    &mut seg,
+                    rq_cells,
+                    (n, *k as usize, rq.dbytes),
+                    &mut tr,
+                );
+                proofs.push(SegmentOpProof::MulRq {
+                    out: io,
+                    y: y_id,
+                    mul,
+                    rq,
+                });
             }
             (Op::Reshape { input, output, .. }, PlannedOp::Plain) => {
                 let (ci, co) = (seg.id(input), seg.id(output));
@@ -1478,7 +1634,11 @@ pub fn prove_segment_full(
                         &mut seg,
                         cells,
                         (row, hidden),
-                        (hidden, crate::model::spec::RECIP_Q as usize, rqs[row].dbytes),
+                        (
+                            hidden,
+                            crate::model::spec::RECIP_Q as usize,
+                            rqs[row].dbytes,
+                        ),
                         (rec_q, eps),
                         &gamma_pub,
                         &mut tr,
@@ -1516,7 +1676,17 @@ pub fn prove_segment_full(
                 }
                 proofs.push(SegmentOpProof::WeightedV(out));
             }
-            (Op::Scores { q, k, output, .. }, PlannedOp::Scores(per_head)) => {
+            (
+                Op::Scores {
+                    q,
+                    k,
+                    output,
+                    shift,
+                    ..
+                },
+                PlannedOp::Scores(per_head),
+            ) => {
+                let q_shift = shift.unwrap_or(crate::model::spec::RECIP_Q);
                 let (cq, ck, co) = (seg.id(q), seg.id(k), seg.id(output));
                 let (h, d) = (dims.heads, dims.head_dim);
                 let lq = seg.cells_meta(cq).logical_rows;
@@ -1542,7 +1712,7 @@ pub fn prove_segment_full(
                         (log_l, log_d, log_h),
                         hp.hi,
                         Fp::new(hp.inv_q as u64),
-                        (lq * lq, crate::model::spec::RECIP_Q as usize, hp.requant.dbytes),
+                        (lq * lq, q_shift as usize, hp.requant.dbytes),
                         &mut tr,
                     ));
                 }
@@ -1579,7 +1749,11 @@ pub fn prove_segment_full(
                         cells,
                         (row, n, l),
                         (pc.m, bounds.exp_lo, pc.tstar),
-                        (rec_q, crate::model::spec::RECIP_Q as usize, pc.requant.dbytes),
+                        (
+                            rec_q,
+                            crate::model::spec::RECIP_Q as usize,
+                            pc.requant.dbytes,
+                        ),
                         &mut tr,
                     ));
                 }
@@ -1674,7 +1848,7 @@ pub fn prove_segment_full(
                     ci,
                     (rows, dims.heads, d),
                     *theta,
-                    (crate::model::spec::RECIP_Q as usize, rp.requant.dbytes),
+                    (crate::gkr::nonlinear::ROPE_Q, rp.requant.dbytes),
                     &mut tr,
                 )));
             }
@@ -1773,6 +1947,7 @@ enum PlannedOp {
         rq: crate::gkr::plan::RequantNames,
     },
     WeightedSum,
+    AddRq(crate::gkr::plan::RequantNames),
     /// Per-row requant names.
     Norm(Vec<crate::gkr::plan::RequantNames>),
     /// Per-row softmax names.
@@ -1790,6 +1965,8 @@ enum PlannedOp {
     TopK(TopKPlan),
     Rope(RopePlan),
     Embed,
+    /// A shifted `mul`: the raw product plus its requant.
+    MulRq(crate::gkr::plan::RequantNames),
     /// No derived cells: the op is claimed directly from its trace cells.
     Plain,
 }
@@ -1946,6 +2123,163 @@ pub fn verify_segment_with_head(
                     return false;
                 }
             }
+            (Op::Add { inputs, output, .. }, SegmentOpProof::Add(p)) => {
+                let Some(out_id) = bundle.segment.commitment.cell(output) else {
+                    return false;
+                };
+                let mut want: Vec<usize> = Vec::with_capacity(inputs.len());
+                for n in inputs {
+                    match bundle.segment.commitment.cell(n) {
+                        Some(i) => want.push(i),
+                        None => return false,
+                    }
+                }
+                if p.out != out_id || p.inputs.iter().map(|t| t.0).ne(want.iter().copied()) {
+                    return false;
+                }
+                if !crate::gkr::segment::verify_add(
+                    &bundle.segment.commitment,
+                    &bundle.segment.claims,
+                    p,
+                    &mut tr,
+                ) {
+                    return false;
+                }
+            }
+            (
+                Op::Add {
+                    inputs,
+                    output,
+                    shift: Some(k),
+                },
+                SegmentOpProof::AddRq { out: o, y, add, rq },
+            ) => {
+                let Some(cc) = bundle.segment.commitment.cell(output) else {
+                    return false;
+                };
+                let mut want: Vec<usize> = Vec::with_capacity(inputs.len());
+                for n in inputs {
+                    match bundle.segment.commitment.cell(n) {
+                        Some(i) => want.push(i),
+                        None => return false,
+                    }
+                }
+                if *o != cc
+                    || add.out != *y
+                    || add.inputs.iter().map(|t| t.0).ne(want.iter().copied())
+                {
+                    return false;
+                }
+                if !crate::gkr::segment::verify_add(
+                    &bundle.segment.commitment,
+                    &bundle.segment.claims,
+                    add,
+                    &mut tr,
+                ) {
+                    return false;
+                }
+                let Some(ym) = bundle.segment.commitment.cells.get(*y) else {
+                    return false;
+                };
+                let n = ym.logical_rows * ym.logical_cols;
+                if !crate::gkr::requant::verify_requant(
+                    &bundle.segment.commitment,
+                    &bundle.segment.claims,
+                    rq,
+                    (n, *k as usize, digits),
+                    &mut tr,
+                ) {
+                    return false;
+                }
+            }
+            (
+                Op::Mul {
+                    a,
+                    b,
+                    output,
+                    shift: None,
+                },
+                SegmentOpProof::Mul(p),
+            ) => {
+                let (Some(ca), Some(cb), Some(cc)) = (
+                    bundle.segment.commitment.cell(a),
+                    bundle.segment.commitment.cell(b),
+                    bundle.segment.commitment.cell(output),
+                ) else {
+                    return false;
+                };
+                if (p.a, p.b, p.c) != (ca, cb, Some(cc)) {
+                    return false;
+                }
+                if !crate::gkr::segment::verify_mul(
+                    &bundle.segment.commitment,
+                    &bundle.segment.claims,
+                    p,
+                    &mut tr,
+                ) {
+                    return false;
+                }
+            }
+            (
+                Op::Mul {
+                    a,
+                    b,
+                    output,
+                    shift: Some(k),
+                },
+                SegmentOpProof::MulRq { out: o, y, mul, rq },
+            ) => {
+                let (Some(ca), Some(cb), Some(cc)) = (
+                    bundle.segment.commitment.cell(a),
+                    bundle.segment.commitment.cell(b),
+                    bundle.segment.commitment.cell(output),
+                ) else {
+                    return false;
+                };
+                if *o != cc || (mul.a, mul.b, mul.c) != (ca, cb, Some(*y)) {
+                    return false;
+                }
+                if !crate::gkr::segment::verify_mul(
+                    &bundle.segment.commitment,
+                    &bundle.segment.claims,
+                    mul,
+                    &mut tr,
+                ) {
+                    return false;
+                }
+                let Some(ym) = bundle.segment.commitment.cells.get(*y) else {
+                    return false;
+                };
+                let n = ym.logical_rows * ym.logical_cols;
+                if !crate::gkr::requant::verify_requant(
+                    &bundle.segment.commitment,
+                    &bundle.segment.claims,
+                    rq,
+                    (n, *k as usize, digits),
+                    &mut tr,
+                ) {
+                    return false;
+                }
+            }
+            (Op::Reshape { input, output, .. }, SegmentOpProof::Reshape(p)) => {
+                let (Some(ci), Some(co)) = (
+                    bundle.segment.commitment.cell(input),
+                    bundle.segment.commitment.cell(output),
+                ) else {
+                    return false;
+                };
+                if (p.input, p.output) != (ci, co) {
+                    return false;
+                }
+                if !crate::gkr::segment::verify_reshape(
+                    &bundle.segment.commitment,
+                    &bundle.segment.claims,
+                    p,
+                    &mut tr,
+                ) {
+                    return false;
+                }
+            }
             (
                 Op::WeightedSum {
                     choice,
@@ -2071,7 +2405,18 @@ pub fn verify_segment_with_head(
                     }
                 }
             }
-            (Op::Scores { q, k, output, .. }, SegmentOpProof::Scores(per_head)) => {
+            (
+                Op::Scores {
+                    q,
+                    k,
+                    output,
+                    scale,
+                    shift,
+                },
+                SegmentOpProof::Scores(per_head),
+            ) => {
+                let q_shift = shift.unwrap_or(crate::model::spec::RECIP_Q);
+                let want_inv_q = Fp::new(((1i64 << q_shift) as f64 / *scale).round() as u64);
                 let (Some(cq), Some(ck), Some(co)) = (
                     bundle.segment.commitment.cell(q),
                     bundle.segment.commitment.cell(k),
@@ -2091,7 +2436,12 @@ pub fn verify_segment_with_head(
                 }
                 for (hi, hp) in per_head.iter().enumerate() {
                     let c = &hp.cells;
-                    if c.q != cq || c.k != ck || c.out != co || hp.head != hi {
+                    if c.q != cq
+                        || c.k != ck
+                        || c.out != co
+                        || hp.head != hi
+                        || hp.inv_q != want_inv_q
+                    {
                         return false;
                     }
                     if !crate::gkr::attention::verify_scores(
@@ -2101,7 +2451,7 @@ pub fn verify_segment_with_head(
                         (log_l, log_d, log_h),
                         hi,
                         hp.inv_q,
-                        (lq * lq, crate::model::spec::RECIP_Q as usize, digits),
+                        (lq * lq, q_shift as usize, digits),
                         &mut tr,
                     ) {
                         return false;
@@ -2271,7 +2621,7 @@ pub fn verify_segment_with_head(
                     rp,
                     (rows, dims.heads, d),
                     *theta,
-                    (crate::model::spec::RECIP_Q as usize, digits),
+                    (crate::gkr::nonlinear::ROPE_Q, digits),
                     &mut tr,
                 ) {
                     return false;
@@ -2481,11 +2831,13 @@ mod tests {
             Op::Add {
                 inputs: vec!["a".into(), "b".into(), "c".into()],
                 output: "out".into(),
+                shift: None,
             },
             Op::Mul {
                 a: "a".into(),
                 b: "b".into(),
                 output: "prod".into(),
+                shift: None,
             },
             Op::Reshape {
                 input: "prod".into(),
@@ -2529,6 +2881,7 @@ mod tests {
             a: "a".into(),
             b: "nope".into(),
             output: "prod".into(),
+            shift: None,
         }];
         assert!(matches!(
             prove_segment(&dangling, &cells, Params::default()),
@@ -2601,6 +2954,7 @@ mod tests {
                 a: "nope".into(),
                 b: "s".into(),
                 output: "m".into(),
+                shift: None,
             }),
             Err(DriverError::UnknownCell(_))
         ));
@@ -2955,10 +3309,12 @@ mod tests {
                 a: "x".into(),
                 b: "x".into(),
                 output: "p".into(),
+                shift: None,
             },
             Op::Add {
                 inputs: vec!["p".into(), "p".into()],
                 output: "q".into(),
+                shift: None,
             },
         ];
         let spec = ModelSpec {
@@ -3545,6 +3901,7 @@ mod tests {
             k: "k".into(),
             output: "out".into(),
             scale: 1.0,
+            shift: Some(rq),
         }];
         let bundle = prove_segment_with_weights(
             &ops,
@@ -3797,7 +4154,7 @@ mod tests {
         let rot = crate::gkr::nonlinear::rotate(&inp, rows, h, d, theta);
         let out: Vec<i64> = rot
             .iter()
-            .map(|&v| crate::model::spec::requant(v, crate::model::spec::RECIP_Q))
+            .map(|&v| crate::model::spec::requant(v, crate::gkr::nonlinear::ROPE_Q as u32))
             .collect();
         let bounds = base_bounds();
 

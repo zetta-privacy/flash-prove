@@ -6,6 +6,16 @@ fn main() {
     #[cfg(target_os = "macos")]
     {
         let x: Vec<u64> = (0..1024u64).map(|i| i * 3 + 1).collect();
+        println!("--- device limits ---");
+        {
+            use metal::Device;
+            let d = Device::system_default().unwrap();
+            println!(
+                "max_threadgroup_memory = {} bytes, max_threads_per_group = {}",
+                d.max_threadgroup_memory_length(),
+                d.max_threads_per_threadgroup().width
+            );
+        }
         println!("--- bisect ---");
         for (name, report) in flashprove::backend::metal::bisect() {
             println!("{name:<16} {report}");

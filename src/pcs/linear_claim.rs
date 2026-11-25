@@ -125,6 +125,13 @@ pub fn prove(v: &[Fp], h: &LinearH, tr: &mut Transcript) -> (LinearClaimProof, V
     let mut vf: Vec<Ext> = v.iter().map(|&x| Ext::from(x)).collect();
     let b: Ext = hf.iter().zip(&vf).map(|(&a, &c)| a * c).sum();
 
+    // GPU path: both operands stay resident on the device for the whole claim, so the
+    // only traffic is one upload and one download. `None` (GPU off / too small) falls
+    // through to the loop below, which produces exactly the same transcript.
+    if let Some((rounds, z)) = crate::backend::linear_sumcheck(&hf, &vf, tr) {
+        return (LinearClaimProof { rounds }, z, b);
+    }
+
     let mut rounds = Vec::with_capacity(m);
     let mut z = Vec::with_capacity(m);
     for _ in 0..m {

@@ -271,6 +271,11 @@ fn replay(
 }
 
 /// `R·inp` for every row; the row's angle comes from `pos = row` and `theta`.
+/// Fixed-point scale of the RoPE cos/sin tables (`* 32768`), and therefore the
+/// requant shift of `rope`'s output. Independent of [`crate::model::spec::RECIP_Q`],
+/// which scales the reciprocals of norm/scores/softmax.
+pub const ROPE_Q: usize = 15;
+
 pub fn rotate(inp: &[i64], rows: usize, heads: usize, d: usize, theta: f64) -> Vec<i64> {
     let mut rot = vec![0i64; rows * d];
     for r in 0..rows {

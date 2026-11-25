@@ -25,7 +25,7 @@ struct Args {
     #[arg(long, default_value_t = 6)]
     digits: usize,
     /// Softmax/reciprocal fixed-point exponent (must match the proof).
-    #[arg(long, default_value_t = 24)]
+    #[arg(long, default_value_t = flashprove::model::spec::RECIP_Q)]
     rec_q: u32,
     /// `eps` for the RMSNorm denominator (must match the proof).
     #[arg(long, default_value_t = 1e-6)]

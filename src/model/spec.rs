@@ -11,16 +11,15 @@ pub fn requant(x: i64, k: u32) -> i64 {
 }
 
 /// Fixed-point bits for the quantized reciprocal (`1/scale`, `1/√(·+eps)`). Chosen
-/// so every input `|x| < 2^RECIP_Q` (the scores dot and norm `x·γ` stay well below
-/// this), making the integer `requant(x·inv_q, RECIP_Q)` bit-consistent with the
-/// f64 `round(x/divisor)`.
-pub const RECIP_Q: u32 = 24;
+/// so every input `|x| < 2^RECIP_Q` (the norm `x·γ` stays well below this), making
+/// the integer `requant(x·inv_q, RECIP_Q)` bit-consistent with the f64 `round(x/divisor)`.
+pub const RECIP_Q: u32 = 14;
 
 /// `round(x / scale)` — the attention-scores rounding, now a quantized reciprocal
 /// so it is a clean shift (arith: `requant(x · round(2^Q/scale), Q)`).
-pub fn round_div(x: i64, scale: f64) -> i64 {
-    let inv_q = ((1i64 << RECIP_Q) as f64 / scale).round() as i64;
-    requant(x * inv_q, RECIP_Q)
+pub fn round_div(x: i64, scale: f64, q: u32) -> i64 {
+    let inv_q = ((1i64 << q) as f64 / scale).round() as i64;
+    requant(x * inv_q, q)
 }
 
 pub fn silu(x: i64) -> i64 {
@@ -108,12 +107,14 @@ pub enum Op {
         output: String,
         shape: Vec<i64>,
     },
-    /// attention scores = q·k^T / scale (3-D).
+    /// attention scores = requant(q·k^T · round(2^shift / scale), shift) (3-D).
     Scores {
         q: String,
         k: String,
         output: String,
         scale: f64,
+        #[serde(default)]
+        shift: Option<u32>,
     },
     /// causal softmax over the last dim (3-D).
     CausalSoftmax { input: String, output: String },
@@ -125,14 +126,23 @@ pub enum Op {
     },
     /// SiLU lookup, elementwise.
     Silu { input: String, output: String },
-    /// elementwise multiply.
+    /// elementwise multiply; `shift` (if present) rescales it:
+    /// `out = requant(a·b, shift)`.
     Mul {
         a: String,
         b: String,
         output: String,
+        #[serde(default)]
+        shift: Option<u32>,
     },
-    /// elementwise add.
-    Add { inputs: Vec<String>, output: String },
+    /// elementwise add; `shift` (if present) rescales the sum:
+    /// `out = requant(Σ inputs, shift)`.
+    Add {
+        inputs: Vec<String>,
+        output: String,
+        #[serde(default)]
+        shift: Option<u32>,
+    },
     /// top-k on the last dim, choice is an indicator.
     TopK {
         input: String,

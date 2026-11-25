@@ -8,6 +8,8 @@ use p3_field::{PrimeCharacteristicRing, PrimeField64};
 use p3_goldilocks::Goldilocks;
 use std::time::Instant;
 
+use flashprove::backend::{batch_invert, batch_invert_naive};
+
 fn main() {
     for log_n in [18usize, 20, 22, 24] {
         let n = 1usize << log_n;
@@ -47,4 +49,27 @@ fn main() {
             reps *= 2;
         }
     }
+    // Inversions: `n` per-element inversions vs Montgomery's trick.
+    for log_n in [16usize, 18, 20] {
+        let n = 1usize << log_n;
+        let a: Vec<Goldilocks> = (1..=n as u64).map(|i| Goldilocks::new(i * 7919)).collect();
+
+        let t0 = Instant::now();
+        let naive = batch_invert_naive(&a);
+        let naive_ns = t0.elapsed().as_nanos() as f64;
+
+        let t0 = Instant::now();
+        let fast = batch_invert(&a);
+        let fast_ns = t0.elapsed().as_nanos() as f64;
+
+        assert_eq!(naive, fast, "batch invert mismatch");
+        println!(
+            "2^{:<2}  batch_invert  naive {:8.1} ns/elem   montgomery {:8.1} ns/elem   {:5.1}x",
+            log_n,
+            naive_ns / n as f64,
+            fast_ns / n as f64,
+            naive_ns / fast_ns
+        );
+    }
+
 }
