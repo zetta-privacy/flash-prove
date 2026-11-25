@@ -120,7 +120,7 @@ pub fn claim_norm_row(
     let gamma_public = claim_eq_public(seg, c.gamma, gamma_public, tr);
 
     // `y = inv_q · h` at one point.
-    let r: Vec<Fp> = (0..hidden).map(|_| tr.sample_val()).collect();
+    let (r, coins) = crate::pcs::linear_claim::sample_coins(hidden, tr);
     let h = LinearH::Dense(r.clone());
     let h_v = seg.claim_linear_view(c.h, &View::Whole, &h, tr);
     let y_v = seg.claim_linear_view(c.y, &View::Whole, &h, tr);
@@ -144,7 +144,7 @@ pub fn claim_norm_row(
         ss,
         mul,
         gamma_public,
-        r,
+        r: coins,
         xr_v,
         x_v,
         h_v,
@@ -196,8 +196,8 @@ pub fn verify_norm_row(
         return false;
     }
 
-    let r: Vec<Fp> = (0..hidden).map(|_| tr.sample_val()).collect();
-    if r != proof.r {
+    let (r, coins) = crate::pcs::linear_claim::sample_coins(hidden, tr);
+    if coins != proof.r {
         return false;
     }
     let h = LinearH::Dense(r.clone());
@@ -356,7 +356,7 @@ pub fn claim_rope(
     tr.observe_val(Fp::new(inp as u64));
     tr.observe_val(Fp::new(rot as u64));
 
-    let r: Vec<Fp> = (0..n).map(|_| tr.sample_val()).collect();
+    let (r, coins) = crate::pcs::linear_claim::sample_coins(n, tr);
     let rt = rotate_t(&r, rows, heads, d, theta);
     let b_rot = seg.claim_linear_id(rot, 0, &LinearH::Dense(r.clone()), tr);
     let b_inp = seg.claim_linear_id(inp, 0, &LinearH::Dense(rt), tr);
@@ -369,7 +369,7 @@ pub fn claim_rope(
         d,
         inp,
         rot,
-        r,
+        r: coins,
         b_rot,
         b_inp,
         requant,
@@ -388,14 +388,14 @@ pub fn verify_rope(
     tr: &mut Transcript,
 ) -> bool {
     let n = rows * d;
-    if proof.rows != rows || proof.heads != heads || proof.d != d || proof.r.len() != n {
+    if proof.rows != rows || proof.heads != heads || proof.d != d {
         return false;
     }
     tr.observe_val(Fp::new(proof.inp as u64));
     tr.observe_val(Fp::new(proof.rot as u64));
 
-    let r: Vec<Fp> = (0..n).map(|_| tr.sample_val()).collect();
-    if r != proof.r {
+    let (r, coins) = crate::pcs::linear_claim::sample_coins(n, tr);
+    if coins != proof.r {
         return false;
     }
     let rt = rotate_t(&r, rows, heads, d, theta);
@@ -514,7 +514,7 @@ pub fn claim_softmax_row(
         View::block(seg.cells_meta(c.nrm).m(), unit * n, log_n),
     );
 
-    let r: Vec<Fp> = (0..n).map(|_| tr.sample_val()).collect();
+    let (r, coins) = crate::pcs::linear_claim::sample_coins(n, tr);
     let hm: Vec<Fp> = (0..n)
         .map(|i| if i <= l { r[i] } else { Fp::new(0) })
         .collect();
@@ -549,8 +549,7 @@ pub fn claim_softmax_row(
     let b_e_mask = seg.claim_linear_view(c.e, &v_e, &mask, tr);
     let s = b_e_mask.0;
 
-    let r2: Vec<Fp> = (0..n).map(|_| tr.sample_val()).collect();
-    let h2 = LinearH::Dense(r2.clone());
+    let h2 = crate::pcs::linear_claim::sample(n, tr);
     let b_e = seg.claim_linear_view(c.e, &v_e, &h2, tr);
     let b_inv = seg.claim_linear_view(c.y, &v_y, &h2, tr);
     let b_nrm = seg.claim_linear_view(c.nrm, &v_nrm, &h2, tr);
@@ -563,8 +562,8 @@ pub fn claim_softmax_row(
         exp_lo,
         row_max,
         cells,
-        r,
-        r2,
+        r: coins,
+        r2: h2.coins().to_vec(),
         b_d,
         b_scores,
         b_e_mask,
@@ -617,8 +616,8 @@ pub fn verify_softmax_row(
         View::block(m_nrm, unit * n, log_n),
     );
 
-    let r: Vec<Fp> = (0..n).map(|_| tr.sample_val()).collect();
-    if r != proof.r {
+    let (r, coins) = crate::pcs::linear_claim::sample_coins(n, tr);
+    if coins != proof.r {
         return false;
     }
     let hm: Vec<Fp> = (0..n)
@@ -684,8 +683,8 @@ pub fn verify_softmax_row(
     }
     let inv_q = fp_i64(softmax_inv_q(s_int, rec_q));
 
-    let r2: Vec<Fp> = (0..n).map(|_| tr.sample_val()).collect();
-    if r2 != proof.r2 {
+    let (r2, coins2) = crate::pcs::linear_claim::sample_coins(n, tr);
+    if coins2 != proof.r2 {
         return false;
     }
     let h2 = LinearH::Dense(r2.clone());

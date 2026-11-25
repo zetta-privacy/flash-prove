@@ -57,6 +57,14 @@ pub enum LinearH {
     /// brute-force sum over the whole table (this is the LogUp balance/multiplicity
     /// functional, and the all-ones count in `row_max` and the head claim).
     Ones { len: usize },
+    /// The equality tensor built from `m` coins: entry `j` is
+    /// `Π_k (j_k ? coins[k] : 1 − coins[k])`, zero-padded to `len`.
+    ///
+    /// Its terminal evaluation is `Π_k ((1−c_k)(1−z_k) + c_k z_k)` — `O(m)`, with no
+    /// dependence on the table size. `len` may exceed `2^m` (a short vector padded up
+    /// to the cell's arity); the padding is zero, so the product form is still right
+    /// only when `len == 2^m`, and the padded case falls back to the fold.
+    Tensor { coins: Vec<Fp>, len: usize },
 }
 
 impl LinearH {
@@ -64,6 +72,18 @@ impl LinearH {
         match self {
             Self::Dense(h) => h.len(),
             Self::Block { len, .. } | Self::Sparse { len, .. } | Self::Ones { len } => *len,
+            Self::Tensor { len, .. } => *len,
+        }
+    }
+
+    /// The coins a `Tensor` functional is built from; empty for the other shapes.
+    ///
+    /// The proof carries these instead of the expanded vector: `m` field elements
+    /// instead of `2^m`.
+    pub fn coins(&self) -> &[Fp] {
+        match self {
+            Self::Tensor { coins, .. } => coins,
+            _ => &[],
         }
     }
 
@@ -97,6 +117,23 @@ impl LinearH {
                 out
             }
             Self::Ones { len } => vec![Fp::ONE; *len],
+            Self::Tensor { coins, len } => {
+                let mut v: Vec<Fp> = Vec::with_capacity(1usize << coins.len());
+                v.push(Fp::ONE);
+                // Highest coin first: the doubling loop puts the *current* coin on
+                // the lowest index bit, so this makes `coins[k]` select bit `k`.
+                for &a in coins.iter().rev() {
+                    let not_a = Fp::ONE - a;
+                    let mut next = Vec::with_capacity(v.len() * 2);
+                    for &x in &v {
+                        next.push(x * not_a);
+                        next.push(x * a);
+                    }
+                    v = next;
+                }
+                v.resize(*len, Fp::ZERO);
+                v
+            }
         }
     }
 
@@ -117,23 +154,85 @@ impl LinearH {
                 debug_assert!(len.is_power_of_two() && z.len() == len.trailing_zeros() as usize);
                 Ext::ONE
             }
+            Self::Tensor { coins, len } => {
+                if *len == 1usize << coins.len() && z.len() == coins.len() {
+                    coins
+                        .iter()
+                        .zip(z)
+                        .map(|(&c, &zk)| {
+                            (Ext::ONE - Ext::from(c)) * (Ext::ONE - zk) + Ext::from(c) * zk
+                        })
+                        .product()
+                } else {
+                    // Short vector padded with zeros: the product form does not apply.
+                    fold_eval(&self.dense(), z)
+                }
+            }
         }
     }
 }
 
 /// `Σ_j h_j·eq(z, j)` by folding one variable at a time: two extension-field
 /// multiplications per entry instead of `m`, so `O(2^m)` rather than `O(2^m·m)`.
+///
+/// `h` may be shorter than the cube (`h.len() = 2^b < 2^m`): the entries above it are
+/// zero, so the coordinates above `b` contribute the constant factor `Π(1 − z_k)`.
 fn fold_eval(h: &[Fp], z: &[Ext]) -> Ext {
+    if !h.len().is_power_of_two() {
+        return h
+            .iter()
+            .enumerate()
+            .map(|(j, &x)| eq(z, j) * Ext::from(x))
+            .sum();
+    }
+    let b = h.len().trailing_zeros() as usize;
     let mut acc: Vec<Ext> = h.iter().map(|&x| Ext::from(x)).collect();
-    for &zk in z.iter().rev() {
-        let half = acc.len() / 2;
+    for (k, &zk) in z.iter().enumerate().rev() {
         let not_z = Ext::ONE - zk;
-        for i in 0..half {
-            acc[i] = acc[i] * not_z + acc[i + half] * zk;
+        if k >= b {
+            for x in acc.iter_mut() {
+                *x *= not_z;
+            }
+        } else {
+            let half = acc.len() / 2;
+            for i in 0..half {
+                acc[i] = acc[i] * not_z + acc[i + half] * zk;
+            }
+            acc.truncate(half);
         }
-        acc.truncate(half);
     }
     acc.first().copied().unwrap_or(Ext::ZERO)
+}
+
+/// `n` public field elements, derived from `log2(n)` transcript coins.
+///
+/// The vector is the multilinear equality tensor `r_j = Π_k (j_k ? α_k : 1 − α_k)`,
+/// so the linear claim `⟨r, v⟩ = b` becomes a degree-1-per-variable polynomial in the
+/// `m` coins: unsound with probability at most `m / |F|`, and it costs `m` transcript
+/// squeezes instead of `n` on both sides.
+///
+/// The expansion is `O(n)` (`n − 1` multiplications, doubling one coin at a time), so
+/// call sites that consume the vector entry-wise are no worse than before.
+pub fn sample_vec(n: usize, tr: &mut Transcript) -> Vec<Fp> {
+    sample(n, tr).dense()
+}
+
+/// [`sample`] plus the dense expansion — for sites that consume the vector
+/// entry-wise but must only *store* the coins.
+pub fn sample_coins(n: usize, tr: &mut Transcript) -> (Vec<Fp>, Vec<Fp>) {
+    let h = sample(n, tr);
+    (h.dense(), h.coins().to_vec())
+}
+
+/// The functional to use for a claim over `n` entries: an equality tensor built
+/// from `log2(n)` coins. Sites that consume the vector entry-wise call
+/// [`LinearH::dense`]; everything else keeps the `O(m)` structure.
+pub fn sample(n: usize, tr: &mut Transcript) -> LinearH {
+    let m = n.max(2).next_power_of_two().trailing_zeros() as usize;
+    LinearH::Tensor {
+        coins: (0..m).map(|_| tr.sample_val()).collect(),
+        len: n,
+    }
 }
 
 /// Prove `⟨h, v⟩`, returning the sumcheck proof, the final point `z` (whose
@@ -235,6 +334,23 @@ mod tests {
 
     fn ip(h: &[Fp], v: &[Fp]) -> Fp {
         h.iter().zip(v).map(|(&a, &b)| a * b).sum()
+    }
+
+    #[test]
+    fn tensor_eval_matches_dense() {
+        for n in [1usize, 2, 4, 8, 16, 64] {
+            let mut tr = tr();
+            let h = sample(n, &mut tr);
+            let d = h.dense();
+            let m = n.max(2).next_power_of_two().trailing_zeros() as usize;
+            let z: Vec<Ext> = (0..m).map(|i| Ext::from(Fp::new(i as u64 + 3))).collect();
+            let want: Ext = d
+                .iter()
+                .enumerate()
+                .map(|(j, &x)| eq(&z, j) * Ext::from(x))
+                .sum();
+            assert_eq!(h.eval_at(&z), want, "n={n}");
+        }
     }
 
     #[test]

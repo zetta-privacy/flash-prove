@@ -78,7 +78,7 @@ pub fn claim_top_k_row(
         seg.cells_meta(cells.delta).m(),
         seg.cells_meta(cells.choice).m(),
     );
-    let r: Vec<Fp> = (0..e).map(|_| tr.sample_val()).collect();
+    let (r, coins) = crate::pcs::linear_claim::sample_coins(e, tr);
     let h = LinearH::Dense(r.clone());
     let tau_ext = Ext::from(fp_i64(tau));
     let mut sum_r = Ext::from(Fp::new(0));
@@ -129,7 +129,7 @@ pub fn claim_top_k_row(
         k,
         tau,
         tstar,
-        r,
+        r: coins,
         b_scores,
         b_adj,
         b_delta,
@@ -164,8 +164,8 @@ pub fn verify_top_k_row(
         tr.observe_val(Fp::new(id as u64));
     }
 
-    let r: Vec<Fp> = (0..e).map(|_| tr.sample_val()).collect();
-    if r != proof.r {
+    let (r, coins) = crate::pcs::linear_claim::sample_coins(e, tr);
+    if coins != proof.r {
         return false;
     }
     let h = LinearH::Dense(r.clone());

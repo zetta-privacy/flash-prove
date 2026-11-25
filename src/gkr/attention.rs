@@ -137,9 +137,7 @@ pub fn claim_scores(
     // `y = inv_q · dot` over the whole head block.
     tr.observe_val(Fp::new(cells.dot as u64));
     tr.observe_val(Fp::new(cells.y as u64));
-    let r: Vec<Fp> = (0..(1usize << (log_l + log_l)))
-        .map(|_| tr.sample_val())
-        .collect();
+    let (r, coins) = crate::pcs::linear_claim::sample_coins(1usize << (log_l + log_l), tr);
     let h = LinearH::Dense(r.clone());
     let dot_v = seg.claim_linear_view(cells.dot, &View::Whole, &h, tr);
     let y_v = seg.claim_linear_view(cells.y, &View::Whole, &h, tr);
@@ -156,7 +154,7 @@ pub fn claim_scores(
         head,
         inv_q,
         mm,
-        r,
+        r: coins,
         dot_v,
         y_v,
         s_v,
@@ -206,10 +204,8 @@ pub fn verify_scores(
 
     tr.observe_val(Fp::new(cells.dot as u64));
     tr.observe_val(Fp::new(cells.y as u64));
-    let r: Vec<Fp> = (0..(1usize << (log_l + log_l)))
-        .map(|_| tr.sample_val())
-        .collect();
-    if r != proof.r {
+    let (r, coins) = crate::pcs::linear_claim::sample_coins(1usize << (log_l + log_l), tr);
+    if coins != proof.r {
         return false;
     }
     let h = LinearH::Dense(r.clone());
@@ -337,9 +333,7 @@ pub fn claim_weighted_v(
 
     let requant = claim_requant(seg, cells.requant.clone(), (n, k, digits), tr);
 
-    let r: Vec<Fp> = (0..(1usize << (log_l + log_d)))
-        .map(|_| tr.sample_val())
-        .collect();
+    let (r, coins) = crate::pcs::linear_claim::sample_coins(1usize << (log_l + log_d), tr);
     let h = LinearH::Dense(r.clone());
     let ob_v = seg.claim_linear_view(cells.ob, &View::Whole, &h, tr);
     let vout = head_block_view(log_d, log_h, log_l, head);
@@ -350,7 +344,7 @@ pub fn claim_weighted_v(
         dims: (log_l, log_d, log_h),
         head,
         mm,
-        r,
+        r: coins,
         ob_v,
         out_v,
         requant,
@@ -399,10 +393,8 @@ pub fn verify_weighted_v(
         return false;
     }
 
-    let r: Vec<Fp> = (0..(1usize << (log_l + log_d)))
-        .map(|_| tr.sample_val())
-        .collect();
-    if r != proof.r {
+    let (r, coins) = crate::pcs::linear_claim::sample_coins(1usize << (log_l + log_d), tr);
+    if coins != proof.r {
         return false;
     }
     let h = LinearH::Dense(r.clone());

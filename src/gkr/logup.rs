@@ -140,7 +140,7 @@ pub fn claim_lookup2(
     let dq = 1usize << d;
     // Only the `n` real query positions carry the RLC; the padding is zero so the
     // `fp` padding (which LogUp fills with `1`) cannot leak into `b_fp`.
-    let mut r: Vec<Fp> = (0..n).map(|_| tr.sample_val()).collect();
+    let (mut r, coins) = crate::pcs::linear_claim::sample_coins(n, tr);
     r.resize(dq, Fp::ZERO);
     let h = LinearH::Dense(r.clone());
 
@@ -163,7 +163,7 @@ pub fn claim_lookup2(
         cells,
         alpha,
         beta,
-        r,
+        r: coins,
         b_in,
         b_out,
         b_fp,
@@ -186,8 +186,7 @@ pub fn verify_lookup2(
     };
     let d = meta.m();
     let dq = 1usize << d;
-    if proof.r.len() != dq
-        || proof.n != n
+    if proof.n != n
         || proof.big_n != big_n
         || n > dq
         || big_n > 1usize << commitment.cells.get(cells.m).map_or(0, |c| c.m())
@@ -197,9 +196,9 @@ pub fn verify_lookup2(
     for id in [cells.input, cells.output, cells.fp] {
         tr.observe_val(Fp::new(id as u64));
     }
-    let mut r: Vec<Fp> = (0..n).map(|_| tr.sample_val()).collect();
+    let (mut r, coins) = crate::pcs::linear_claim::sample_coins(n, tr);
     r.resize(dq, Fp::ZERO);
-    if r != proof.r {
+    if coins != proof.r {
         return false;
     }
     let h = LinearH::Dense(r.clone());
@@ -435,12 +434,12 @@ pub fn claim_link(
 ) -> LookupLink {
     tr.observe_val(Fp::new(x as u64));
     tr.observe_val(Fp::new(fq as u64));
-    let r: Vec<Fp> = (0..n).map(|_| tr.sample_val()).collect();
+    let (r, coins) = crate::pcs::linear_claim::sample_coins(n, tr);
     let h = LinearH::Dense(r.clone());
     let b_x = seg_in.claim_linear_id(x, 0, &h, tr);
     let b_fq = seg_derived.claim_linear_id(fq, 0, &h, tr);
     let _ = alpha;
-    LookupLink { n, r, b_x, b_fq }
+    LookupLink { n, r: coins, b_x, b_fq }
 }
 
 /// Verify the link across the two segments' claims.
@@ -458,8 +457,8 @@ pub fn verify_link(
 ) -> bool {
     tr.observe_val(Fp::new(x as u64));
     tr.observe_val(Fp::new(fq as u64));
-    let r: Vec<Fp> = (0..proof.n).map(|_| tr.sample_val()).collect();
-    if r != proof.r {
+    let (r, coins) = crate::pcs::linear_claim::sample_coins(proof.n, tr);
+    if coins != proof.r {
         return false;
     }
     let h = LinearH::Dense(r.clone());

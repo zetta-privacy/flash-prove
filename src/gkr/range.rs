@@ -228,7 +228,7 @@ pub fn claim_decomp(
     tr.observe_val(Fp::new(cells.value as u64));
     tr.observe_val(Fp::new(cells.all_digits as u64));
 
-    let mut r: Vec<Fp> = (0..n).map(|_| tr.sample_val()).collect();
+    let (mut r, coins) = crate::pcs::linear_claim::sample_coins(n, tr);
     r.resize(d, Fp::ZERO);
     let h = LinearH::Dense(r.clone());
 
@@ -259,7 +259,7 @@ pub fn claim_decomp(
         n,
         decomp,
         cells,
-        r,
+        r: coins,
         b_value,
         b_words,
         logup,
@@ -286,15 +286,15 @@ pub fn verify_decomp(
         return false;
     }
     let d = 1usize << meta.m();
-    if proof.r.len() != d || n > d {
+    if n > d {
         return false;
     }
 
     tr.observe_val(Fp::new(cells.value as u64));
     tr.observe_val(Fp::new(cells.all_digits as u64));
-    let mut r: Vec<Fp> = (0..n).map(|_| tr.sample_val()).collect();
+    let (mut r, coins) = crate::pcs::linear_claim::sample_coins(n, tr);
     r.resize(d, Fp::ZERO);
-    if r != proof.r {
+    if coins != proof.r {
         return false;
     }
     let h = LinearH::Dense(r.clone());
@@ -316,11 +316,11 @@ pub fn verify_decomp(
     let Some(v) = claim_value_at_id(commitment, claims, cells.all_digits, &z) else {
         return false;
     };
-    if !linear_finish(&reconstruct_h(decomp, n, m_all, &proof.r), &z, cf, v) {
+    if !linear_finish(&reconstruct_h(decomp, n, m_all, &r), &z, cf, v) {
         return false;
     }
     // The digits reconstruct the value, up to the public shift offset.
-    if b_words != proof.b_value.0 + Ext::from(reconstruct_offset(decomp, n, &proof.r)) {
+    if b_words != proof.b_value.0 + Ext::from(reconstruct_offset(decomp, n, &r)) {
         return false;
     }
 
@@ -407,7 +407,7 @@ pub fn claim_row_max(
     tr.observe_val(Fp::new(cells.d as u64));
     tr.observe_val(Fp::new(cells.over as u64));
 
-    let r: Vec<Fp> = (0..n).map(|_| tr.sample_val()).collect();
+    let (r, coins) = crate::pcs::linear_claim::sample_coins(n, tr);
     // `mask ⊙ r`: only the prefix carries the equation.
     let hm: Vec<Fp> = r.iter().zip(&mask).map(|(&ri, &mi)| ri * mi).collect();
     let m_ext = Ext::from(fp_i64(m));
@@ -451,7 +451,7 @@ pub fn claim_row_max(
         m,
         tstar,
         cells,
-        r,
+        r: coins,
         d_v,
         scores_v,
         count,
@@ -485,8 +485,8 @@ pub fn verify_row_max(
         tr.observe_val(Fp::new(id as u64));
     }
 
-    let r: Vec<Fp> = (0..n).map(|_| tr.sample_val()).collect();
-    if r != proof.r {
+    let (r, coins) = crate::pcs::linear_claim::sample_coins(n, tr);
+    if coins != proof.r {
         return false;
     }
     let mask: Vec<Fp> = (0..n)

@@ -95,7 +95,7 @@ pub fn claim_requant(
 
     let m = seg.cells_meta(c.x).m();
     let d = 1usize << m;
-    let mut r: Vec<Fp> = (0..n).map(|_| tr.sample_val()).collect();
+    let (mut r, coins) = crate::pcs::linear_claim::sample_coins(n, tr);
     r.resize(d, Fp::ZERO);
     let h = LinearH::Dense(r.clone());
 
@@ -124,7 +124,7 @@ pub fn claim_requant(
         mul_ss,
         mul_sx,
         mul_sout,
-        r,
+        r: coins,
         c_abs_x,
         c_x,
         c_sx,
@@ -155,7 +155,7 @@ pub fn verify_requant(
         return false;
     };
     let d = 1usize << meta.m();
-    if proof.r.len() != d || n > d {
+    if n > d {
         return false;
     }
 
@@ -170,9 +170,9 @@ pub fn verify_requant(
         return false;
     }
 
-    let mut r: Vec<Fp> = (0..n).map(|_| tr.sample_val()).collect();
+    let (mut r, coins) = crate::pcs::linear_claim::sample_coins(n, tr);
     r.resize(d, Fp::ZERO);
-    if r != proof.r {
+    if coins != proof.r {
         return false;
     }
     let h = LinearH::Dense(r.clone());

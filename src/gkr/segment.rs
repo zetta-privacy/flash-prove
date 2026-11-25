@@ -725,8 +725,7 @@ pub fn claim_add(
     for &i in inputs {
         tr.observe_val(Fp::new(i as u64));
     }
-    let r: Vec<Fp> = (0..n).map(|_| tr.sample_val()).collect();
-    let h = LinearH::Dense(r);
+    let h = crate::pcs::linear_claim::sample(n, tr);
 
     let (b_out, c_out) = seg.claim_linear_id(out, 0, &h, tr);
     let mut terms = Vec::with_capacity(inputs.len());
@@ -768,8 +767,7 @@ pub fn verify_add(
     for (i, _, _) in &proof.inputs {
         tr.observe_val(Fp::new(*i as u64));
     }
-    let r: Vec<Fp> = (0..n).map(|_| tr.sample_val()).collect();
-    let h = LinearH::Dense(r);
+    let h = crate::pcs::linear_claim::sample(n, tr);
 
     let Some((z, cf)) = linear_verify(&proof.c_out, proof.b_out, tr) else {
         return false;
@@ -1727,8 +1725,7 @@ pub fn claim_reshape(
     let n = 1usize << seg.cells[output].m();
     tr.observe_val(Fp::new(input as u64));
     tr.observe_val(Fp::new(output as u64));
-    let r: Vec<Fp> = (0..n).map(|_| tr.sample_val()).collect();
-    let h = LinearH::Dense(r);
+    let h = crate::pcs::linear_claim::sample(n, tr);
     let (b_in, c_in) = seg.claim_linear_id(input, 0, &h, tr);
     let (b_out, c_out) = seg.claim_linear_id(output, 0, &h, tr);
     ReshapeSegmentProof {
@@ -1757,8 +1754,7 @@ pub fn verify_reshape(
     let n = 1usize << meta.m();
     tr.observe_val(Fp::new(proof.input as u64));
     tr.observe_val(Fp::new(proof.output as u64));
-    let r: Vec<Fp> = (0..n).map(|_| tr.sample_val()).collect();
-    let h = LinearH::Dense(r);
+    let h = crate::pcs::linear_claim::sample(n, tr);
 
     let Some((z_in, c_in)) = linear_verify(&proof.c_in, proof.b_in, tr) else {
         return false;
@@ -1819,7 +1815,7 @@ pub fn claim_weighted_sum(
     tr.observe_val(Fp::new(choice as u64));
     tr.observe_val(Fp::new(s as u64));
 
-    let r: Vec<Fp> = (0..hidden).map(|_| tr.sample_val()).collect();
+    let (r, _coins) = crate::pcs::linear_claim::sample_coins(hidden, tr);
     let row = |len: usize| LinearH::Block {
         start: s * hidden,
         values: r.clone(),
@@ -1886,7 +1882,7 @@ pub fn verify_weighted_sum(
     tr.observe_val(Fp::new(proof.choice as u64));
     tr.observe_val(Fp::new(proof.s as u64));
 
-    let r: Vec<Fp> = (0..proof.hidden).map(|_| tr.sample_val()).collect();
+    let (r, _coins) = crate::pcs::linear_claim::sample_coins(proof.hidden, tr);
     let row = |cell: usize| LinearH::Block {
         start: proof.s * proof.hidden,
         values: r.clone(),

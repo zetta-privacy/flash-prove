@@ -86,7 +86,7 @@ pub fn claim_head(
     }
 
     // The row tie: two views at one point.
-    let r: Vec<Fp> = (0..n).map(|_| tr.sample_val()).collect();
+    let (r, coins) = crate::pcs::linear_claim::sample_coins(n, tr);
     let h = LinearH::Dense(r.clone());
     let b_scores = seg.claim_linear_id(cells.input, 0, &h, tr);
     let m_logits = seg.cells_meta(logits).m();
@@ -127,7 +127,7 @@ pub fn claim_head(
         cells,
         scores: cells.input,
         ones,
-        r,
+        r: coins,
         b_scores,
         b_logits,
         b_count,
@@ -158,8 +158,8 @@ pub fn verify_head(
         tr.observe_val(Fp::new(id as u64));
     }
 
-    let r: Vec<Fp> = (0..n).map(|_| tr.sample_val()).collect();
-    if r != proof.r {
+    let (r, coins) = crate::pcs::linear_claim::sample_coins(n, tr);
+    if coins != proof.r {
         return false;
     }
     let h = LinearH::Dense(r.clone());

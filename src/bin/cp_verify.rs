@@ -50,12 +50,28 @@ struct Args {
 
 fn main() -> ExitCode {
     let args = Args::parse();
+    let t_load = std::time::Instant::now();
+    let tick = |what: &str, t: &std::time::Instant| {
+        if std::env::var("FLASHPROVE_PROFILE").is_ok_and(|v| v == "1") {
+            eprintln!("  load {what}: {:.2}s", t.elapsed().as_secs_f64());
+        }
+    };
     let spec: ModelSpec = common::load(&args.spec);
     // The pre-shared map: one root per weight tensor, as `cp_commit` wrote it.
     let commits: Vec<(String, SegmentCommitment)> = common::load_bin(&args.commit);
     let published: HashMap<String, SegmentCommitment> = commits.into_iter().collect();
-    let weights = common::load_weights_bin(&args.weights);
+    tick("commit", &t_load);
+    let t_w = std::time::Instant::now();
+    // Only the norm γ vectors and the embedding's shape are read; the rest of the
+    // 553 MB weight file is skipped.
+    let weights = common::load_weights_bin_subset(&args.weights, |name| {
+        name.contains("norm") || name == "embed_tokens"
+    });
+    tick("weights", &t_w);
+    let t_p = std::time::Instant::now();
     let file: ProvedModel = common::load_bin(&args.proof);
+    tick("proof", &t_p);
+    tick("all", &t_load);
 
     if args.stats {
         for (s, b) in file.segments.iter().enumerate() {
@@ -106,44 +122,65 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     };
 
+    // The segments are independent: each replays its own transcript against its own
+    // commitment, and `verify_links` ties the cross-segment copies afterwards. So they
+    // run in parallel, one thread each; a segment's own checks stay sequential.
+    let t_all = std::time::Instant::now();
+    let params = (
+        args.digits,
+        flashprove::field::Fp::new(11),
+        flashprove::field::Fp::new(5),
+        args.rec_q,
+        args.eps,
+    );
     let mut ok = true;
-    for (s, bundle) in file.segments.iter().enumerate() {
-        if args.only.is_some_and(|o| o != s) {
-            continue;
-        }
-        let head = if s == file.head_segment {
-            Some(HeadSpec {
+    let outcomes: Vec<(usize, bool, f64)> = std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(file.segments.len());
+        for (s, bundle) in file.segments.iter().enumerate() {
+            if args.only.is_some_and(|o| o != s) {
+                continue;
+            }
+            let head = (s == file.head_segment).then(|| HeadSpec {
                 logits: args.head_cell.clone(),
                 token: file.head_token,
                 max: file.head_max,
-            })
-        } else {
-            None
-        };
-        let t0 = std::time::Instant::now();
-        let this = verify_segment_with_head(
-            &per_segment[s],
-            bundle,
-            &published,
-            &weights,
-            &spec.dims,
-            (
-                args.digits,
-                flashprove::field::Fp::new(11),
-                flashprove::field::Fp::new(5),
-                args.rec_q,
-                args.eps,
-            ),
-            &file.bounds,
-            &file.window,
-            head.as_ref(),
-        );
+            });
+            let ops = &per_segment[s];
+            let published = &published;
+            let weights = &weights;
+            let dims = &spec.dims;
+            let bounds = &file.bounds;
+            let window = &file.window;
+            handles.push(scope.spawn(move || {
+                let t0 = std::time::Instant::now();
+                let this = verify_segment_with_head(
+                    ops,
+                    bundle,
+                    published,
+                    weights,
+                    dims,
+                    params,
+                    bounds,
+                    window,
+                    head.as_ref(),
+                );
+                (s, this, t0.elapsed().as_secs_f64())
+            }));
+        }
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    for (s, this, secs) in outcomes {
         eprintln!(
-            "segment {s}: {} in {:.1}s",
-            if this { "ok" } else { "REJECT" },
-            t0.elapsed().as_secs_f64()
+            "segment {s}: {} in {secs:.1}s",
+            if this { "ok" } else { "REJECT" }
         );
         ok &= this;
+    }
+    if std::env::var("FLASHPROVE_PROFILE").is_ok_and(|v| v == "1") {
+        eprintln!(
+            "  profile segments: {:.2}s wall",
+            t_all.elapsed().as_secs_f64()
+        );
     }
 
     // Every cross-segment copy must equal the cell it copies.
