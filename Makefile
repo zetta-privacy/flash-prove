@@ -1,24 +1,40 @@
+SPEC   := data/olmoe_small.json
+CONFIG := olmoe/config_small.json
+WEIGHTS ?= data/weights.bin
+PROMPT ?= "1 2 3"
+WINDOW ?= 64
+
 commit:
-	/usr/bin/time -l target/release/cp_commit --weights data/weights.bin --out data/commit.bin
+	/usr/bin/time -l target/release/cp_commit --weights $(WEIGHTS) --out data/commit.bin
+
+# Per-role requant calibration: writes data/shifts.json and the spec.
+calibrate:
+	.venv/bin/python python/calibrate.py --config $(CONFIG) --weights $(WEIGHTS) \
+		--prompt $(PROMPT) --window $(WINDOW) \
+		--out-spec $(SPEC) --out-shifts data/shifts.json
+
+trace:
+	.venv/bin/python python/run_real.py --spec $(SPEC) --weights $(WEIGHTS) \
+		--prompt $(PROMPT) --window $(WINDOW) --out data/trace.json
 
 prove:
-	/usr/bin/time -l target/release/cp_prove --spec data/olmoe_small.json --weights data/weights.bin --trace data/trace.json --prompt data/prompt.json --output data/output.json --fill data/fill.json --out data/proof.bin
+	/usr/bin/time -l target/release/cp_prove --spec $(SPEC) --weights $(WEIGHTS) \
+		--trace data/trace.json --prompt data/prompt.json --output data/output.json \
+		--fill data/fill.json --out data/proof.bin
 
 verify:
-	/usr/bin/time -l target/release/cp_verify --spec data/olmoe_small.json --commit data/commit.bin --proof data/proof.bin
+	/usr/bin/time -l target/release/cp_verify --spec $(SPEC) --weights $(WEIGHTS) \
+		--commit data/commit.bin --proof data/proof.bin
+
+# Same, with the field-width guard and the GPU kernels on.
+prove-check:
+	FLASHPROVE_GPU=1 FLASHPROVE_CHECK_BITS=31 $(MAKE) prove
 
 full-run:
-	# 1. rebuild (cp_commit's CLI changed)
 	cargo build --release --bin cp_commit --bin cp_prove --bin cp_verify
-
-	# 2. spec + weights (only if config_small.json or the python side changed)
-	.venv/bin/python python/gen_spec.py --config olmoe/config_small.json --out data/olmoe_small.json
-	.venv/bin/python python/load_weights.py --dir olmoe --spec data/olmoe_small.json --out data/weights.bin
-
-	# 3. trace + request files (writes trace/prompt/output/fill in one shot)
-	.venv/bin/python python/run_real.py --spec data/olmoe_small.json --weights data/weights.bin --prompt "1 2 3" --window 64 --out data/trace.json
-
-	# 4. commit -> prove -> verify
-	make commit
-	make prove
-	make verify
+	.venv/bin/python python/load_weights.py --dir olmoe --spec $(SPEC) --out $(WEIGHTS)
+	$(MAKE) calibrate
+	$(MAKE) trace
+	$(MAKE) commit
+	$(MAKE) prove
+	$(MAKE) verify

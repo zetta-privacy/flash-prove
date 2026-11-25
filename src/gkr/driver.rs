@@ -2029,6 +2029,12 @@ pub fn verify_segment_with_head(
     if bundle.segment.ops.len() != ops.len() || n_ops > ops.len() {
         return false;
     }
+    if n_ops != ops.len() {
+        eprintln!(
+            "WARNING: only the first {n_ops} of {} ops are checked (FLASHPROVE_VERIFY_OPS)",
+            ops.len()
+        );
+    }
     let wmap: std::collections::HashMap<
         &str,
         (&whir_stacked::SegmentCommitment, &whir_stacked::Proof),
