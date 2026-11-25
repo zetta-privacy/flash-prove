@@ -2733,12 +2733,18 @@ pub fn verify_segment_with_head(
     }
 
     // The op claims are only sound if the segment's own openings check out.
-    crate::gkr::segment::verify(
+    crate::gkr::segment::profile::report("op claims");
+    let t_pcs = std::time::Instant::now();
+    let ok = crate::gkr::segment::verify(
         &bundle.segment.commitment,
         &bundle.segment.claims,
         &bundle.segment.proof,
         &mut new_challenger(),
-    )
+    );
+    if std::env::var("FLASHPROVE_PROFILE").is_ok_and(|v| v == "1") {
+        eprintln!("  profile pcs: {:.2}s", t_pcs.elapsed().as_secs_f64());
+    }
+    ok
 }
 
 /// One proved model: a bundle per trace segment, plus the public inputs the

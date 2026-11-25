@@ -52,13 +52,18 @@ pub enum LinearH {
         entries: Vec<(usize, Fp)>,
         len: usize,
     },
+    /// All `len` entries are one. `Σ_j eq(z, j) = 1` for any point `z` over the
+    /// hypercube, so the terminal evaluation is the constant `1` instead of a
+    /// brute-force sum over the whole table (this is the LogUp balance/multiplicity
+    /// functional, and the all-ones count in `row_max` and the head claim).
+    Ones { len: usize },
 }
 
 impl LinearH {
     pub fn len(&self) -> usize {
         match self {
             Self::Dense(h) => h.len(),
-            Self::Block { len, .. } | Self::Sparse { len, .. } => *len,
+            Self::Block { len, .. } | Self::Sparse { len, .. } | Self::Ones { len } => *len,
         }
     }
 
@@ -91,17 +96,14 @@ impl LinearH {
                 }
                 out
             }
+            Self::Ones { len } => vec![Fp::ONE; *len],
         }
     }
 
     /// `h̃(z)`, evaluated using only the support (verifier side).
     pub fn eval_at(&self, z: &[Ext]) -> Ext {
         match self {
-            Self::Dense(h) => h
-                .iter()
-                .enumerate()
-                .map(|(j, &x)| eq(z, j) * Ext::from(x))
-                .sum(),
+            Self::Dense(h) => fold_eval(h, z),
             Self::Block { start, values, .. } => values
                 .iter()
                 .enumerate()
@@ -110,8 +112,28 @@ impl LinearH {
             Self::Sparse { entries, .. } => {
                 entries.iter().map(|&(i, x)| eq(z, i) * Ext::from(x)).sum()
             }
+            Self::Ones { len } => {
+                // `Σ_{j<2^m} eq(z, j) = 1` whenever `len = 2^m` and `|z| = m`.
+                debug_assert!(len.is_power_of_two() && z.len() == len.trailing_zeros() as usize);
+                Ext::ONE
+            }
         }
     }
+}
+
+/// `Σ_j h_j·eq(z, j)` by folding one variable at a time: two extension-field
+/// multiplications per entry instead of `m`, so `O(2^m)` rather than `O(2^m·m)`.
+fn fold_eval(h: &[Fp], z: &[Ext]) -> Ext {
+    let mut acc: Vec<Ext> = h.iter().map(|&x| Ext::from(x)).collect();
+    for &zk in z.iter().rev() {
+        let half = acc.len() / 2;
+        let not_z = Ext::ONE - zk;
+        for i in 0..half {
+            acc[i] = acc[i] * not_z + acc[i + half] * zk;
+        }
+        acc.truncate(half);
+    }
+    acc.first().copied().unwrap_or(Ext::ZERO)
 }
 
 /// Prove `⟨h, v⟩`, returning the sumcheck proof, the final point `z` (whose

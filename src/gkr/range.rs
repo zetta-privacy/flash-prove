@@ -436,7 +436,7 @@ pub fn claim_row_max(
     );
 
     let over_blk = View::block(m_over, row * n, log_n);
-    let count = seg.claim_linear_view(cells.over, &over_blk, &LinearH::Dense(vec![Fp::ONE; n]), tr);
+    let count = seg.claim_linear_view(cells.over, &over_blk, &LinearH::Ones { len: n }, tr);
     assert_eq!(count.0, Ext::from(Fp::new(0)), "every score is ≤ m");
 
     // The Boolean point is inside the row, so it goes through the row's view.
@@ -530,7 +530,7 @@ pub fn verify_row_max(
     let Some(v) = claim_value_at_id(commitment, claims, c.over, &over_blk.point(&z, m_over)) else {
         return false;
     };
-    if !linear_finish(&LinearH::Dense(vec![Fp::ONE; n]), &z, cf, v) {
+    if !linear_finish(&LinearH::Ones { len: n }, &z, cf, v) {
         return false;
     }
     if proof.count.0 != Ext::from(Fp::new(0)) {

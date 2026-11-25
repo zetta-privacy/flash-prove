@@ -126,7 +126,44 @@ pub struct CellSegment {
     cells: Vec<CellMeta>,
     /// Name → cell id, so the op graph does not scan the table list per lookup.
     ids: HashMap<String, usize>,
+    /// Cell id → the PCS table it is packed into, and its first column inside it.
+    ///
+    /// Cells of equal arity share one table (one column each), so the verifier pays
+    /// its per-table opening work a handful of times per segment instead of once per
+    /// derived cell. Both sides derive the same map from the cell arities alone.
+    table_of: Vec<usize>,
+    col_of: Vec<usize>,
     claims: Vec<CellClaim>,
+}
+
+/// Cells of equal arity in the same table, `PACK_WIDTH` columns per table.
+///
+/// Deterministic in the cell arities and ids, so the verifier rebuilds it from
+/// `CellSegmentCommitment::cells` without any extra wire data.
+pub fn packing(metas: &[CellMeta]) -> (Vec<usize>, Vec<usize>) {
+    const PACK_WIDTH: usize = 64;
+    let mut order: Vec<usize> = (0..metas.len()).collect();
+    order.sort_by_key(|&i| (metas[i].m(), i));
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    let mut cur: Vec<usize> = Vec::new();
+    for &i in &order {
+        if cur.len() == PACK_WIDTH || cur.first().is_some_and(|&j| metas[j].m() != metas[i].m()) {
+            groups.push(std::mem::take(&mut cur));
+        }
+        cur.push(i);
+    }
+    if !cur.is_empty() {
+        groups.push(cur);
+    }
+    let mut table = vec![0usize; metas.len()];
+    let mut col = vec![0usize; metas.len()];
+    for (t, g) in groups.iter().enumerate() {
+        for (c, &i) in g.iter().enumerate() {
+            table[i] = t;
+            col[i] = c;
+        }
+    }
+    (table, col)
 }
 
 impl CellSegment {
@@ -138,9 +175,18 @@ impl CellSegment {
         params: Params,
     ) -> Self {
         assert_eq!(metas.len(), columns.len());
+        let (table_of, col_of) = packing(&metas);
+        let ntables = table_of.iter().copied().max().map_or(0, |t| t + 1);
+        let mut per_table: Vec<(usize, Vec<Vec<Fp>>)> =
+            (0..ntables).map(|_| (0, Vec::new())).collect();
+        for (i, cols) in columns.into_iter().enumerate() {
+            let t = table_of[i];
+            per_table[t].0 = metas[i].m();
+            per_table[t].1.extend(cols);
+        }
         let mut c = Committer::new();
-        for (meta, cols) in metas.iter().zip(columns) {
-            c.add_table(meta.m(), cols);
+        for (m, cols) in per_table {
+            c.add_table(m, cols);
         }
         Self {
             prover: c.seal(params),
@@ -150,6 +196,8 @@ impl CellSegment {
                 .map(|(i, m)| (m.name.clone(), i))
                 .collect(),
             cells: metas,
+            table_of,
+            col_of,
             claims: Vec::new(),
         }
     }
@@ -244,6 +292,10 @@ impl CellSegment {
                 .enumerate()
                 .map(|(i, m)| (m.name.clone(), i))
                 .collect(),
+            // Weight tensors stay one table each: `column_logical` and the weight
+            // proofs address them by table id.
+            table_of: (0..metas.len()).collect(),
+            col_of: vec![0; metas.len()],
             cells: metas,
             claims: Vec::new(),
         }
@@ -270,14 +322,17 @@ impl CellSegment {
 
     /// Logical column values (unpadded length `1 << m`).
     pub fn values(&self, cell: usize, col: usize) -> Vec<Fp> {
-        let mut c = self.prover.column(cell, col);
+        let mut c = self
+            .prover
+            .column(self.table_of[cell], self.col_of[cell] + col);
         c.truncate(1usize << self.cells[cell].m());
         c
     }
 
     /// Record a claim of columns `cols` of `cell` at `point`, returning the values.
     pub fn claim_id(&mut self, cell: usize, cols: &[usize], point: &[Ext]) -> Vec<Ext> {
-        let values = self.prover.claim(cell, cols, point);
+        let pcs_cols: Vec<usize> = cols.iter().map(|&c| self.col_of[cell] + c).collect();
+        let values = self.prover.claim(self.table_of[cell], &pcs_cols, point);
         self.claims.push(CellClaim {
             cell,
             cols: cols.to_vec(),
@@ -340,14 +395,16 @@ impl CellSegment {
         let bits = view.bits(m);
         assert_eq!(h.len(), 1usize << bits, "h must match the view's arity");
 
-        let mut col = self.prover.column(cell, 0);
+        let mut col = self.prover.column(self.table_of[cell], self.col_of[cell]);
         col.truncate(1usize << m);
         let v = view.values(&col, m);
         assert_eq!(v.len(), 1usize << bits);
 
         let (proof, z, b) = linear_claim::prove(&v, h, tr);
         let point = view.point(&z, m);
-        let opened = self.prover.claim(cell, &[0], &point);
+        let opened = self
+            .prover
+            .claim(self.table_of[cell], &[self.col_of[cell]], &point);
         self.claims.push(CellClaim {
             cell,
             cols: vec![0],
@@ -365,7 +422,7 @@ impl CellSegment {
     pub fn claim_id_view(&mut self, cell: usize, view: &View, z: &[Ext]) -> Vec<Ext> {
         let m = self.cells[cell].m();
         assert_eq!(view.bits(m), z.len(), "view arity");
-        let mut col = self.prover.column(cell, 0);
+        let mut col = self.prover.column(self.table_of[cell], self.col_of[cell]);
         col.truncate(1usize << m);
         let v = view.values(&col, m);
         let value: Ext = v
@@ -374,8 +431,12 @@ impl CellSegment {
             .map(|(j, &x)| crate::field::eq(z, j) * Ext::from(x))
             .sum();
         let point = view.point(z, m);
-        self.prover
-            .claim_value(cell, &[0], &point, vec![value.clone()]);
+        self.prover.claim_value(
+            self.table_of[cell],
+            &[self.col_of[cell]],
+            &point,
+            vec![value.clone()],
+        );
         self.claims.push(CellClaim {
             cell,
             cols: vec![0],
@@ -397,7 +458,7 @@ impl CellSegment {
         assert_eq!(h.len(), n, "`h` must be padded to the cell's column length");
 
         let v: Vec<Fp> = {
-            let mut c = self.prover.column(id, col);
+            let mut c = self.prover.column(self.table_of[id], self.col_of[id] + col);
             // The stored column is padded up to the first folding round; the claim
             // runs over the cell's *logical* cube and the PCS pads the point back.
             c.truncate(n);
@@ -406,7 +467,9 @@ impl CellSegment {
         assert_eq!(v.len(), n);
         let (proof, z, b) = linear_claim::prove(&v, h, tr);
         // The sumcheck leaves one point evaluation to open on this same segment.
-        let opened = self.prover.claim(id, &[col], &z);
+        let opened = self
+            .prover
+            .claim(self.table_of[id], &[self.col_of[id] + col], &z);
         self.claims.push(CellClaim {
             cell: id,
             cols: vec![col],
@@ -466,10 +529,55 @@ pub fn claim_value_at_col(
     if commitment.cells.get(cell).is_none() {
         return None;
     }
-    claims
+    if !profile::enabled() {
+        return claims
+            .iter()
+            .find(|c| c.cell == cell && c.point == point && c.cols.as_slice() == [col])
+            .map(|c| c.values[0]);
+    }
+    let mut scanned = 0u64;
+    let found = claims
         .iter()
-        .find(|c| c.cell == cell && c.point == point && c.cols.as_slice() == [col])
-        .map(|c| c.values[0])
+        .find(|c| {
+            scanned += 1;
+            c.cell == cell && c.point == point && c.cols.as_slice() == [col]
+        })
+        .map(|c| c.values[0]);
+    profile::lookup(scanned);
+    found
+}
+
+/// Cheap counters for the verifier's inner loop (`FLASHPROVE_PROFILE=1` prints them).
+/// The flag is read once, so the default path carries a single atomic load.
+pub mod profile {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::OnceLock;
+
+    pub static LOOKUPS: AtomicU64 = AtomicU64::new(0);
+    pub static SCANNED: AtomicU64 = AtomicU64::new(0);
+
+    pub fn enabled() -> bool {
+        static FLAG: OnceLock<bool> = OnceLock::new();
+        *FLAG.get_or_init(|| std::env::var("FLASHPROVE_PROFILE").is_ok_and(|v| v == "1"))
+    }
+
+    /// Record one claim-list scan that examined `n` entries.
+    pub fn lookup(n: u64) {
+        LOOKUPS.fetch_add(1, Ordering::Relaxed);
+        SCANNED.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Print and reset the counters.
+    pub fn report(what: &str) {
+        if !enabled() {
+            return;
+        }
+        let l = LOOKUPS.swap(0, Ordering::Relaxed);
+        let s = SCANNED.swap(0, Ordering::Relaxed);
+        if l > 0 {
+            eprintln!("  profile {what}: {l} claim lookups, {s} entries scanned");
+        }
+    }
 }
 
 /// Plans a segment's tables by name, then seals them.
@@ -2166,13 +2274,17 @@ pub fn verify(
     {
         return false;
     }
+    let (table_of, col_of) = packing(&commitment.cells);
     let flat: Vec<whir_stacked::Claim> = claims
         .iter()
-        .map(|c| whir_stacked::Claim {
-            table: c.cell,
-            cols: c.cols.clone(),
-            point: c.point.clone(),
-            values: c.values.clone(),
+        .map(|c| {
+            let base = col_of[c.cell];
+            whir_stacked::Claim {
+                table: table_of[c.cell],
+                cols: c.cols.iter().map(|&k| base + k).collect(),
+                point: c.point.clone(),
+                values: c.values.clone(),
+            }
         })
         .collect();
     whir_stacked::verify(&commitment.pcs, &flat, proof, ch)

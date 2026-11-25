@@ -98,7 +98,7 @@ pub fn claim_head(
     );
 
     // `Σ_j ones[j] = n`.
-    let b_count = seg.claim_linear_id(ones, 0, &LinearH::Dense(vec![Fp::ONE; n]), tr);
+    let b_count = seg.claim_linear_id(ones, 0, &LinearH::Ones { len: n }, tr);
 
     // `scores[head_token]` is a plain point evaluation at a Boolean point.
     let tok_point = bool_point(head_token, n.trailing_zeros() as usize)
@@ -194,7 +194,7 @@ pub fn verify_head(
     let Some(v) = claim_value_at_id(commitment, claims, proof.ones, &z) else {
         return false;
     };
-    if !linear_finish(&LinearH::Dense(vec![Fp::ONE; n]), &z, cf, v) {
+    if !linear_finish(&LinearH::Ones { len: n }, &z, cf, v) {
         return false;
     }
     if proof.b_count.0 != Ext::from(Fp::new(n as u64)) {

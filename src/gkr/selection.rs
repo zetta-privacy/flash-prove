@@ -107,7 +107,7 @@ pub fn claim_top_k_row(
     let count = seg.claim_linear_view(
         cells.choice,
         &View::block(m_choice, row * e, log_e),
-        &LinearH::Dense(vec![Fp::ONE; e]),
+        &LinearH::Ones { len: e },
         tr,
     );
 
@@ -187,7 +187,7 @@ pub fn verify_top_k_row(
             cells.choice,
             m_choice,
             &proof.count,
-            LinearH::Dense(vec![Fp::ONE; e]),
+            LinearH::Ones { len: e },
         ),
     ] {
         let Some((z, cf)) = linear_verify(&lin.1, lin.0, tr) else {

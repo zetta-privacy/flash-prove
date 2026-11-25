@@ -255,7 +255,7 @@ pub struct LogUpSegmentProof {
 
 /// The padded all-ones functional over `2^d` entries.
 fn ones(d: usize) -> LinearH {
-    LinearH::Dense(vec![Fp::ONE; 1usize << d])
+    LinearH::Ones { len: 1usize << d }
 }
 
 /// Claim `fq ⊆ ft` with multiplicities `m`.

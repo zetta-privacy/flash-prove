@@ -43,6 +43,9 @@ struct Args {
     /// Verify only this segment (debugging). Cross-segment links are skipped.
     #[arg(long)]
     only: Option<usize>,
+    /// Print per-segment proof size and claim counts, then exit without verifying.
+    #[arg(long)]
+    stats: bool,
 }
 
 fn main() -> ExitCode {
@@ -53,6 +56,43 @@ fn main() -> ExitCode {
     let published: HashMap<String, SegmentCommitment> = commits.into_iter().collect();
     let weights = common::load_weights_bin(&args.weights);
     let file: ProvedModel = common::load_bin(&args.proof);
+
+    if args.stats {
+        for (s, b) in file.segments.iter().enumerate() {
+            let cells = b.segment.commitment.cells.len();
+            let claims = b.segment.claims.len();
+            let values: usize = b
+                .segment
+                .commitment
+                .pcs
+                .tables
+                .iter()
+                .map(|t| 1usize << t.m)
+                .sum();
+            println!(
+                "segment {s}: {cells} cells, {} pcs tables, {values} table rows, {claims} claims, {} ops",
+                b.segment.commitment.pcs.tables.len(),
+                b.segment.ops.len()
+            );
+            // Which families of cells account for the tables (and so for PCS time).
+            let mut fam: std::collections::HashMap<String, usize> =
+                std::collections::HashMap::new();
+            for c in &b.segment.commitment.cells {
+                let mut parts = c.name.split('.');
+                let key = match (parts.next(), parts.next()) {
+                    (Some("__norm"), Some(_)) => "__norm.*".to_string(),
+                    (Some(k), _) => k.to_string(),
+                    (None, _) => "?".to_string(),
+                };
+                *fam.entry(key).or_default() += 1;
+            }
+            let mut f: Vec<(String, usize)> = fam.into_iter().collect();
+            f.sort_by(|a, b| b.1.cmp(&a.1));
+            let top: Vec<String> = f.iter().take(6).map(|(k, v)| format!("{k}={v}")).collect();
+            println!("    tables by family: {}", top.join(" "));
+        }
+        return ExitCode::SUCCESS;
+    }
 
     // Ops are assigned to segments by the spec's own split, so the verifier derives
     // the same schedule the prover used (including the cross-segment links).
