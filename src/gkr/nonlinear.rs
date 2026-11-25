@@ -452,7 +452,8 @@ pub fn max_big_n(exp_lo: i64) -> usize {
     (0 - exp_lo + 1) as usize
 }
 
-/// The cells one causal-softmax row touches.
+/// The cells one causal-softmax op touches. `d`, `e`, `y`, `nrm` and `over` are
+/// **op-wide** (`units · n` entries); a claim reads one unit's block.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SoftmaxRowCells {
     pub scores: usize,
@@ -463,10 +464,9 @@ pub struct SoftmaxRowCells {
     pub nrm: usize,
     /// `1[d > 0]`, for the row-max obligation.
     pub over: usize,
-    pub requant: RequantCells,
 }
 
-/// A single-row causal-softmax claim.
+/// A single causal-softmax claim: one (token, head) unit of the op.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SoftmaxRowProof {
     pub row: usize,
@@ -488,17 +488,15 @@ pub struct SoftmaxRowProof {
     pub b_inv: Lin,
     pub b_nrm: Lin,
     pub b_probs: Lin,
-    pub requant: RequantSegmentProof,
 }
 
-/// Claim one causal-softmax row.
+/// Claim one causal-softmax unit `(token, head)`.
 #[allow(clippy::too_many_arguments)]
 pub fn claim_softmax_row(
     seg: &mut CellSegment,
     cells: SoftmaxRowCells,
-    (row, n, l): (usize, usize, usize),
+    (unit, n, l): (usize, usize, usize),
     (m, exp_lo, tstar): (i64, i64, usize),
-    (_rec_q, k, digits): (u32, usize, usize),
     tr: &mut Transcript,
 ) -> SoftmaxRowProof {
     let c = cells.clone();
@@ -506,16 +504,24 @@ pub fn claim_softmax_row(
         tr.observe_val(Fp::new(id as u64));
     }
     let log_n = n.trailing_zeros() as usize;
+    // One block per unit: every derived cell is op-wide, so a unit is a slice.
+    let m_scores = seg.cells_meta(c.scores).m();
+    let m_probs = seg.cells_meta(c.probs).m();
+    let (v_d, v_e, v_y, v_nrm) = (
+        View::block(seg.cells_meta(c.d).m(), unit * n, log_n),
+        View::block(seg.cells_meta(c.e).m(), unit * n, log_n),
+        View::block(seg.cells_meta(c.y).m(), unit * n, log_n),
+        View::block(seg.cells_meta(c.nrm).m(), unit * n, log_n),
+    );
 
     let r: Vec<Fp> = (0..n).map(|_| tr.sample_val()).collect();
     let hm: Vec<Fp> = (0..n)
         .map(|i| if i <= l { r[i] } else { Fp::new(0) })
         .collect();
-    let b_d = seg.claim_linear_id(c.d, 0, &LinearH::Dense(r.clone()), tr);
-    let m_scores = seg.cells_meta(c.scores).m();
+    let b_d = seg.claim_linear_view(c.d, &v_d, &LinearH::Dense(r.clone()), tr);
     let b_scores = seg.claim_linear_view(
         c.scores,
-        &View::block(m_scores, row * n, log_n),
+        &View::block(m_scores, unit * n, log_n),
         &LinearH::Dense(hm),
         tr,
     );
@@ -528,7 +534,7 @@ pub fn claim_softmax_row(
             d: c.d,
             over: c.over,
         },
-        (row, n),
+        (unit, n),
         l,
         m,
         tstar,
@@ -540,21 +546,18 @@ pub fn claim_softmax_row(
             .map(|i| if i <= l { Fp::ONE } else { Fp::ZERO })
             .collect(),
     );
-    let b_e_mask = seg.claim_linear_id(c.e, 0, &mask, tr);
+    let b_e_mask = seg.claim_linear_view(c.e, &v_e, &mask, tr);
     let s = b_e_mask.0;
 
     let r2: Vec<Fp> = (0..n).map(|_| tr.sample_val()).collect();
     let h2 = LinearH::Dense(r2.clone());
-    let b_e = seg.claim_linear_id(c.e, 0, &h2, tr);
-    let b_inv = seg.claim_linear_id(c.y, 0, &h2, tr);
-
-    let requant = claim_requant(seg, c.requant.clone(), (n, k, digits), tr);
-    let b_nrm = seg.claim_linear_id(c.nrm, 0, &h2, tr);
-    let m_probs = seg.cells_meta(c.probs).m();
-    let b_probs = seg.claim_linear_view(c.probs, &View::block(m_probs, row * n, log_n), &h2, tr);
+    let b_e = seg.claim_linear_view(c.e, &v_e, &h2, tr);
+    let b_inv = seg.claim_linear_view(c.y, &v_y, &h2, tr);
+    let b_nrm = seg.claim_linear_view(c.nrm, &v_nrm, &h2, tr);
+    let b_probs = seg.claim_linear_view(c.probs, &View::block(m_probs, unit * n, log_n), &h2, tr);
 
     SoftmaxRowProof {
-        row,
+        row: unit,
         n,
         l,
         exp_lo,
@@ -570,22 +573,21 @@ pub fn claim_softmax_row(
         b_inv,
         b_nrm,
         b_probs,
-        requant,
     }
 }
 
-/// Verify a [`SoftmaxRowProof`].
+/// Verify a [`SoftmaxRowProof`] (one (token, head) unit).
 #[allow(clippy::too_many_arguments)]
 pub fn verify_softmax_row(
     commitment: &CellSegmentCommitment,
     claims: &[CellClaim],
     proof: &SoftmaxRowProof,
-    (row, n, l): (usize, usize, usize),
+    (unit, n, l): (usize, usize, usize),
     (exp_lo, tstar): (i64, usize),
-    (rec_q, k, digits): (u32, usize, usize),
+    rec_q: u32,
     tr: &mut Transcript,
 ) -> bool {
-    if proof.row != row
+    if proof.row != unit
         || proof.n != n
         || proof.l != l
         || proof.exp_lo != exp_lo
@@ -594,9 +596,13 @@ pub fn verify_softmax_row(
         return false;
     }
     let c = proof.cells.clone();
-    let (Some(m_scores), Some(m_probs)) = (
+    let (Some(m_scores), Some(m_probs), Some(m_d), Some(m_e), Some(m_y), Some(m_nrm)) = (
         commitment.cells.get(c.scores).map(|x| x.m()),
         commitment.cells.get(c.probs).map(|x| x.m()),
+        commitment.cells.get(c.d).map(|x| x.m()),
+        commitment.cells.get(c.e).map(|x| x.m()),
+        commitment.cells.get(c.y).map(|x| x.m()),
+        commitment.cells.get(c.nrm).map(|x| x.m()),
     ) else {
         return false;
     };
@@ -604,6 +610,12 @@ pub fn verify_softmax_row(
         tr.observe_val(Fp::new(id as u64));
     }
     let log_n = n.trailing_zeros() as usize;
+    let (v_d, v_e, v_y, v_nrm) = (
+        View::block(m_d, unit * n, log_n),
+        View::block(m_e, unit * n, log_n),
+        View::block(m_y, unit * n, log_n),
+        View::block(m_nrm, unit * n, log_n),
+    );
 
     let r: Vec<Fp> = (0..n).map(|_| tr.sample_val()).collect();
     if r != proof.r {
@@ -615,7 +627,7 @@ pub fn verify_softmax_row(
     let Some((z, cf)) = linear_verify(&proof.b_d.1, proof.b_d.0, tr) else {
         return false;
     };
-    let Some(v) = claim_value_at_id(commitment, claims, c.d, &z) else {
+    let Some(v) = claim_value_at_id(commitment, claims, c.d, &v_d.point(&z, m_d)) else {
         return false;
     };
     if !linear_finish(&LinearH::Dense(r.clone()), &z, cf, v) {
@@ -624,7 +636,7 @@ pub fn verify_softmax_row(
     let Some((z, cf)) = linear_verify(&proof.b_scores.1, proof.b_scores.0, tr) else {
         return false;
     };
-    let bxs = View::block(m_scores, row * n, log_n);
+    let bxs = View::block(m_scores, unit * n, log_n);
     let Some(v) = claim_value_at_id(commitment, claims, c.scores, &bxs.point(&z, m_scores)) else {
         return false;
     };
@@ -643,14 +655,7 @@ pub fn verify_softmax_row(
         return false;
     }
 
-    if !crate::gkr::range::verify_row_max(
-        commitment,
-        claims,
-        &proof.row_max,
-        (row, n),
-        l,
-        tr,
-    ) {
+    if !crate::gkr::range::verify_row_max(commitment, claims, &proof.row_max, (unit, n), l, tr) {
         return false;
     }
 
@@ -662,7 +667,7 @@ pub fn verify_softmax_row(
     let Some((z, cf)) = linear_verify(&proof.b_e_mask.1, proof.b_e_mask.0, tr) else {
         return false;
     };
-    let Some(v) = claim_value_at_id(commitment, claims, c.e, &z) else {
+    let Some(v) = claim_value_at_id(commitment, claims, c.e, &v_e.point(&z, m_e)) else {
         return false;
     };
     if !linear_finish(&mask, &z, cf, v) {
@@ -687,7 +692,7 @@ pub fn verify_softmax_row(
     let Some((z, cf)) = linear_verify(&proof.b_e.1, proof.b_e.0, tr) else {
         return false;
     };
-    let Some(v) = claim_value_at_id(commitment, claims, c.e, &z) else {
+    let Some(v) = claim_value_at_id(commitment, claims, c.e, &v_e.point(&z, m_e)) else {
         return false;
     };
     if !linear_finish(&h2, &z, cf, v) {
@@ -696,7 +701,7 @@ pub fn verify_softmax_row(
     let Some((z, cf)) = linear_verify(&proof.b_inv.1, proof.b_inv.0, tr) else {
         return false;
     };
-    let Some(v) = claim_value_at_id(commitment, claims, c.y, &z) else {
+    let Some(v) = claim_value_at_id(commitment, claims, c.y, &v_y.point(&z, m_y)) else {
         return false;
     };
     if !linear_finish(&h2, &z, cf, v) {
@@ -706,20 +711,16 @@ pub fn verify_softmax_row(
         return false;
     }
 
-    if !verify_requant(commitment, claims, &proof.requant, (n, k, digits), tr) {
-        return false;
-    }
-
     let Some((z, cf)) = linear_verify(&proof.b_nrm.1, proof.b_nrm.0, tr) else {
         return false;
     };
-    let Some(v) = claim_value_at_id(commitment, claims, c.nrm, &z) else {
+    let Some(v) = claim_value_at_id(commitment, claims, c.nrm, &v_nrm.point(&z, m_nrm)) else {
         return false;
     };
     if !linear_finish(&h2, &z, cf, v) {
         return false;
     }
-    let bp = View::block(m_probs, row * n, log_n);
+    let bp = View::block(m_probs, unit * n, log_n);
     let Some((z, cf)) = linear_verify(&proof.b_probs.1, proof.b_probs.0, tr) else {
         return false;
     };
@@ -1195,28 +1196,23 @@ mod tests {
             y: seg.id("y"),
             nrm: seg.id("nrm"),
             over: seg.id("over"),
-            requant: RequantCells {
-                x: seg.id("y"),
-                out: seg.id("nrm"),
-                s: seg.id("rs"),
-                sx: seg.id("sx"),
-                sout: seg.id("sout"),
-                abs_x: seg.id("abs_x"),
-                abs_out: seg.id("abs_out"),
-                rem: seg.id("rem"),
-                bits: dec_cells(&seg, "bit", "rem", k),
-                digits: dec_cells(&seg, "dig", "y", digits),
-            },
+        };
+        let rq = RequantCells {
+            x: seg.id("y"),
+            out: seg.id("nrm"),
+            s: seg.id("rs"),
+            sx: seg.id("sx"),
+            sout: seg.id("sout"),
+            abs_x: seg.id("abs_x"),
+            abs_out: seg.id("abs_out"),
+            rem: seg.id("rem"),
+            bits: dec_cells(&seg, "bit", "rem", k),
+            digits: dec_cells(&seg, "dig", "y", digits),
         };
         let mut tr = Transcript::new(&new_challenger());
-        let proof = claim_softmax_row(
-            &mut seg,
-            sc,
-            (0, n, l),
-            (m, exp_lo, 0),
-            (rec_q, k, digits),
-            &mut tr,
-        );
+        let proof = claim_softmax_row(&mut seg, sc, (0, n, l), (m, exp_lo, 0), &mut tr);
+        // The requant is claimed once per op, after the units.
+        let rq_proof = claim_requant(&mut seg, rq, (n, k, digits), &mut tr);
         // The two lookups are op-wide now: prove them over the same query cells.
         let _ = (alpha, beta, table, big_n);
         let claims = seg.claims().to_vec();
@@ -1229,7 +1225,14 @@ mod tests {
             &proof,
             (0, n, l),
             (exp_lo, 0),
-            (rec_q, k, digits),
+            rec_q,
+            &mut vtr
+        ));
+        assert!(verify_requant(
+            &com,
+            &claims,
+            &rq_proof,
+            (n, k, digits),
             &mut vtr
         ));
     }

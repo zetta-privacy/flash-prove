@@ -338,11 +338,11 @@ pub fn verify_decomp(
 /// Cells for a "this is the maximum of a row" claim.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RowMaxCells {
-    /// The row's cell (flat, `n` entries).
+    /// The whole op's score cell (flat, `units · n` entries).
     pub scores: usize,
-    /// `scores[i] − m`, whose sign must be non-positive.
+    /// `scores[i] − m`, op-wide; the claim reads one unit's block.
     pub d: usize,
-    /// `1` where `scores[i] > m`, else `0`.
+    /// `1` where `scores[i] > m`, else `0`, op-wide.
     pub over: usize,
 }
 
@@ -418,7 +418,10 @@ pub fn claim_row_max(
 
     // Both sides carry the *masked* functional, so the equation constrains only the
     // prefix and masked-out entries cannot leak in.
-    let d_v = seg.claim_linear_id(cells.d, 0, &LinearH::Dense(hm.clone()), tr);
+    let m_d = seg.cells_meta(cells.d).m();
+    let m_over = seg.cells_meta(cells.over).m();
+    let unit_blk = View::block(m_d, row * n, log_n);
+    let d_v = seg.claim_linear_view(cells.d, &unit_blk, &LinearH::Dense(hm.clone()), tr);
     let m_scores = seg.cells_meta(cells.scores).m();
     let scores_v = seg.claim_linear_view(
         cells.scores,
@@ -432,7 +435,8 @@ pub fn claim_row_max(
         "d = mask ⊙ (scores − m)"
     );
 
-    let count = seg.claim_linear_id(cells.over, 0, &LinearH::Dense(vec![Fp::ONE; n]), tr);
+    let over_blk = View::block(m_over, row * n, log_n);
+    let count = seg.claim_linear_view(cells.over, &over_blk, &LinearH::Dense(vec![Fp::ONE; n]), tr);
     assert_eq!(count.0, Ext::from(Fp::new(0)), "every score is ≤ m");
 
     // The Boolean point is inside the row, so it goes through the row's view.
@@ -469,7 +473,11 @@ pub fn verify_row_max(
         return false;
     }
     let c = proof.cells.clone();
-    let Some(m_scores) = commitment.cells.get(c.scores).map(|x| x.m()) else {
+    let (Some(m_scores), Some(m_d), Some(m_over)) = (
+        commitment.cells.get(c.scores).map(|x| x.m()),
+        commitment.cells.get(c.d).map(|x| x.m()),
+        commitment.cells.get(c.over).map(|x| x.m()),
+    ) else {
         return false;
     };
     let log_n = n.trailing_zeros() as usize;
@@ -494,7 +502,8 @@ pub fn verify_row_max(
     let Some((z, cf)) = linear_verify(&proof.d_v.1, proof.d_v.0, tr) else {
         return false;
     };
-    let Some(v) = claim_value_at_id(commitment, claims, c.d, &z) else {
+    let d_blk = View::block(m_d, row * n, log_n);
+    let Some(v) = claim_value_at_id(commitment, claims, c.d, &d_blk.point(&z, m_d)) else {
         return false;
     };
     if !linear_finish(&LinearH::Dense(hm.clone()), &z, cf, v) {
@@ -517,7 +526,8 @@ pub fn verify_row_max(
     let Some((z, cf)) = linear_verify(&proof.count.1, proof.count.0, tr) else {
         return false;
     };
-    let Some(v) = claim_value_at_id(commitment, claims, c.over, &z) else {
+    let over_blk = View::block(m_over, row * n, log_n);
+    let Some(v) = claim_value_at_id(commitment, claims, c.over, &over_blk.point(&z, m_over)) else {
         return false;
     };
     if !linear_finish(&LinearH::Dense(vec![Fp::ONE; n]), &z, cf, v) {
@@ -716,8 +726,18 @@ mod tests {
             1,
             scores.iter().map(|&x| fp_i64(x)).collect(),
         );
-        cells.cell_fp("d", n, 1, d.iter().map(|&x| fp_i64(x)).collect());
-        cells.cell_fp("over", n, 1, over.iter().map(|&x| fp_i64(x)).collect());
+        // `d`/`over` are op-wide (one block per unit), as in the driver.
+        let mut d_all = vec![0i64; rows * n];
+        d_all[row * n..(row + 1) * n].copy_from_slice(&d);
+        let mut over_all = vec![0i64; rows * n];
+        over_all[row * n..(row + 1) * n].copy_from_slice(&over);
+        cells.cell_fp("d", rows * n, 1, d_all.iter().map(|&x| fp_i64(x)).collect());
+        cells.cell_fp(
+            "over",
+            rows * n,
+            1,
+            over_all.iter().map(|&x| fp_i64(x)).collect(),
+        );
         cells.cell_fp("fp", n, 1, fpv);
         cells.cell_fp("dq", n, 1, diff_q);
         cells.cell_fp("ft", ft_d, 1, table.clone());
@@ -742,15 +762,7 @@ mod tests {
         };
         let _ = &lk;
         let mut tr = Transcript::new(&new_challenger());
-        let proof = claim_row_max(
-            &mut seg,
-            cells2,
-            (row, n),
-            prefix,
-            m,
-            tstar,
-            &mut tr,
-        );
+        let proof = claim_row_max(&mut seg, cells2, (row, n), prefix, m, tstar, &mut tr);
         let claims = seg.claims().to_vec();
         let wproof = seg.prove(&mut new_challenger());
         assert!(verify(&com, &claims, &wproof, &mut new_challenger()));

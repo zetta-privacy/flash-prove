@@ -19,6 +19,10 @@ struct Args {
     spec: PathBuf,
     #[arg(long)]
     commit: PathBuf,
+    /// Integer weights: the verifier needs the norm γ vectors (and each embedding's
+    /// row count). They are pre-shared with the prover, like the commitments.
+    #[arg(long)]
+    weights: PathBuf,
     #[arg(long)]
     proof: PathBuf,
     /// Requant digit-decomposition width (must match the proof).
@@ -36,6 +40,9 @@ struct Args {
     /// The cell holding the last logits row (the head's input).
     #[arg(long, default_value = "logits")]
     head_cell: String,
+    /// Verify only this segment (debugging). Cross-segment links are skipped.
+    #[arg(long)]
+    only: Option<usize>,
 }
 
 fn main() -> ExitCode {
@@ -44,6 +51,7 @@ fn main() -> ExitCode {
     // The pre-shared map: one root per weight tensor, as `cp_commit` wrote it.
     let commits: Vec<(String, SegmentCommitment)> = common::load_bin(&args.commit);
     let published: HashMap<String, SegmentCommitment> = commits.into_iter().collect();
+    let weights = common::load_weights_bin(&args.weights);
     let file: ProvedModel = common::load_bin(&args.proof);
 
     // Ops are assigned to segments by the spec's own split, so the verifier derives
@@ -60,6 +68,9 @@ fn main() -> ExitCode {
 
     let mut ok = true;
     for (s, bundle) in file.segments.iter().enumerate() {
+        if args.only.is_some_and(|o| o != s) {
+            continue;
+        }
         let head = if s == file.head_segment {
             Some(HeadSpec {
                 logits: args.head_cell.clone(),
@@ -69,11 +80,12 @@ fn main() -> ExitCode {
         } else {
             None
         };
-        ok &= verify_segment_with_head(
+        let t0 = std::time::Instant::now();
+        let this = verify_segment_with_head(
             &per_segment[s],
             bundle,
             &published,
-            &[],
+            &weights,
             &spec.dims,
             (
                 args.digits,
@@ -86,10 +98,22 @@ fn main() -> ExitCode {
             &file.window,
             head.as_ref(),
         );
+        eprintln!(
+            "segment {s}: {} in {:.1}s",
+            if this { "ok" } else { "REJECT" },
+            t0.elapsed().as_secs_f64()
+        );
+        ok &= this;
     }
 
     // Every cross-segment copy must equal the cell it copies.
-    ok &= flashprove::gkr::driver::verify_links(&file, &spec, args.segments);
+    if args.only.is_none() {
+        let links = flashprove::gkr::driver::verify_links(&file, &spec, args.segments);
+        if !links {
+            eprintln!("links: REJECT");
+        }
+        ok &= links;
+    }
 
     println!("{}", if ok { "accept" } else { "reject" });
     if ok {
