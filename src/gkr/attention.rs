@@ -284,21 +284,6 @@ pub struct WeightedVSegmentProof {
     pub requant: RequantSegmentProof,
 }
 
-/// The `v` view for one head, transposed to `d × lq` (row = dim, col = position).
-///
-/// Logical index is `i·lq + t`, so its low `log_l` bits address the position and
-/// its high `log_d` bits the dimension: those map to the cell's position bit (above
-/// the head bits) and its dimension bit respectively.
-pub fn head_v_view(log_d: usize, log_h: usize, log_l: usize, head: usize) -> View {
-    let mut map: Vec<usize> = Vec::with_capacity(log_l + log_d);
-    map.extend((0..log_l).map(|k| log_d + log_h + k));
-    map.extend(0..log_d);
-    let fixed: Vec<(usize, bool)> = (0..log_h)
-        .map(|i| (log_d + i, (head >> i) & 1 == 1))
-        .collect();
-    View::gather(map, fixed)
-}
-
 /// Claim one **whole head** of `weighted_v`: every query position at once.
 ///
 /// ```text

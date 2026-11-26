@@ -58,11 +58,11 @@ fn main() {
                     n,
                     <Ext as p3_field::BasedVectorSpace<Fp>>::as_basis_coefficients_slice(&sum)
                         .iter()
-                        .map(|v| p3_field::PrimeField64::as_canonical_u64(v))
+                        .map(p3_field::PrimeField64::as_canonical_u64)
                         .collect::<Vec<_>>(),
                     <Ext as p3_field::BasedVectorSpace<Fp>>::as_basis_coefficients_slice(&backend::mle_eval_cpu(&values, &point))
                         .iter()
-                        .map(|v| p3_field::PrimeField64::as_canonical_u64(v))
+                        .map(p3_field::PrimeField64::as_canonical_u64)
                         .collect::<Vec<_>>(),
                 );
             } else {
@@ -179,8 +179,8 @@ fn main() {
                         cpu_s / gpu_s
                     ),
                     Some((gr, gz)) => {
-                        let cb: Vec<u64> = <Ext as p3_field::BasedVectorSpace<Fp>>::as_basis_coefficients_slice(&cpu_rounds[0].0[0]).iter().map(|v| p3_field::PrimeField64::as_canonical_u64(v)).collect();
-                        let gb: Vec<u64> = <Ext as p3_field::BasedVectorSpace<Fp>>::as_basis_coefficients_slice(&gr[0].0[0]).iter().map(|v| p3_field::PrimeField64::as_canonical_u64(v)).collect();
+                        let cb: Vec<u64> = <Ext as p3_field::BasedVectorSpace<Fp>>::as_basis_coefficients_slice(&cpu_rounds[0].0[0]).iter().map(p3_field::PrimeField64::as_canonical_u64).collect();
+                        let gb: Vec<u64> = <Ext as p3_field::BasedVectorSpace<Fp>>::as_basis_coefficients_slice(&gr[0].0[0]).iter().map(p3_field::PrimeField64::as_canonical_u64).collect();
                         println!(
                             "2^{:<4} {:<11} MISMATCH rounds_eq={} z_eq={} cpu_A={:?} gpu_A={:?}",
                             log_n,

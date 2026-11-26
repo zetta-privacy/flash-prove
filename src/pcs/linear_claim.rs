@@ -46,7 +46,7 @@ pub enum LinearH {
         values: Vec<Fp>,
         len: usize,
     },
-    /// `len` entries, zero except at the listed positions (embeddings scatter the
+    /// `len` entries, zero except at the listed positions (an embedding scatters the
     /// RLC vector into the vocabulary rows the window actually reads).
     Sparse {
         entries: Vec<(usize, Fp)>,
@@ -280,19 +280,6 @@ fn fold_eval(h: &[Fp], z: &[Ext]) -> Ext {
         }
     }
     acc.first().copied().unwrap_or(Ext::ZERO)
-}
-
-/// `n` public field elements, derived from `log2(n)` transcript coins.
-///
-/// The vector is the multilinear equality tensor `r_j = Π_k (j_k ? α_k : 1 − α_k)`,
-/// so the linear claim `⟨r, v⟩ = b` becomes a degree-1-per-variable polynomial in the
-/// `m` coins: unsound with probability at most `m / |F|`, and it costs `m` transcript
-/// squeezes instead of `n` on both sides.
-///
-/// The expansion is `O(n)` (`n − 1` multiplications, doubling one coin at a time), so
-/// call sites that consume the vector entry-wise are no worse than before.
-pub fn sample_vec(n: usize, tr: &mut Transcript) -> Vec<Fp> {
-    sample(n, tr).dense()
 }
 
 /// [`sample`] plus the dense expansion — for sites that consume the vector
@@ -550,31 +537,7 @@ mod tests {
         assert!(finish(&e, &z2, claim, mle_value(&full, &z2)));
     }
 
-    #[test]
-    fn sparse_matches_dense() {
-        let mut rng = StdRng::seed_from_u64(7);
-        let v = rand_fp(&mut rng, 32);
-        let entries = vec![(3, Fp::new(5)), (17, Fp::new(9)), (31, Fp::new(2))];
-        let sparse = LinearH::Sparse {
-            entries: entries.clone(),
-            len: 32,
-        };
-        let mut expect = Fp::zero_vec(32);
-        for (i, x) in &entries {
-            expect[*i] = *x;
-        }
-        assert_eq!(sparse.dense(), expect);
-
-        let (proof, z, b) = prove(&v, &sparse, &mut tr());
-        assert_eq!(b, Ext::from(ip(&expect, &v)));
-        let mut vt = tr();
-        let (z2, claim) = verify(&proof, b, &mut vt).expect("honest");
-        assert_eq!(z, z2);
-        assert!(finish(&sparse, &z2, claim, mle_value(&v, &z2)));
-        assert_eq!(sparse.eval_at(&z2), LinearH::Dense(expect).eval_at(&z2));
-    }
-
-    #[test]
+        #[test]
     fn round_polynomial_is_quadratic() {
         let mut rng = StdRng::seed_from_u64(6);
         let v = rand_fp(&mut rng, 8);

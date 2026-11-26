@@ -24,7 +24,6 @@
 
 use std::collections::HashMap;
 
-use crate::field::arith::bool_point;
 use crate::field::sumcheck::{mle_eval, RoundPoly, RoundPoly3};
 use crate::field::{Ext, Fp};
 use crate::gkr::protocol::{concat, eq_partial, matrix_mle, round_poly3_mul, round_poly_product};
@@ -435,13 +434,13 @@ impl CellSegment {
             self.table_of[cell],
             &[self.col_of[cell]],
             &point,
-            vec![value.clone()],
+            vec![value],
         );
         self.claims.push(CellClaim {
             cell,
             cols: vec![0],
             point,
-            values: vec![value.clone()],
+            values: vec![value],
         });
         vec![value]
     }
@@ -566,62 +565,13 @@ pub fn claim_value_at_col(
     col: usize,
     point: &[Ext],
 ) -> Option<Ext> {
-    if commitment.cells.get(cell).is_none() {
-        return None;
-    }
-    if !profile::enabled() {
-        return claims
-            .on(cell)
-            .iter()
-            .map(|&i| &claims.as_slice()[i])
-            .find(|c| c.point == point && c.cols.as_slice() == [col])
-            .map(|c| c.values[0]);
-    }
-    let mut scanned = 0u64;
-    let found = claims
+    commitment.cells.get(cell)?;
+    claims
         .on(cell)
         .iter()
         .map(|&i| &claims.as_slice()[i])
-        .find(|c| {
-            scanned += 1;
-            c.point == point && c.cols.as_slice() == [col]
-        })
-        .map(|c| c.values[0]);
-    profile::lookup(scanned);
-    found
-}
-
-/// Cheap counters for the verifier's inner loop (`FLASHPROVE_PROFILE=1` prints them).
-/// The flag is read once, so the default path carries a single atomic load.
-pub mod profile {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::OnceLock;
-
-    pub static LOOKUPS: AtomicU64 = AtomicU64::new(0);
-    pub static SCANNED: AtomicU64 = AtomicU64::new(0);
-
-    pub fn enabled() -> bool {
-        static FLAG: OnceLock<bool> = OnceLock::new();
-        *FLAG.get_or_init(|| std::env::var("FLASHPROVE_PROFILE").is_ok_and(|v| v == "1"))
-    }
-
-    /// Record one claim-list scan that examined `n` entries.
-    pub fn lookup(n: u64) {
-        LOOKUPS.fetch_add(1, Ordering::Relaxed);
-        SCANNED.fetch_add(n, Ordering::Relaxed);
-    }
-
-    /// Print and reset the counters.
-    pub fn report(what: &str) {
-        if !enabled() {
-            return;
-        }
-        let l = LOOKUPS.swap(0, Ordering::Relaxed);
-        let s = SCANNED.swap(0, Ordering::Relaxed);
-        if l > 0 {
-            eprintln!("  profile {what}: {l} claim lookups, {s} entries scanned");
-        }
-    }
+        .find(|c| c.point == point && c.cols.as_slice() == [col])
+        .map(|c| c.values[0])
 }
 
 /// Plans a segment's tables by name, then seals them.
@@ -939,165 +889,6 @@ pub struct WeightOpen {
     pub value: Ext,
 }
 
-/// `c = a ⊙ w`, with `w` in its own pre-shared segment.
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct MulWeightProof {
-    /// The activation operand.
-    pub a: usize,
-    /// The product (activation) cell.
-    pub c: usize,
-    pub d: usize,
-    pub r: Vec<Ext>,
-    pub istar: Vec<Ext>,
-    pub c_val: Ext,
-    pub a_val: Ext,
-    pub w: WeightOpen,
-    pub rounds: Vec<RoundPoly3>,
-}
-
-/// Claim `c[i] = a[i]·w[i]` with `w` living in its own segment.
-///
-/// Same sumcheck as [`claim_mul`]; the difference is that the weight's terminal
-/// evaluation is recorded on the weight segment, so it is paid for by that
-/// tensor's proof instead of by the activation segment's.
-#[allow(clippy::too_many_arguments)]
-pub fn claim_mul_weight(
-    seg: &mut CellSegment,
-    a: usize,
-    weight: &mut SegmentProver,
-    weight_cell: usize,
-    c: usize,
-    weight_name: &str,
-    tr: &mut Transcript,
-) -> MulWeightProof {
-    let d = seg.cells_meta(a).m();
-    assert_eq!(seg.cells_meta(c).m(), d, "mul operands must share an arity");
-    for id in [a, c] {
-        tr.observe_val(Fp::new(id as u64));
-    }
-
-    let to_ext = |v: Vec<Fp>| -> Vec<Ext> { v.into_iter().map(Ext::from).collect() };
-    let af = to_ext(seg.values(a, 0));
-    let wf = to_ext(weight.column_logical(weight_cell, 0));
-    let cf = to_ext(seg.values(c, 0));
-    assert_eq!(wf.len(), af.len(), "weight arity");
-
-    let r: Vec<Ext> = (0..d).map(|_| tr.sample_ext()).collect();
-    let c_val = mle_eval(&cf, &r);
-
-    let mut rounds = Vec::with_capacity(d);
-    let mut istar = Vec::with_capacity(d);
-    for j in 0..d {
-        let round = round_poly3_mul(&af, &wf, &r, d, j, &istar);
-        for coeff in &round.0 {
-            tr.observe_ext(*coeff);
-        }
-        let rj = tr.sample_ext();
-        rounds.push(round);
-        istar.push(rj);
-    }
-
-    let a_val = mle_eval(&af, &istar);
-    let w_val = mle_eval(&wf, &istar);
-    seg.claim_id(a, &[0], &istar);
-    seg.claim_id(c, &[0], &r);
-    // The weight operand is opened on its own segment.
-    let opened = weight.claim(weight_cell, &[0], &istar);
-    assert_eq!(opened[0], w_val, "weight opening matches the sumcheck");
-
-    MulWeightProof {
-        a,
-        c,
-        d,
-        r,
-        w: WeightOpen {
-            name: weight_name.to_string(),
-            cell: weight_cell,
-            point: istar.clone(),
-            value: w_val,
-        },
-        istar,
-        c_val,
-        a_val,
-        rounds,
-    }
-}
-
-/// Verify a [`MulWeightProof`].
-///
-/// `w_com`/`w_proof` are the tensor's pre-shared commitment and its per-tensor
-/// proof (one per `(name, tensor)` pair, covering every claim on it).
-#[allow(clippy::too_many_arguments)]
-pub fn verify_mul_weight(
-    commitment: &CellSegmentCommitment,
-    claims: &crate::gkr::segment::Claims<'_>,
-    w_com: &whir_stacked::SegmentCommitment,
-    w_proof: &whir_stacked::Proof,
-    proof: &MulWeightProof,
-    tr: &mut Transcript,
-) -> bool {
-    let (a, c, d) = (proof.a, proof.c, proof.d);
-    let Some(ma) = commitment.cells.get(a) else {
-        return false;
-    };
-    if commitment.cells.get(c).is_none()
-        || ma.m() != d
-        || proof.rounds.len() != d
-        || proof.r.len() != d
-        || proof.istar.len() != d
-    {
-        return false;
-    }
-    for id in [a, c] {
-        tr.observe_val(Fp::new(id as u64));
-    }
-
-    let r: Vec<Ext> = (0..d).map(|_| tr.sample_ext()).collect();
-    if r != proof.r {
-        return false;
-    }
-
-    let mut claim = proof.c_val;
-    let mut istar = Vec::with_capacity(d);
-    for round in &proof.rounds {
-        if round.eval(Ext::ZERO) + round.eval(Ext::ONE) != claim {
-            return false;
-        }
-        for coeff in &round.0 {
-            tr.observe_ext(*coeff);
-        }
-        let rj = tr.sample_ext();
-        istar.push(rj);
-        claim = round.eval(rj);
-    }
-    if istar != proof.istar {
-        return false;
-    }
-    if claim != eq_partial(&r, &istar) * proof.a_val * proof.w.value {
-        return false;
-    }
-
-    if claim_value_at_id(commitment, claims, a, &istar) != Some(proof.a_val)
-        || claim_value_at_id(commitment, claims, c, &r) != Some(proof.c_val)
-    {
-        return false;
-    }
-
-    // The weight's opening, against its own root.
-    let w_claim = whir_stacked::Claim {
-        table: proof.w.cell,
-        cols: vec![0],
-        point: proof.w.point.clone(),
-        values: vec![proof.w.value],
-    };
-    whir_stacked::verify(
-        w_com,
-        &[w_claim],
-        w_proof,
-        &mut crate::pcs::transcript::new_challenger(),
-    )
-}
-
 /// `C = W·B` with `W` a pre-shared weight tensor (step 5 of the port).
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct MatmulWeightProof {
@@ -1339,224 +1130,6 @@ pub struct ChunkOpen {
     pub open: WeightOpen,
 }
 
-/// `C = W·B` where `W` is row-chunked across several pre-shared roots.
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct MatmulChunkedProof {
-    pub ln: usize,
-    pub lm: usize,
-    pub lp: usize,
-    pub b: usize,
-    pub c: usize,
-    pub rounds: Vec<RoundPoly>,
-    pub a_val: Ext,
-    pub b_val: Ext,
-    pub c_val: Ext,
-    /// One opening per chunk; `Σ_i eq(r_high, i)·value_i == a_val`.
-    pub w: Vec<ChunkOpen>,
-}
-
-/// Claim `C = W·B` for a weight split into `2^g` row chunks.
-///
-/// The row bits of a row-major matrix are its **high** bits, so chunk `i` owns the
-/// low `ln−g` row coordinates and its index lives in the high `g`:
-///
-/// ```text
-///   Ã(r, k) = Σ_i eq(r_high, i) · Ã_i(r_low, k)
-/// ```
-///
-/// The sumcheck runs on that weighted sum, and each chunk opens its terminal
-/// evaluation at `concat(kstar, r_low)` against its own root. Composing with a
-/// plain sum instead is wrong for every chunk count above one.
-pub fn claim_matmul_weight_chunked(
-    seg: &mut CellSegment,
-    chunks: &mut [(&str, &mut SegmentProver, usize)],
-    (b, c): (usize, usize),
-    tr: &mut Transcript,
-    (ln, lm, lp): (usize, usize, usize),
-) -> MatmulChunkedProof {
-    assert!(
-        !chunks.is_empty() && chunks.len().is_power_of_two(),
-        "a row-chunked weight needs 2^g chunks"
-    );
-    let g = chunks.len().trailing_zeros() as usize;
-    assert!(g <= ln, "more chunks than rows");
-    let ln_low = ln - g;
-
-    for id in [b, c] {
-        tr.observe_val(Fp::new(id as u64));
-    }
-    for (_, _, cell) in chunks.iter() {
-        tr.observe_val(Fp::new(*cell as u64));
-    }
-
-    let r: Vec<Ext> = (0..ln).map(|_| tr.sample_ext()).collect();
-    let s: Vec<Ext> = (0..lp).map(|_| tr.sample_ext()).collect();
-    let r_low = r[..ln_low].to_vec();
-    let r_high = r[ln_low..].to_vec();
-
-    let to_ext = |v: Vec<Fp>| -> Vec<Ext> { v.into_iter().map(Ext::from).collect() };
-    let parts: Vec<Vec<Ext>> = chunks
-        .iter()
-        .map(|(_, seg_c, cell)| to_ext(seg_c.column_logical(*cell, 0)))
-        .collect();
-    let bv = to_ext(seg.values(b, 0));
-    let cv = to_ext(seg.values(c, 0));
-    assert_eq!(bv.len(), 1 << (lm + lp), "B dimensions");
-    assert_eq!(cv.len(), 1 << (ln + lp), "C dimensions");
-    for a in &parts {
-        assert_eq!(a.len(), 1 << (ln_low + lm), "chunk dimensions");
-    }
-
-    let c_val = matrix_mle(&cv, &r, &s);
-    let eqs: Vec<Ext> = (0..chunks.len())
-        .map(|i| crate::field::eq(&r_high, i))
-        .collect();
-
-    let mut p = vec![Ext::ZERO; 1 << lm];
-    let mut q = vec![Ext::ZERO; 1 << lm];
-    for k in 0..(1 << lm) {
-        let kb = bool_point(k, lm);
-        for (a, &w) in parts.iter().zip(&eqs) {
-            p[k] += w * matrix_mle(a, &r_low, &kb);
-        }
-        q[k] = matrix_mle(&bv, &kb, &s);
-    }
-
-    let mut kstar = Vec::with_capacity(lm);
-    let mut rounds = Vec::with_capacity(lm);
-    for i in 0..lm {
-        let round = round_poly_product(&p, &q, lm, i, &kstar);
-        for coeff in &round.0 {
-            tr.observe_ext(*coeff);
-        }
-        let ri = tr.sample_ext();
-        rounds.push(round);
-        kstar.push(ri);
-    }
-
-    let a_val = mle_eval(&p, &kstar);
-    let b_val = mle_eval(&q, &kstar);
-    let a_point = concat(&kstar, &r_low);
-    let opened_b = seg.claim_id(b, &[0], &concat(&s, &kstar))[0];
-    let opened_c = seg.claim_id(c, &[0], &concat(&s, &r))[0];
-    assert_eq!(opened_b, b_val, "B opening matches the sumcheck");
-    assert_eq!(opened_c, c_val, "C opening matches the sumcheck");
-
-    let mut w = Vec::with_capacity(chunks.len());
-    let mut sum = Ext::ZERO;
-    for (i, (name, seg_c, cell)) in chunks.iter_mut().enumerate() {
-        let vals = seg_c.claim(*cell, &[0], &a_point);
-        sum += eqs[i] * vals[0];
-        w.push(ChunkOpen {
-            chunk: i,
-            open: WeightOpen {
-                name: name.to_string(),
-                cell: *cell,
-                point: a_point.clone(),
-                value: vals[0],
-            },
-        });
-    }
-    assert_eq!(sum, a_val, "eq-weighted chunk openings must equal a_val");
-
-    MatmulChunkedProof {
-        ln,
-        lm,
-        lp,
-        b,
-        c,
-        rounds,
-        a_val,
-        b_val,
-        c_val,
-        w,
-    }
-}
-
-/// Verify a [`MatmulChunkedProof`]; `parts[i]` is chunk `i`'s `(commitment, proof)`.
-pub fn verify_matmul_weight_chunked(
-    commitment: &CellSegmentCommitment,
-    claims: &crate::gkr::segment::Claims<'_>,
-    parts: &[(&whir_stacked::SegmentCommitment, &whir_stacked::Proof)],
-    proof: &MatmulChunkedProof,
-    tr: &mut Transcript,
-) -> bool {
-    let (b, c) = (proof.b, proof.c);
-    if commitment.cells.get(b).is_none()
-        || commitment.cells.get(c).is_none()
-        || parts.len() != proof.w.len()
-        || parts.is_empty()
-        || !parts.len().is_power_of_two()
-    {
-        return false;
-    }
-    let g = parts.len().trailing_zeros() as usize;
-    if g > proof.ln {
-        return false;
-    }
-    let ln_low = proof.ln - g;
-
-    for id in [b, c] {
-        tr.observe_val(Fp::new(id as u64));
-    }
-    for o in &proof.w {
-        tr.observe_val(Fp::new(o.open.cell as u64));
-    }
-
-    let (ln, lm, lp) = (proof.ln, proof.lm, proof.lp);
-    let r: Vec<Ext> = (0..ln).map(|_| tr.sample_ext()).collect();
-    let s: Vec<Ext> = (0..lp).map(|_| tr.sample_ext()).collect();
-    let r_high = r[ln_low..].to_vec();
-    if proof.rounds.len() != lm {
-        return false;
-    }
-
-    let mut claim = proof.c_val;
-    let mut kstar = Vec::with_capacity(lm);
-    for round in &proof.rounds {
-        if round.eval(Ext::ZERO) + round.eval(Ext::ONE) != claim {
-            return false;
-        }
-        for coeff in &round.0 {
-            tr.observe_ext(*coeff);
-        }
-        let ri = tr.sample_ext();
-        kstar.push(ri);
-        claim = round.eval(ri);
-    }
-    if claim != proof.a_val * proof.b_val {
-        return false;
-    }
-    if claim_value_at_id(commitment, claims, b, &concat(&s, &kstar)) != Some(proof.b_val)
-        || claim_value_at_id(commitment, claims, c, &concat(&s, &r)) != Some(proof.c_val)
-    {
-        return false;
-    }
-
-    let mut sum = Ext::ZERO;
-    for (expected, (o, (com, proof_c))) in proof.w.iter().zip(parts).enumerate() {
-        if o.chunk != expected {
-            return false;
-        }
-        let w_claim = whir_stacked::Claim {
-            table: o.open.cell,
-            cols: vec![0],
-            point: o.open.point.clone(),
-            values: vec![o.open.value],
-        };
-        if !whir_stacked::verify(
-            com,
-            &[w_claim],
-            proof_c,
-            &mut crate::pcs::transcript::new_challenger(),
-        ) {
-            return false;
-        }
-        sum += crate::field::eq(&r_high, o.chunk) * o.open.value;
-    }
-    sum == proof.a_val
-}
-
 /// A pointwise-product claim `c = a ⊙ b` over committed cells.
 ///
 /// `c: None` means the target is the **public all-ones vector** (`a⊙b = 1
@@ -1580,58 +1153,6 @@ pub struct MulSegmentProof {
     /// so is not evaluated at `istar`. `None` for the ordinary pointwise claim.
     #[serde(default)]
     pub b_point: Option<Vec<Ext>>,
-}
-
-/// How a short vector `b` is repeated to the length of `a` in a broadcast product.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum Broadcast {
-    /// `b[x mod 2^l]` — one `b` entry every `2^l` indices (γ repeated across the
-    /// rows of a normalisation).
-    Repeat { l: usize },
-    /// `b[(x >> block) * stride + offset]` — one `b` entry per `2^block` indices
-    /// (one column of the choice cell, spread across the hidden axis).
-    Block {
-        block: usize,
-        stride: usize,
-        offset: usize,
-    },
-}
-
-impl Broadcast {
-    /// The `b` index that multiplies position `x`.
-    pub fn index(&self, x: usize) -> usize {
-        match *self {
-            Self::Repeat { l } => x & ((1usize << l) - 1),
-            Self::Block {
-                block,
-                stride,
-                offset,
-            } => ((x >> block) * stride) + offset,
-        }
-    }
-
-    /// The point at which `b̃(istar)` is read, given the sumcheck's terminal point.
-    ///
-    /// Both shapes make `Σ_x eq(istar, x)·b[bcast x]` collapse to a *point* opening of
-    /// `b`: for `Repeat` the high coordinates sum to one (`Σ_t eq(z, t) = 1`), and for
-    /// `Block` the spread-out index is pinned to `offset` by a Boolean sub-point.
-    pub fn b_point(&self, istar: &[Ext]) -> Vec<Ext> {
-        match *self {
-            Self::Repeat { l } => istar[..l.min(istar.len())].to_vec(),
-            Self::Block {
-                block,
-                stride,
-                offset,
-            } => {
-                let mut p = istar[block.min(istar.len())..].to_vec();
-                p.extend(crate::field::arith::bool_point(
-                    offset,
-                    stride.trailing_zeros() as usize,
-                ));
-                p
-            }
-        }
-    }
 }
 
 /// Claim `c[i] = a[i]·b[i]` pointwise.
@@ -1795,139 +1316,6 @@ pub fn verify_mul(
     target_ok
         && claim_value_at_id(commitment, claims, a, &istar) == Some(proof.a_val)
         && claim_value_at_id(commitment, claims, b, &istar) == Some(proof.b_val)
-}
-
-/// Claim `c[x] = a[x] · b[broadcast x]`, where `b` is a short vector repeated to
-/// `a`'s length by `bcast`.
-///
-/// The sumcheck is the ordinary product one; the only difference is that `b` is
-/// expanded on the prover side and opened at the *reduced* point
-/// [`Broadcast::b_point`], which is all the verifier needs — that reduction is what
-/// lets one claim cover a whole cell instead of one claim per row.
-pub fn claim_mul_broadcast(
-    seg: &mut CellSegment,
-    (a, b, c): (usize, usize, usize),
-    bcast: Broadcast,
-    tr: &mut Transcript,
-) -> MulSegmentProof {
-    let d = seg.cells[a].m();
-    assert_eq!(seg.cells[c].m(), d, "mul operands must share an arity");
-    for id in [a, b, c] {
-        tr.observe_val(Fp::new(id as u64));
-    }
-
-    let to_ext = |v: Vec<Fp>| -> Vec<Ext> { v.into_iter().map(Ext::from).collect() };
-    let af = to_ext(seg.values(a, 0));
-    let cf = to_ext(seg.values(c, 0));
-    let braw: Vec<Ext> = to_ext(seg.values(b, 0));
-    let n = 1usize << d;
-    let bf: Vec<Ext> = (0..n).map(|x| braw[bcast.index(x)]).collect();
-
-    let r: Vec<Ext> = (0..d).map(|_| tr.sample_ext()).collect();
-    let c_val = mle_eval(&cf, &r);
-
-    let mut rounds = Vec::with_capacity(d);
-    let mut istar = Vec::with_capacity(d);
-    for j in 0..d {
-        let round = round_poly3_mul(&af, &bf, &r, d, j, &istar);
-        for coeff in &round.0 {
-            tr.observe_ext(*coeff);
-        }
-        let rj = tr.sample_ext();
-        rounds.push(round);
-        istar.push(rj);
-    }
-
-    let b_point = bcast.b_point(&istar);
-    let a_val = mle_eval(&af, &istar);
-    let b_val = mle_eval(&braw, &b_point);
-    seg.claim_id(a, &[0], &istar);
-    seg.claim_id(b, &[0], &b_point);
-    seg.claim_id(c, &[0], &r);
-
-    MulSegmentProof {
-        a,
-        b,
-        c: Some(c),
-        d,
-        r,
-        istar,
-        c_val,
-        a_val,
-        b_val,
-        rounds,
-        b_point: Some(b_point),
-    }
-}
-
-/// Verify a [`MulSegmentProof`] whose `b` operand is a broadcast vector.
-pub fn verify_mul_broadcast(
-    commitment: &CellSegmentCommitment,
-    claims: &crate::gkr::segment::Claims<'_>,
-    proof: &MulSegmentProof,
-    bcast: Broadcast,
-    tr: &mut Transcript,
-) -> bool {
-    let Some(b_point) = proof.b_point.as_deref() else {
-        return false;
-    };
-    if b_point != bcast.b_point(&proof.istar).as_slice() {
-        return false;
-    }
-    let (a, b, d) = (proof.a, proof.b, proof.d);
-    let Some(ma) = commitment.cells.get(a) else {
-        return false;
-    };
-    let Some(mb) = commitment.cells.get(b) else {
-        return false;
-    };
-    if ma.m() != d || mb.m() != b_point.len() || proof.rounds.len() != d || proof.r.len() != d
-    {
-        return false;
-    }
-    for id in [a, b] {
-        tr.observe_val(Fp::new(id as u64));
-    }
-    if let Some(c) = proof.c {
-        tr.observe_val(Fp::new(c as u64));
-    }
-
-    let r: Vec<Ext> = (0..d).map(|_| tr.sample_ext()).collect();
-    if r != proof.r {
-        return false;
-    }
-
-    let mut claim = proof.c_val;
-    let mut istar = Vec::with_capacity(d);
-    for round in &proof.rounds {
-        if round.eval(Ext::ZERO) + round.eval(Ext::ONE) != claim {
-            return false;
-        }
-        for coeff in &round.0 {
-            tr.observe_ext(*coeff);
-        }
-        let rj = tr.sample_ext();
-        istar.push(rj);
-        claim = round.eval(rj);
-    }
-    if istar != proof.istar {
-        return false;
-    }
-    let rhs = eq_partial(&proof.r, &istar) * proof.a_val * proof.b_val;
-    if claim != rhs {
-        return false;
-    }
-
-    let target_ok = match proof.c {
-        None => proof.c_val == Ext::ONE,
-        Some(c) => claim_value_at_id(commitment, claims, c, &proof.r) == Some(proof.c_val),
-    };
-    let a_ok = claim_value_at_id(commitment, claims, a, &istar) == Some(proof.a_val);
-    let b_ok = claim_value_at_id(commitment, claims, b, b_point) == Some(proof.b_val);
-    if !(target_ok && a_ok && b_ok) {
-        return false;
-    }
-    true
 }
 
 /// Verify a [`MulSegmentProof`] whose target is the public all-ones vector.
@@ -2511,7 +1899,7 @@ pub fn verify(
                 || commitment
                     .cells
                     .get(c.cell)
-                    .map_or(true, |meta| c.cols.iter().any(|&k| k >= meta.cols))
+                    .is_none_or(|meta| c.cols.iter().any(|&k| k >= meta.cols))
         })
     {
         return false;
@@ -2987,69 +2375,6 @@ mod tests {
     }
 
     #[test]
-    fn broadcast_mul_roundtrip_and_soundness() {
-        use crate::pcs::transcript::{new_challenger, Transcript};
-        use crate::pcs::whir_stacked::Params;
-
-        // `a` is 64 long; `b` is 4 long and repeated. The expected products are
-        // written out by hand so the test does not just re-run the index map.
-        let a: Vec<i64> = vec![3, -5, 7, 11, 13, -17, 19, 23, 29, -31, 37, 41, 43, -47, 53, 59, 3, -5, 7, 11, 13, -17, 19, 23, 29, -31, 37, 41, 43, -47, 53, 59, 3, -5, 7, 11, 13, -17, 19, 23, 29, -31, 37, 41, 43, -47, 53, 59, 3, -5, 7, 11, 13, -17, 19, 23, 29, -31, 37, 41, 43, -47, 53, 59];
-        let b: Vec<i64> = vec![2, 3, 5, 7];
-        let cases: Vec<(Broadcast, Vec<i64>)> = vec![
-            // b[x mod 4]
-            (Broadcast::Repeat { l: 2 }, vec![6, -15, 35, 77, 26, -51, 95, 161, 58, -93, 185, 287, 86, -141, 265, 413, 6, -15, 35, 77, 26, -51, 95, 161, 58, -93, 185, 287, 86, -141, 265, 413, 6, -15, 35, 77, 26, -51, 95, 161, 58, -93, 185, 287, 86, -141, 265, 413, 6, -15, 35, 77, 26, -51, 95, 161, 58, -93, 185, 287, 86, -141, 265, 413]),
-            // b[x >> 4]: b[j] on the j-th block of sixteen
-            (
-                Broadcast::Block {
-                    block: 4,
-                    stride: 1,
-                    offset: 0,
-                },
-                vec![6, -10, 14, 22, 26, -34, 38, 46, 58, -62, 74, 82, 86, -94, 106, 118, 9, -15, 21, 33, 39, -51, 57, 69, 87, -93, 111, 123, 129, -141, 159, 177, 15, -25, 35, 55, 65, -85, 95, 115, 145, -155, 185, 205, 215, -235, 265, 295, 21, -35, 49, 77, 91, -119, 133, 161, 203, -217, 259, 287, 301, -329, 371, 413],
-            ),
-        ];
-
-        for (bcast, c) in cases {
-            let cells = vec![
-                Cell::new("a", 64, 1, a.clone()),
-                Cell::new("b", 4, 1, b.clone()),
-                Cell::new("c", 64, 1, c.clone()),
-            ];
-            let mut seg = CellSegment::seal(&cells, Params::default());
-            let com = seg.commitment();
-            let (ca, cb, cc) = (seg.id("a"), seg.id("b"), seg.id("c"));
-            let mut tr = Transcript::new(&new_challenger());
-            let proof = claim_mul_broadcast(&mut seg, (ca, cb, cc), bcast, &mut tr);
-            let claims = seg.claims().to_vec();
-            let wproof = seg.prove(&mut new_challenger());
-            assert!(
-                verify(&com, &Claims::new(&claims), &wproof, &mut new_challenger()),
-                "{bcast:?}"
-            );
-            let mut vtr = Transcript::new(&new_challenger());
-            assert!(
-                verify_mul_broadcast(&com, &Claims::new(&claims), &proof, bcast, &mut vtr),
-                "{bcast:?}"
-            );
-
-            // One wrong product entry must be rejected.
-            let mut bad_cells = cells.clone();
-            bad_cells[2].values[5] += 1;
-            let mut bad = CellSegment::seal(&bad_cells, Params::default());
-            let com_bad = bad.commitment();
-            let mut btr = Transcript::new(&new_challenger());
-            let bad_proof = claim_mul_broadcast(&mut bad, (ca, cb, cc), bcast, &mut btr);
-            let claims_bad = bad.claims().to_vec();
-            let _ = bad.prove(&mut new_challenger());
-            let mut vtr = Transcript::new(&new_challenger());
-            assert!(
-                !verify_mul_broadcast(&com_bad, &Claims::new(&claims_bad), &bad_proof, bcast, &mut vtr),
-                "{bcast:?}"
-            );
-        }
-    }
-
-    #[test]
     fn add_claim_roundtrip_and_soundness() {
         let mut rng = StdRng::seed_from_u64(9);
         let n = 8;
@@ -3437,90 +2762,11 @@ mod tests {
     }
 
     #[test]
-    fn mul_against_a_preshared_weight_root() {
-        use crate::pcs::whir_stacked::Committer;
-
-        let a_vals = vec![1i64, 2, 3, 4];
-        let w_vals = vec![2i64, 3, 4, 5];
-        let c_vals: Vec<i64> = (0..4).map(|i| a_vals[i] * w_vals[i]).collect();
-
-        // The weight lives in its own segment (the cp_commit output).
-        let mut wc = Committer::new();
-        wc.add_vec(
-            &w_vals
-                .iter()
-                .map(|&x| Fp::new(x as u64))
-                .collect::<Vec<_>>(),
-        );
-        let mut w_prov = wc.seal(Params::default());
-        let w_com = w_prov.commitment().clone();
-
-        let mut seg = CellSegment::seal(
-            &[
-                Cell::new("a", 4, 1, a_vals.clone()),
-                Cell::new("c", 4, 1, c_vals.clone()),
-            ],
-            Params::default(),
-        );
-        let com = seg.commitment();
-        let (ca, cc) = (seg.id("a"), seg.id("c"));
-
-        let mut tr = Transcript::new(&new_challenger());
-        let proof = claim_mul_weight(&mut seg, ca, &mut w_prov, 0, cc, "w", &mut tr);
-
-        let claims = seg.claims().to_vec();
-        let wproof = seg.prove(&mut new_challenger());
-        let wt_proof = w_prov.prove(&mut new_challenger());
-
-        assert!(verify(&com, &Claims::new(&claims), &wproof, &mut new_challenger()));
-        let mut vtr = Transcript::new(&new_challenger());
-        assert!(verify_mul_weight(
-            &com, &Claims::new(&claims), &w_com, &wt_proof, &proof, &mut vtr
-        ));
-
-        // A product that is not `a ⊙ w` is rejected by the sumcheck.
-        let mut bad_c = c_vals.clone();
-        bad_c[1] += 1;
-        let mut bad = CellSegment::seal(
-            &[Cell::new("a", 4, 1, a_vals), Cell::new("c", 4, 1, bad_c)],
-            Params::default(),
-        );
-        let bad_com = bad.commitment();
-        let mut wc2 = Committer::new();
-        wc2.add_vec(
-            &w_vals
-                .iter()
-                .map(|&x| Fp::new(x as u64))
-                .collect::<Vec<_>>(),
-        );
-        let mut w_prov2 = wc2.seal(Params::default());
-        let bad_proof = claim_mul_weight(
-            &mut bad,
-            ca,
-            &mut w_prov2,
-            0,
-            cc,
-            "w",
-            &mut Transcript::new(&new_challenger()),
-        );
-        let bad_claims = bad.claims().to_vec();
-        let mut vtr = Transcript::new(&new_challenger());
-        assert!(!verify_mul_weight(
-            &bad_com,
-            &Claims::new(&bad_claims),
-            &w_com,
-            &wt_proof,
-            &bad_proof,
-            &mut vtr
-        ));
-    }
-
-    #[test]
     fn matmul_against_a_preshared_weight_root() {
         use crate::pcs::whir_stacked::Committer;
 
         // W: 2x2, B: 2x1, C = W·B.
-        let w_vals = vec![1i64, 2, 3, 4];
+        let w_vals = [1i64, 2, 3, 4];
         let b_vals = vec![2i64, 3];
         let c_vals = vec![
             w_vals[0] * b_vals[0] + w_vals[1] * b_vals[1],
@@ -3623,10 +2869,10 @@ mod tests {
         use crate::pcs::whir_stacked::Committer;
 
         // W is 4x2; the op uses rows [2,4) as a 2x2 matrix.
-        let w_vals = vec![9i64, 9, 9, 9, 1, 2, 3, 4];
+        let w_vals = [9i64, 9, 9, 9, 1, 2, 3, 4];
         let b_vals = vec![2i64, 3];
         // C = W_block · B with W_block = [[1,2],[3,4]].
-        let c_vals = vec![1 * 2 + 2 * 3, 3 * 2 + 4 * 3];
+        let c_vals = vec![2 + 2 * 3, 3 * 2 + 4 * 3];
 
         let mut wc = Committer::new();
         wc.add_vec(
@@ -3695,85 +2941,4 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn chunked_weight_uses_eq_weights() {
-        use crate::pcs::whir_stacked::Committer;
-
-        // W is 4x2, split into two 2x2 chunk roots (embed/lm_head shape).
-        let w_rows = [[1i64, 2], [3, 4], [5, 6], [7, 8]];
-        let b_vals = vec![2i64, 3];
-        let c_vals: Vec<i64> = (0..4)
-            .map(|i| w_rows[i][0] * b_vals[0] + w_rows[i][1] * b_vals[1])
-            .collect();
-
-        let mut chunks: Vec<(String, SegmentProver, usize)> = Vec::new();
-        for (ci, half) in w_rows.chunks(2).enumerate() {
-            let flat: Vec<Fp> = half
-                .iter()
-                .flat_map(|r| r.iter().map(|&x| Fp::new(x as u64)))
-                .collect();
-            let mut wc = Committer::new();
-            wc.add_vec(&flat);
-            chunks.push((format!("W{ci}"), wc.seal(Params::default()), 0));
-        }
-        let coms: Vec<_> = chunks.iter().map(|c| c.1.commitment().clone()).collect();
-
-        let mut seg = CellSegment::seal(
-            &[
-                Cell::new("b", 2, 1, b_vals.clone()),
-                Cell::new("c", 4, 1, c_vals.clone()),
-            ],
-            Params::default(),
-        );
-        let com = seg.commitment();
-        let (cb, cc) = (seg.id("b"), seg.id("c"));
-
-        // ln = 2 rows, lm = 1 column, lp = 0; two chunks (g = 1).
-        let mut handles: Vec<(&str, &mut SegmentProver, usize)> = chunks
-            .iter_mut()
-            .map(|(n, p, c)| (n.as_str(), p, *c))
-            .collect();
-        let mut tr = Transcript::new(&new_challenger());
-        let proof =
-            claim_matmul_weight_chunked(&mut seg, &mut handles, (cb, cc), &mut tr, (2, 1, 0));
-        assert_eq!(proof.w.len(), 2);
-
-        let claims = seg.claims().to_vec();
-        let wproof = seg.prove(&mut new_challenger());
-        let provers: Vec<SegmentProver> = chunks.into_iter().map(|(_, p, _)| p).collect();
-        let proofs: Vec<whir_stacked::Proof> = provers
-            .into_iter()
-            .map(|p| p.prove(&mut new_challenger()))
-            .collect();
-        let parts: Vec<(&whir_stacked::SegmentCommitment, &whir_stacked::Proof)> = coms
-            .iter()
-            .zip(proofs.iter())
-            .map(|(c, p)| (c, p))
-            .collect();
-
-        assert!(verify(&com, &Claims::new(&claims), &wproof, &mut new_challenger()));
-        let mut vtr = Transcript::new(&new_challenger());
-        assert!(verify_matmul_weight_chunked(
-            &com, &Claims::new(&claims), &parts, &proof, &mut vtr
-        ));
-
-        // A proof that composed the chunks with a plain sum instead of eq weights
-        // would fail here: the verifier recomputes eq from `r`.
-        let mut bad = proof.clone();
-        bad.a_val += Ext::ONE;
-        let mut vtr = Transcript::new(&new_challenger());
-        assert!(!verify_matmul_weight_chunked(
-            &com, &Claims::new(&claims), &parts, &bad, &mut vtr
-        ));
-
-        // Dropping a chunk root is rejected.
-        let mut vtr = Transcript::new(&new_challenger());
-        assert!(!verify_matmul_weight_chunked(
-            &com,
-            &Claims::new(&claims),
-            &parts[..1],
-            &proof,
-            &mut vtr
-        ));
-    }
 }

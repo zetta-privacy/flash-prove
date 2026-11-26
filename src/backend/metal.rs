@@ -974,7 +974,7 @@ pub fn bisect() -> Vec<(&'static str, String)> {
             }
             "bis_args" => got[0] == 3 && got[1] == n as u64,
             "mle_v_only" => got[0] == a.iter().sum::<u64>() % crate::backend::ORDER,
-            "mle_e_only" => got[0] == 128 * 1,
+            "mle_e_only" => got[0] == 128,
             "mle_reduce" => {
                 let pt: Vec<Ext> = (0..3).map(|k| Ext::from(Fp::new(b[k]))).collect();
                 let vals: Vec<Fp> = a.iter().map(|&v| Fp::new(v)).collect();
@@ -1322,7 +1322,7 @@ impl SumcheckGpu {
     /// The current round's polynomial coefficients `(A, B, C)`.
     pub fn round(&mut self) -> (Ext, Ext, Ext) {
         let npair = self.n / 2;
-        let groups = npair.div_ceil(1024) as usize;
+        let groups = npair.div_ceil(1024);
         let cmd = self.gpu.queue.new_command_buffer();
 
         // 1. Terms.
@@ -1418,7 +1418,7 @@ impl SumcheckGpu {
 /// One BLAKE3 digest per `words` field elements; `None` when the GPU is unavailable or
 /// the digest input would not fit in a single BLAKE3 block.
 pub fn hash_many(input: &[Fp], words: usize) -> Option<Vec<[Fp; 2]>> {
-    if words == 0 || words > 8 || input.len() % words != 0 {
+    if words == 0 || words > 8 || !input.len().is_multiple_of(words) {
         return None;
     }
     let gpu = init()?;

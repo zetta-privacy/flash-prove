@@ -15,13 +15,6 @@ pub fn requant(x: i64, k: u32) -> i64 {
 /// the integer `requant(x·inv_q, RECIP_Q)` bit-consistent with the f64 `round(x/divisor)`.
 pub const RECIP_Q: u32 = 14;
 
-/// `round(x / scale)` — the attention-scores rounding, now a quantized reciprocal
-/// so it is a clean shift (arith: `requant(x · round(2^Q/scale), Q)`).
-pub fn round_div(x: i64, scale: f64, q: u32) -> i64 {
-    let inv_q = ((1i64 << q) as f64 / scale).round() as i64;
-    requant(x * inv_q, q)
-}
-
 pub fn silu(x: i64) -> i64 {
     let xc = x.clamp(-(1 << 15), (1 << 15) - 1);
     let xf = xc as f64;
@@ -31,30 +24,6 @@ pub fn silu(x: i64) -> i64 {
 pub fn exp_q15(x: i64) -> i64 {
     let xc = x.clamp(-(1 << 15), 0);
     ((xc as f64).exp() * 32768.0).round() as i64
-}
-
-/// RoPE: rotate one head-dim vector by `pos`.
-pub fn rope_apply(q: &mut [i64], pos: usize, theta: f64) {
-    let d = q.len();
-    for i in (0..d).step_by(2) {
-        let angle = (pos as f64) * theta.powf(-(i as f64) / d as f64);
-        let c = (angle.cos() * 32768.0).round() as i64;
-        let s = (angle.sin() * 32768.0).round() as i64;
-        let (a, b) = (q[i], q[i + 1]);
-        q[i] = requant(a * c - b * s, 15);
-        q[i + 1] = requant(a * s + b * c, 15);
-    }
-}
-
-/// Integer RMSNorm of one vector, via the quantized reciprocal.
-pub fn rmsnorm_vec(x: &[i64], gamma: &[i8], eps: f64) -> Vec<i64> {
-    let d = x.len() as f64;
-    let mean_sq = x.iter().map(|&v| (v as f64) * (v as f64)).sum::<f64>() / d;
-    let inv_q = ((1i64 << RECIP_Q) as f64 / (mean_sq + eps).sqrt()).round() as i64;
-    x.iter()
-        .zip(gamma)
-        .map(|(&v, &g)| requant(v * (g as i64) * inv_q, RECIP_Q))
-        .collect()
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]

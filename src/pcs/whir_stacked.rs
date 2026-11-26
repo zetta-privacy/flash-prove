@@ -379,17 +379,7 @@ impl SegmentProver {
     }
 
     /// The logical values `[start, start + len)` of a column, without copying the rest.
-    pub fn column_range(&self, table: usize, col: usize, start: usize, len: usize) -> Vec<F> {
-        self.pd
-            .table(table)
-            .column(col)
-            .values()
-            .skip(start)
-            .take(len)
-            .collect()
-    }
-
-    /// Produce the single stacked WHIR proof covering every recorded claim.
+        /// Produce the single stacked WHIR proof covering every recorded claim.
     ///
     /// `ch` must be the segment's transcript: this absorbs the root and then
     /// runs the WHIR opening on the same challenger state.

@@ -390,7 +390,7 @@ impl Shapes {
             Op::Add { inputs, output, .. } => {
                 let first = inputs
                     .first()
-                    .ok_or_else(|| DriverError::Unsupported("add with no inputs"))?;
+                    .ok_or(DriverError::Unsupported("add with no inputs"))?;
                 self.copy_from(first, output)
             }
             Op::TopK {
@@ -590,18 +590,6 @@ impl LookupBounds {
     }
 
     /// The rotated-value table `α + β·x + β²·requant(x, k)` over `[rope_lo, rope_hi]`.
-    pub fn rope_table(&self, k: u32, alpha: Fp, beta: Fp) -> Vec<Fp> {
-        let n = self.rope_big_n();
-        let mut v: Vec<Fp> = (self.rope_lo..=self.rope_hi)
-            .map(|x| {
-                let out = crate::model::spec::requant(x, k);
-                alpha + beta * signed(x) + beta * beta * signed(out)
-            })
-            .collect();
-        v.resize(n.next_power_of_two(), Fp::ONE);
-        v
-    }
-
     pub fn rope_big_n(&self) -> usize {
         (self.rope_hi - self.rope_lo + 1).max(1) as usize
     }
@@ -1821,7 +1809,7 @@ pub fn prove_segment_full(
                 let table = bounds.sign_table(alpha, beta);
                 let lookup = crate::gkr::logup::claim_lookup2(
                     &mut seg,
-                    cells.lookup.clone(),
+                    cells.lookup,
                     (alpha, beta),
                     &table,
                     (rows * e, bounds.sign_big_n()),
@@ -2018,21 +2006,8 @@ pub fn verify_segment_with_head(
     // One `cell -> claims` index for the whole segment: value lookups were scanning
     // every claim in the list.
     let claims = crate::gkr::segment::Claims::new(&bundle.segment.claims);
-    // Debug switch: check only the first `FLASHPROVE_VERIFY_OPS` ops. Prover and
-    // verifier advance the transcript identically over a prefix, so this isolates
-    // which op a rejection comes from.
-    let n_ops = std::env::var("FLASHPROVE_VERIFY_OPS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(ops.len());
-    if bundle.segment.ops.len() != ops.len() || n_ops > ops.len() {
+    if bundle.segment.ops.len() != ops.len() {
         return false;
-    }
-    if n_ops != ops.len() {
-        eprintln!(
-            "WARNING: only the first {n_ops} of {} ops are checked (FLASHPROVE_VERIFY_OPS)",
-            ops.len()
-        );
     }
     let wmap: std::collections::HashMap<
         &str,
@@ -2044,11 +2019,7 @@ pub fn verify_segment_with_head(
         .collect();
     let mut tr = Transcript::new(&new_challenger());
 
-    for (i, (op, proof)) in ops[..n_ops]
-        .iter()
-        .zip(&bundle.segment.ops[..n_ops])
-        .enumerate()
-    {
+    for (i, (op, proof)) in ops.iter().zip(&bundle.segment.ops).enumerate() {
         match (op, proof) {
             (Op::Silu { input, output }, SegmentOpProof::Silu(p)) => {
                 let (Some(ci), Some(co)) = (
@@ -2162,12 +2133,8 @@ pub fn verify_segment_with_head(
                 if p.out != out_id || p.inputs.iter().map(|t| t.0).ne(want.iter().copied()) {
                     return false;
                 }
-                if !crate::gkr::segment::verify_add(
-                    &bundle.segment.commitment,
-                    &claims,
-                    p,
-                    &mut tr,
-                ) {
+                if !crate::gkr::segment::verify_add(&bundle.segment.commitment, &claims, p, &mut tr)
+                {
                     return false;
                 }
             }
@@ -2236,12 +2203,8 @@ pub fn verify_segment_with_head(
                 if (p.a, p.b, p.c) != (ca, cb, Some(cc)) {
                     return false;
                 }
-                if !crate::gkr::segment::verify_mul(
-                    &bundle.segment.commitment,
-                    &claims,
-                    p,
-                    &mut tr,
-                ) {
+                if !crate::gkr::segment::verify_mul(&bundle.segment.commitment, &claims, p, &mut tr)
+                {
                     return false;
                 }
             }
@@ -2732,18 +2695,12 @@ pub fn verify_segment_with_head(
     }
 
     // The op claims are only sound if the segment's own openings check out.
-    crate::gkr::segment::profile::report("op claims");
-    let t_pcs = std::time::Instant::now();
-    let ok = crate::gkr::segment::verify(
+    crate::gkr::segment::verify(
         &bundle.segment.commitment,
         &claims,
         &bundle.segment.proof,
         &mut new_challenger(),
-    );
-    if std::env::var("FLASHPROVE_PROFILE").is_ok_and(|v| v == "1") {
-        eprintln!("  profile pcs: {:.2}s", t_pcs.elapsed().as_secs_f64());
-    }
-    ok
+    )
 }
 
 /// One proved model: a bundle per trace segment, plus the public inputs the
@@ -3076,7 +3033,7 @@ mod tests {
         other.add_vec(&[Fp::new(9), Fp::new(9), Fp::new(9), Fp::new(9)]);
         let other_seg = other.seal(params);
         let other_root = other_seg.commitment();
-        assert!(!check_preshared("w1", &other_root, &published));
+        assert!(!check_preshared("w1", other_root, &published));
     }
 
     #[test]
@@ -3111,7 +3068,7 @@ mod tests {
         let k = 1usize;
         let w = WeightMatrix::new("W", 2, 2, vec![1, 2, 3, 4]);
         let x = vec![2i64, 3];
-        let y = vec![1 * 2 + 2 * 3, 3 * 2 + 4 * 3];
+        let y = [2 + 2 * 3, 3 * 2 + 4 * 3];
         let out: Vec<i64> = y.iter().map(|&v| requant_i64(v, k as u32)).collect();
 
         let cells = vec![
@@ -3353,7 +3310,7 @@ mod tests {
         // Two chained ops: `p = x·x`, `q = p + p`.
         let p: Vec<i64> = x.iter().map(|&v| v * v).collect();
         let q: Vec<i64> = p.iter().map(|&v| 2 * v).collect();
-        let cells = vec![
+        let cells = [
             Cell::new("x", 4, 1, x),
             Cell::new("p", 4, 1, p),
             Cell::new("q", 4, 1, q),
@@ -3414,7 +3371,7 @@ mod tests {
                 .map(|n| cells.iter().find(|c| &c.name == n).unwrap().clone())
                 .collect();
             for name in external_inputs(&plan[s], &per_segment[s]) {
-                seg_cells.push(cells.iter().find(|c| &c.name == &name).unwrap().clone());
+                seg_cells.push(cells.iter().find(|c| c.name == name).unwrap().clone());
             }
             let extra: Vec<(String, Vec<Ext>)> = openings[s].clone();
             segments.push(

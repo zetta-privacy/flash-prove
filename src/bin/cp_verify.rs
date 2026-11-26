@@ -40,75 +40,21 @@ struct Args {
     /// The cell holding the last logits row (the head's input).
     #[arg(long, default_value = "logits")]
     head_cell: String,
-    /// Verify only this segment (debugging). Cross-segment links are skipped.
-    #[arg(long)]
-    only: Option<usize>,
-    /// Print per-segment proof size and claim counts, then exit without verifying.
-    #[arg(long)]
-    stats: bool,
 }
 
 fn main() -> ExitCode {
     let args = Args::parse();
-    let t_load = std::time::Instant::now();
-    let tick = |what: &str, t: &std::time::Instant| {
-        if std::env::var("FLASHPROVE_PROFILE").is_ok_and(|v| v == "1") {
-            eprintln!("  load {what}: {:.2}s", t.elapsed().as_secs_f64());
-        }
-    };
     let spec: ModelSpec = common::load(&args.spec);
     // The pre-shared map: one root per weight tensor, as `cp_commit` wrote it.
     let commits: Vec<(String, SegmentCommitment)> = common::load_bin(&args.commit);
     let published: HashMap<String, SegmentCommitment> = commits.into_iter().collect();
-    tick("commit", &t_load);
-    let t_w = std::time::Instant::now();
     // Only the norm γ vectors and the embedding's shape are read; the rest of the
     // 553 MB weight file is skipped.
     let weights = common::load_weights_bin_subset(&args.weights, |name| {
         name.contains("norm") || name == "embed_tokens"
     });
-    tick("weights", &t_w);
-    let t_p = std::time::Instant::now();
     let file: ProvedModel = common::load_bin(&args.proof);
-    tick("proof", &t_p);
-    tick("all", &t_load);
 
-    if args.stats {
-        for (s, b) in file.segments.iter().enumerate() {
-            let cells = b.segment.commitment.cells.len();
-            let claims = b.segment.claims.len();
-            let values: usize = b
-                .segment
-                .commitment
-                .pcs
-                .tables
-                .iter()
-                .map(|t| 1usize << t.m)
-                .sum();
-            println!(
-                "segment {s}: {cells} cells, {} pcs tables, {values} table rows, {claims} claims, {} ops",
-                b.segment.commitment.pcs.tables.len(),
-                b.segment.ops.len()
-            );
-            // Which families of cells account for the tables (and so for PCS time).
-            let mut fam: std::collections::HashMap<String, usize> =
-                std::collections::HashMap::new();
-            for c in &b.segment.commitment.cells {
-                let mut parts = c.name.split('.');
-                let key = match (parts.next(), parts.next()) {
-                    (Some("__norm"), Some(_)) => "__norm.*".to_string(),
-                    (Some(k), _) => k.to_string(),
-                    (None, _) => "?".to_string(),
-                };
-                *fam.entry(key).or_default() += 1;
-            }
-            let mut f: Vec<(String, usize)> = fam.into_iter().collect();
-            f.sort_by(|a, b| b.1.cmp(&a.1));
-            let top: Vec<String> = f.iter().take(6).map(|(k, v)| format!("{k}={v}")).collect();
-            println!("    tables by family: {}", top.join(" "));
-        }
-        return ExitCode::SUCCESS;
-    }
 
     // Ops are assigned to segments by the spec's own split, so the verifier derives
     // the same schedule the prover used (including the cross-segment links).
@@ -125,7 +71,6 @@ fn main() -> ExitCode {
     // The segments are independent: each replays its own transcript against its own
     // commitment, and `verify_links` ties the cross-segment copies afterwards. So they
     // run in parallel, one thread each; a segment's own checks stay sequential.
-    let t_all = std::time::Instant::now();
     let params = (
         args.digits,
         flashprove::field::Fp::new(11),
@@ -138,16 +83,13 @@ fn main() -> ExitCode {
     let outcomes: Vec<(usize, bool, f64)> = std::thread::scope(|scope| {
         // The links only need the commitments, so they run alongside the segments
         // instead of after them.
-        let links_handle = args.only.is_none().then(|| {
+        let links_handle = {
             let (file, spec) = (&file, &spec);
             let segments = args.segments;
             scope.spawn(move || flashprove::gkr::driver::verify_links(file, spec, segments))
-        });
+        };
         let mut handles = Vec::with_capacity(file.segments.len());
         for (s, bundle) in file.segments.iter().enumerate() {
-            if args.only.is_some_and(|o| o != s) {
-                continue;
-            }
             let head = (s == file.head_segment).then(|| HeadSpec {
                 logits: args.head_cell.clone(),
                 token: file.head_token,
@@ -177,9 +119,7 @@ fn main() -> ExitCode {
         }
         let mut all: Vec<(usize, bool, f64)> =
             handles.into_iter().map(|h| h.join().unwrap()).collect();
-        if let Some(h) = links_handle {
-            links_ok.set(h.join().unwrap());
-        }
+        links_ok.set(links_handle.join().unwrap());
         all.sort_by_key(|t| t.0);
         all
     });
@@ -189,12 +129,6 @@ fn main() -> ExitCode {
             if this { "ok" } else { "REJECT" }
         );
         ok &= this;
-    }
-    if std::env::var("FLASHPROVE_PROFILE").is_ok_and(|v| v == "1") {
-        eprintln!(
-            "  profile segments: {:.2}s wall",
-            t_all.elapsed().as_secs_f64()
-        );
     }
 
     // Every cross-segment copy must equal the cell it copies (checked above, in

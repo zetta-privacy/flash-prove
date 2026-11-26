@@ -65,7 +65,7 @@ impl Decomp {
     /// Uses bytes when `k` is a multiple of 8 (a byte table covers the same interval
     /// with `k/8` lookups instead of `k`), and bits otherwise.
     pub fn bits(k: usize) -> Self {
-        if k >= 8 && k % 8 == 0 {
+        if k >= 8 && k.is_multiple_of(8) {
             Self {
                 radix: 256,
                 digits: k / 8,
@@ -389,11 +389,6 @@ pub struct RowMaxProof {
     pub tok_val: Ext,
 }
 
-/// The shifted sign table `{1, 2}` for the `over` indicator.
-pub fn over_table() -> Vec<Fp> {
-    vec![Fp::ONE, Fp::new(2)]
-}
-
 /// Claim `m = max(scores[row·n .. row·n + prefix + 1])`.
 ///
 /// The prefix mask `1[i ≤ prefix]` is **derived from `prefix`**, which is public, so
@@ -698,7 +693,7 @@ mod tests {
         use p3_field::Field;
 
         let (rows, n) = (2usize, 4usize);
-        let scores = vec![3i64, 7, 5, 1, 2, 2, 9, 4];
+        let scores = [3i64, 7, 5, 1, 2, 2, 9, 4];
         let row = 1usize;
         // Only the prefix [0..=1] is constrained: the row is [2, 2, 9, 4] and
         // positions 2..3 must not count, otherwise `m = 2` would be refuted.

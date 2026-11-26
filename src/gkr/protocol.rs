@@ -114,7 +114,7 @@ pub(crate) fn eq_partial(r: &[Ext], point: &[Ext]) -> Ext {
     let mut acc = Ext::ONE;
     for k in 0..r.len() {
         let p = point[k];
-        acc = acc * (r[k] * p + (Ext::ONE - r[k]) * (Ext::ONE - p));
+        acc *= r[k] * p + (Ext::ONE - r[k]) * (Ext::ONE - p);
     }
     acc
 }

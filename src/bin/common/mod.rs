@@ -82,12 +82,6 @@ pub fn load<T: serde::de::DeserializeOwned>(path: &std::path::Path) -> T {
     serde_json::from_slice(&bytes).unwrap_or_else(|e| panic!("parse {}: {e}", path.display()))
 }
 
-/// Save a value to a file as JSON.
-pub fn save<T: serde::Serialize>(path: &std::path::Path, v: &T) {
-    let bytes = serde_json::to_vec(v).unwrap();
-    std::fs::write(path, bytes).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
-}
-
 /// Save a value to a file as bincode (streamed, for large commit tables).
 pub fn save_bin<T: serde::Serialize>(path: &std::path::Path, v: &T) {
     let file =
@@ -103,7 +97,3 @@ pub fn load_bin<T: serde::de::DeserializeOwned>(path: &std::path::Path) -> T {
     bincode::deserialize_from(r).unwrap_or_else(|e| panic!("decode {}: {e}", path.display()))
 }
 
-/// Hex-encode bytes for human-readable output.
-pub fn hex(d: &[u8]) -> String {
-    d.iter().map(|b| format!("{b:02x}")).collect()
-}

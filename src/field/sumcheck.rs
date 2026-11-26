@@ -19,7 +19,7 @@ pub fn mle_eval(evals: &[Ext], point: &[Ext]) -> Ext {
     debug_assert_eq!(evals.len(), 1 << point.len());
     let mut acc = Ext::ZERO;
     for (j, &e) in evals.iter().enumerate() {
-        acc = acc + e * eq(point, j);
+        acc += e * eq(point, j);
     }
     acc
 }

@@ -8,7 +8,7 @@
 //! committed data to the challenge points/indices that the linear claim, the
 //! LogUp multiplicity, and the WHIR openings use.
 
-use p3_challenger::{CanObserve, CanSampleBits, DuplexChallenger, FieldChallenger};
+use p3_challenger::{CanObserve, DuplexChallenger, FieldChallenger};
 use p3_goldilocks::Poseidon2Goldilocks;
 use rand::rngs::StdRng;
 use rand::SeedableRng;
@@ -69,11 +69,7 @@ impl Transcript {
         self.ch.sample_algebra_element()
     }
 
-    /// Sample a uniform index in `[0, n)` (`n` must be a power of two).
-    pub fn sample_index(&mut self, n: usize) -> usize {
-        self.ch.sample_bits(n.trailing_zeros() as usize)
     }
-}
 
 /// Build a fresh challenger for the verifier, deterministically identical to the
 /// one the prover builds (same seed). The verifier needs this so it can absorb

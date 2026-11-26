@@ -25,8 +25,8 @@ use crate::gkr::segment::{
     CellSegmentCommitment, MulSegmentProof,
 };
 use crate::pcs::linear_claim::{LinearClaimProof, LinearH};
-use p3_field::PrimeCharacteristicRing;
 use crate::pcs::transcript::Transcript;
+use p3_field::PrimeCharacteristicRing;
 
 /// The cells a requant occupies inside the segment.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -225,13 +225,13 @@ fn sum_rlc(r: &[Fp]) -> Ext {
 
 #[cfg(test)]
 mod tests {
-    use crate::gkr::segment::Claims;
     use super::*;
-    use p3_field::PrimeCharacteristicRing;
+    use crate::gkr::segment::Claims;
     use crate::gkr::segment::{verify, SegmentCells};
     use crate::model::spec::requant as requant_i64;
     use crate::pcs::transcript::new_challenger;
     use crate::pcs::whir_stacked::Params;
+    use p3_field::PrimeCharacteristicRing;
     use p3_field::{Field, PrimeField64};
 
     fn fp(x: i64) -> Fp {
@@ -324,7 +324,7 @@ mod tests {
 
     fn decomp_cells(seg: &CellSegment, prefix: &str, _digits: usize) -> DecompCells {
         DecompCells {
-            value: seg.id(&format!("{}", if prefix == "bit" { "rem" } else { "x" })),
+            value: seg.id(if prefix == "bit" { "rem" } else { "x" }),
             all_digits: seg.id(&format!("{prefix}all")),
             diff_q: seg.id(&format!("{prefix}dq")),
             ft: seg.id(&format!("{prefix}ft")),
@@ -357,7 +357,13 @@ mod tests {
             return false;
         }
         let mut vtr = Transcript::new(&new_challenger());
-        verify_requant(&com, &Claims::new(&claims), &proof, (n, k, digits), &mut vtr)
+        verify_requant(
+            &com,
+            &Claims::new(&claims),
+            &proof,
+            (n, k, digits),
+            &mut vtr,
+        )
     }
 
     #[test]

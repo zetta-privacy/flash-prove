@@ -272,8 +272,8 @@ mod tests {
         assert_eq!(adj, vec![10, 1, 0, 5]);
 
         // Row 0: top-1 is 10 at t*=0. Row 1: top-1 is 5 at t*=1.
-        let tau = vec![10i64, 5];
-        let tstar = vec![0usize, 1usize];
+        let tau = [10i64, 5];
+        let tstar = [0usize, 1usize];
         let delta: Vec<i64> = (0..rows * e)
             .map(|i| adj[i] - tau[i / e])
             .collect();
@@ -356,7 +356,7 @@ mod tests {
         }
         let lk = claim_lookup2(
             &mut seg,
-            tc.lookup.clone(),
+            tc.lookup,
             (alpha, beta),
             &table,
             (rows * e, big_n),

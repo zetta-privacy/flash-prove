@@ -33,7 +33,7 @@ impl CryptographicHasher<Fp, [Fp; 2]> for GpuBlake3Hasher {
         if out.is_empty() {
             return;
         }
-        if input.len() % out.len() == 0 {
+        if input.len().is_multiple_of(out.len()) {
             let words = input.len() / out.len();
             if let Some(v) = crate::backend::hash_many(input, words) {
                 out.copy_from_slice(&v);

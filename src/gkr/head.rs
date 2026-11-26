@@ -102,9 +102,7 @@ pub fn claim_head(
 
     // `scores[head_token]` is a plain point evaluation at a Boolean point.
     let tok_point = bool_point(head_token, n.trailing_zeros() as usize)
-        .into_iter()
-        .map(|x| Ext::from(x))
-        .collect::<Vec<_>>();
+        .into_iter().collect::<Vec<_>>();
     let tok_val = seg.claim_id(cells.input, &[0], &tok_point)[0];
     assert_eq!(
         tok_val,
@@ -116,7 +114,7 @@ pub fn claim_head(
         "head_max must be the score at the bound token"
     );
 
-    let lookup = claim_lookup2(seg, cells.clone(), (alpha, beta), table, (n, big_n), tr);
+    let lookup = claim_lookup2(seg, cells, (alpha, beta), table, (n, big_n), tr);
 
     HeadSegmentProof {
         logits,
@@ -150,7 +148,7 @@ pub fn verify_head(
     {
         return false;
     }
-    let cells = proof.cells.clone();
+    let cells = proof.cells;
     let Some(m_logits) = commitment.cells.get(logits).map(|c| c.m()) else {
         return false;
     };
@@ -203,9 +201,7 @@ pub fn verify_head(
 
     // `scores(head_token) = head_max`, which fixes the table the verifier rebuilt.
     let tok_point = bool_point(head_token, bits)
-        .into_iter()
-        .map(|x| Ext::from(x))
-        .collect::<Vec<_>>();
+        .into_iter().collect::<Vec<_>>();
     let expected = Ext::from(if proof.head_max < 0 {
         -Fp::new(proof.head_max.unsigned_abs())
     } else {
