@@ -71,6 +71,24 @@ pub fn commit_weights_whir(
         .collect()
 }
 
+/// [`commit_weights_whir`] over the weights **file**: one tensor is read, committed and
+/// dropped at a time, so the commit phase never holds the model.
+///
+/// The roots are a pure function of `(values, params)`, so this produces exactly what
+/// [`commit_weights_whir`] produces — the same file the prover re-derives.
+pub fn commit_weights_file(
+    index: &crate::model::weights::WeightIndex,
+    params: Params,
+) -> std::io::Result<Vec<(String, whir_stacked::SegmentCommitment)>> {
+    let mut out = Vec::new();
+    for name in index.names() {
+        let w = index.tensor(name)?;
+        let seg = CellSegment::weight_segment(&w, params);
+        out.push((name.clone(), seg.commitment().clone()));
+    }
+    Ok(out)
+}
+
 /// Public description of one committed cell.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CellMeta {

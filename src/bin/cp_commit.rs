@@ -9,7 +9,7 @@ mod common;
 use std::path::PathBuf;
 
 use clap::Parser;
-use flashprove::gkr::segment::commit_weights_whir;
+use flashprove::gkr::segment::commit_weights_file;
 use flashprove::pcs::whir_stacked::Params;
 
 #[derive(Parser)]
@@ -23,9 +23,11 @@ struct Args {
 
 fn main() {
     let args = Args::parse();
-    let weights = common::load_weights_bin(&args.weights);
-
-    let map = commit_weights_whir(&weights, Params::default());
+    // One tensor at a time: the model never has to fit in memory.
+    let index = flashprove::model::weights::WeightIndex::read(&args.weights)
+        .unwrap_or_else(|e| panic!("weights {}: {e}", args.weights.display()));
+    let map = commit_weights_file(&index, Params::default())
+        .unwrap_or_else(|e| panic!("commit {}: {e}", args.weights.display()));
     common::save_bin(&args.out, &map);
     println!("committed {} weights -> {}", map.len(), args.out.display());
 }

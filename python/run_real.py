@@ -4,31 +4,10 @@ emit the trace + request files."""
 
 import argparse
 import json
-import struct
-
-import numpy as np
 
 from run_integer import run, write_binary_trace
+from weights import WeightStore
 
-
-
-def read_bin(path):
-    data = open(path, "rb").read()
-    r = 0
-    n = struct.unpack_from("<I", data, r)[0]
-    r += 4
-    weights = {}
-    for _ in range(n):
-        name_len = struct.unpack_from("<H", data, r)[0]
-        r += 2
-        name = data[r:r + name_len].decode("utf-8")
-        r += name_len
-        rows, cols = struct.unpack_from("<II", data, r)
-        r += 8
-        vals = np.frombuffer(data, dtype=np.int8, count=rows * cols, offset=r)
-        r += rows * cols
-        weights[name] = vals.reshape(rows, cols)
-    return weights
 
 
 def main():
@@ -41,7 +20,8 @@ def main():
     args = p.parse_args()
 
     spec = json.load(open(args.spec))
-    weights = read_bin(args.weights)
+    # Mapped, not read: each tensor is a view, loaded when an op touches it.
+    weights = WeightStore(args.weights)
 
     x = [int(t) for t in args.prompt.split()]
     output_pos = len(x) - 1

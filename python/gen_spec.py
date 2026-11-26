@@ -17,7 +17,7 @@ from run_integer import RECIP_Q, op_role
 SEED_MM = 4
 
 
-def gen_spec(cfg: dict, shifts: dict, sparse_moe: bool = False) -> dict:
+def gen_spec(cfg: dict, shifts: dict, sparse_moe: bool = True) -> dict:
     hidden = cfg["hidden_size"]
     layers = cfg["num_hidden_layers"]
     heads = cfg["num_attention_heads"]

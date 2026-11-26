@@ -65,12 +65,22 @@ def _norm(name: str) -> str:
 
 
 def op_role(op: dict) -> str:
-    """The shift-sharing role of an op: ops in one role use one shift."""
+    """The shift-sharing role of an op: ops in one role use one shift.
+
+    `add` is the exception: the residual stream accumulates across layers, so a single
+    shift for all of them cannot keep every layer in range. Each layer keeps its own
+    (the layer index is part of the role; the expert index still collapses).
+    """
     kind = op["op"]
     if kind == "matmul":
         return "mm:" + _norm(op["weight"])
-    if kind in ("mul", "add"):
-        return f"{kind}:" + _norm(op["output"])
+    if kind == "mul":
+        return "mul:" + _norm(op["output"])
+    if kind == "add":
+        parts = op["output"].split(".")
+        kept = [p if (p.isdigit() and i == 1) else ("*" if p.isdigit() else p)
+                for i, p in enumerate(parts)]
+        return "add:" + ".".join(kept)
     if kind == "scores":
         return "scores"
     return kind
@@ -172,7 +182,7 @@ def write_binary_trace(trace, path):
             f.write(struct.pack("<H", len(name)))
             f.write(name)
             f.write(struct.pack("<II", int(c["rows"]), int(c["cols"])))
-            vals = np.asarray(c["values"], dtype=np.int64)
+            vals = np.asarray(c["values"])
             if vals.size and int(np.abs(vals).max()) >= (1 << 31):
                 raise ValueError(f"{c['name']}: value does not fit the 31-bit field")
             f.write(vals.astype("<i4").tobytes())
@@ -339,8 +349,10 @@ def run(spec, weights, window, output_pos=None, stats=None) -> dict:
             rows, cols = t.shape
         else:
             rows, cols = t.shape[0], t.size // t.shape[0]
+        # Keep the array: `tolist()` would materialise ~28 bytes of Python object per
+        # value, which for the full model is gigabytes of pure waste.
         cells.append({"name": name, "rows": int(rows), "cols": int(cols),
-                      "values": t.flatten().tolist()})
+                      "values": np.ascontiguousarray(t.flatten())})
 
     if output_pos is None:
         output_pos = len(window) - 1

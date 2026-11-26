@@ -25,6 +25,8 @@ struct Entry {
 #[derive(Clone, Debug)]
 pub struct WeightIndex {
     path: PathBuf,
+    /// Tensor names in file order, so a traversal is reproducible.
+    order: Vec<String>,
     entries: HashMap<String, Entry>,
 }
 
@@ -34,6 +36,7 @@ impl WeightIndex {
         let file = File::open(path)?;
         let mut r = BufReader::new(file);
         let count = read_u32(&mut r)? as usize;
+        let mut order = Vec::with_capacity(count);
         let mut entries = HashMap::with_capacity(count);
         for _ in 0..count {
             let name_len = read_u16(&mut r)? as usize;
@@ -47,6 +50,7 @@ impl WeightIndex {
             let offset = r.stream_position()?;
             let len = (rows * cols) as i64;
             r.seek(SeekFrom::Current(len))?;
+            order.push(name.clone());
             entries.insert(
                 name,
                 Entry {
@@ -58,6 +62,7 @@ impl WeightIndex {
         }
         Ok(Self {
             path: path.to_path_buf(),
+            order,
             entries,
         })
     }
@@ -67,8 +72,9 @@ impl WeightIndex {
         self.entries.get(name).map(|e| (e.rows, e.cols))
     }
 
+    /// Tensor names, in file order.
     pub fn names(&self) -> impl Iterator<Item = &String> {
-        self.entries.keys()
+        self.order.iter()
     }
 
     /// Read one tensor's values.

@@ -107,6 +107,10 @@ fn main() {
         .iter()
         .position(|cs| cs.iter().any(|c| c == &args.head_cell))
         .unwrap_or(segment_cells.len() - 1);
+    // One weight set for the run: the file's table of contents is parsed once, and a
+    // tensor stays committed while segments need it.
+    let mut set = flashprove::gkr::driver::WeightSet::from_file(&args.weights, Params::default())
+        .unwrap_or_else(|e| panic!("weights {}: {e}", args.weights.display()));
     let mut segments: Vec<SegmentBundle> = Vec::with_capacity(segment_cells.len());
     for s in 0..segment_cells.len() {
         let head = if s == head_segment {
@@ -143,10 +147,6 @@ fn main() {
             extra.len()
         );
         let t0 = std::time::Instant::now();
-        // One tensor resident at a time: the set reads the weights file on demand.
-        let mut set =
-            flashprove::gkr::driver::WeightSet::from_file(&args.weights, Params::default())
-                .unwrap_or_else(|e| panic!("weights {}: {e}", args.weights.display()));
         let bundle = flashprove::gkr::driver::prove_segment_full(
             &per_segment[s],
             &cells,

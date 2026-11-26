@@ -15,32 +15,34 @@ import struct
 import numpy as np
 
 
-def load_safetensors(path):
-    """Read a safetensors file without torch, returning {name: float32 ndarray}.
-    Handles F32/F16/BF16 (BF16 is reinterpreted exactly as the top 16 bits)."""
-    with open(path, "rb") as f:
-        header_len = struct.unpack("<Q", f.read(8))[0]
-        header = json.loads(f.read(header_len))
-        out = {}
-        for name, info in header.items():
-            if name == "__metadata__":
-                continue
-            dtype = info["dtype"]
-            shape = info["shape"]
-            start, end = info["data_offsets"]
-            f.seek(8 + header_len + start)
-            raw = f.read(end - start)
-            if dtype == "F32":
-                arr = np.frombuffer(raw, dtype=np.float32)
-            elif dtype == "F16":
-                arr = np.frombuffer(raw, dtype=np.float16).astype(np.float32)
-            elif dtype == "BF16":
-                u16 = np.frombuffer(raw, dtype=np.uint16)
-                arr = (u16.astype(np.uint32) << 16).view(np.float32)
-            else:
-                raise ValueError(f"unsupported dtype {dtype} for {name}")
-            out[name] = arr.reshape(shape)
-        return out
+def read_shard(path):
+    """The shard's tensor directory: `(header, data_start)`.
+
+    Nothing is read eagerly: each tensor's bytes are fetched when it is quantised, so a
+    5 GB shard is never materialised as a whole — as `float32` it would be 10 GB.
+    """
+    f = open(path, "rb")
+    header_len = struct.unpack("<Q", f.read(8))[0]
+    header = json.loads(f.read(header_len))
+    return f, header, 8 + header_len
+
+
+def read_tensor(f, data_start, name, info):
+    """One tensor as `float32` (handles F32/F16/BF16 without touching the rest)."""
+    dtype = info["dtype"]
+    start, end = info["data_offsets"]
+    f.seek(data_start + start)
+    raw = f.read(end - start)
+    shape = info["shape"]
+    if dtype == "F32":
+        return np.frombuffer(raw, dtype=np.float32).reshape(shape)
+    if dtype == "F16":
+        return np.frombuffer(raw, dtype=np.float16).astype(np.float32).reshape(shape)
+    if dtype == "BF16":
+        # Exact: BF16 is the top 16 bits of an F32.
+        u16 = np.frombuffer(raw, dtype=np.uint16)
+        return (u16.astype(np.uint32) << 16).view(np.float32).reshape(shape)
+    raise ValueError(f"unsupported dtype {dtype} for {name}")
 
 
 def rename(key: str) -> str:
@@ -97,35 +99,41 @@ def main():
         index = json.load(f)
     shards = sorted(set(index["weight_map"].values()))
 
-    tensors = []
-    for shard in shards:
-        state = load_safetensors(os.path.join(args.dir, shard))
-        for key, tensor in state.items():
-            name = rename(key)
-            if spec_names is not None and name not in spec_names:
-                continue
-            vals = quantize(tensor)
-            if vals.ndim == 1:
-                vals = vals.reshape(1, -1)
-            # The spec fixes each tensor's shape (e.g. a reduced test vocab). Trim the
-            # checkpoint tensor to it, so spec and weights always agree.
-            if name in spec_shapes:
-                rows, cols = spec_shapes[name]
-                vals = vals[:rows, :cols]
-            tensors.append((name, vals))
-        del state
-
-    with open(args.out, "wb") as f:
-        f.write(struct.pack("<I", len(tensors)))
-        for name, vals in tensors:
-            rows, cols = vals.shape
-            nb = name.encode("utf-8")
-            f.write(struct.pack("<H", len(nb)))
-            f.write(nb)
-            f.write(struct.pack("<II", rows, cols))
-            f.write(vals.astype(np.int8).tobytes())
-
-    print(f"wrote {len(tensors)} tensors -> {args.out}")
+    # Stream: one tensor is read, quantised and written at a time, so peak memory is the
+    # largest tensor (`lm_head`, ~0.4 GB) rather than the model. The count at the head of
+    # the file is patched once the number is known.
+    count = 0
+    with open(args.out, "wb") as out:
+        out.write(struct.pack("<I", 0))
+        for shard in shards:
+            f, header, data_start = read_shard(os.path.join(args.dir, shard))
+            try:
+                for key, info in header.items():
+                    if key == "__metadata__":
+                        continue
+                    name = rename(key)
+                    if spec_names is not None and name not in spec_names:
+                        continue
+                    vals = quantize(read_tensor(f, data_start, name, info))
+                    if vals.ndim == 1:
+                        vals = vals.reshape(1, -1)
+                    # The spec fixes each tensor's shape (e.g. a reduced test vocab), so
+                    # trim the checkpoint tensor to it and drop everything else.
+                    if name in spec_shapes:
+                        rows, cols = spec_shapes[name]
+                        vals = vals[:rows, :cols]
+                    nb = name.encode("utf-8")
+                    rows, cols = vals.shape
+                    out.write(struct.pack("<H", len(nb)))
+                    out.write(nb)
+                    out.write(struct.pack("<II", rows, cols))
+                    out.write(vals.astype(np.int8).tobytes())
+                    count += 1
+            finally:
+                f.close()
+        out.seek(0)
+        out.write(struct.pack("<I", count))
+    print(f"wrote {count} tensors -> {args.out}")
 
 
 if __name__ == "__main__":
