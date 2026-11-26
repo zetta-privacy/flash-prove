@@ -77,7 +77,8 @@ The model is not a monolithic function; it's a graph of small, well-understood o
 | `weighted_v` | `out = w · v` |
 | `silu` / `mul` / `add` | elementwise, optionally rescaling the result |
 | `top_k` | `choice = indicator of the k largest router scores` |
-| `weighted_sum` | `out = Σ_e choice[e] · term_e` |
+| `gather` | `out[r] = x[idx[r]]`, the positions that selected an expert |
+| `moe_combine` | `out[p] = Σ_{e : p selected e} term_e[r_e(p)]` |
 
 The prover commits every cell and every weight to a polynomial commitment. Each op then becomes a
 constraint *between committed values* that the verifier must check. The op graph is data
@@ -224,13 +225,16 @@ macOS. It is a development stand-in for OLMoE-1B-7B, not the target model:
 | step | time | peak RSS |
 |---|---|---|
 | `cp_commit` (weights, pre-shared roots) | 36 s | 7.0 GB |
-| `cp_prove` (Metal kernels on) | 2,593 s | 10.3 GB |
-| `cp_verify` | 5.1 s wall, 9.0 s CPU | 0.9 GB |
-| proof file | 63.7 MB | — |
+| `cp_prove` (Metal kernels on) | 467 s | 8.1 GB |
+| `cp_verify` | 4.9 s wall, 7.3 s CPU | 0.9 GB |
+| proof file | 53.3 MB | — |
+| trace (flat binary, `i32`) | 39.3 MB | — |
 
-Verification details at that scale: nine segments on nine threads, per segment 4.5 s / 1.4 s /
-0.5 s ×7, plus ~0.6 s of loading. Of the 63.7 MB proof, the WHIR proofs themselves are 2.5 MB; the
-rest is the per-op sub-proofs and the recorded openings. The prover is Metal-accelerated
+Verification details at that scale: eleven segments on eleven threads, 10–143 s of proving each
+(the first segment carries the attention and embedding); the MoE tail alone went from 645 s to
+209 s when each expert stopped running on every position. Per-op figures: `weighted_sum` cost
+4,096 claims per layer, and the gather/combine now costs 64 selections plus 65 scatter-add claims —
+`Σ_e rows_e = k·L` rows instead of `64·L`. The prover is Metal-accelerated
 (`FLASHPROVE_GPU=1`) for Merkle hashing, the WHIR NTT, MLE evaluations and the sumcheck;
 verification is CPU-only.
 
@@ -245,7 +249,7 @@ Working end to end: commit → prove → verify, `accept`, 75 library + 2 integr
 
 - **Succinct.** The verifier never reads the tables: `O(m)` per claim, one `O(log n)` WHIR check per
   segment. Not succinct in *claim count* — one per norm row, one per (row, expert) of the MoE
-  combine — so verification is linear in it (5.1 s; of the 63.7 MB proof, 2.5 MB is WHIR).
+  combine — so verification is linear in it (4.9 s; of the 53.3 MB proof, ~2.5 MB is WHIR).
 - **Complete.** An honest prover for the spec the verifier holds is always accepted; the tests also
   cover the rejection side. The statement is about the *integer* model, not the float checkpoint.
 - **Not zero-knowledge, deliberately.** OLMoE is open-weight, so hiding the weights buys nothing —

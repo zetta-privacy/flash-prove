@@ -15,6 +15,7 @@ all committed values stay small (`SHIFT_TARGET` bits). Shifts are per *role*
 import argparse
 import json
 import math
+import struct
 
 import numpy as np
 
@@ -150,11 +151,39 @@ def rmsnorm(x, gamma, eps):
     return out.reshape(x.shape)
 
 
+def write_binary_trace(trace, path):
+    """Flat binary layout, read on demand by `src/model/trace_file.rs`.
+
+    magic "FPT1", u32 cell count, i64 head token, then per cell
+    u16 name_len, name, u32 rows, u32 cols, i32 * rows * cols.
+
+    Values are `i32`: every traced value is committed and the field guard requires
+    `|v| < 2^31` (BabyBear/Goldilocks signed range), so 32 bits is lossless and half
+    the bytes of `i64`.
+    """
+    seg = trace["segments"][0]
+    cells = seg["cells"]
+    with open(path, "wb") as f:
+        f.write(b"FPT1")
+        f.write(struct.pack("<I", len(cells)))
+        f.write(struct.pack("<q", seg["head_token"] if seg["head_token"] is not None else -1))
+        for c in cells:
+            name = c["name"].encode("utf-8")
+            f.write(struct.pack("<H", len(name)))
+            f.write(name)
+            f.write(struct.pack("<II", int(c["rows"]), int(c["cols"])))
+            vals = np.asarray(c["values"], dtype=np.int64)
+            if vals.size and int(np.abs(vals).max()) >= (1 << 31):
+                raise ValueError(f"{c['name']}: value does not fit the 31-bit field")
+            f.write(vals.astype("<i4").tobytes())
+
+
 def run(spec, weights, window, output_pos=None, stats=None) -> dict:
     """Run the op graph. With `stats`, record each role's largest pre-shift value
     (used by `calibrate.py`; `stats["scores"]` holds the largest safe score shift).
     """
     env = {}
+    selections = {}
     if stats is None:
         stats = {}
 
@@ -264,6 +293,33 @@ def run(spec, weights, window, output_pos=None, stats=None) -> dict:
             np.put_along_axis(choice, top, 1, axis=-1)
             env[op["output"]] = s
             env[op["choice"]] = choice
+        elif kind == "gather":
+            # The rows of `input` where this expert is selected, in increasing order.
+            ch = get(op["choice"])  # [L, E]
+            e = int(op["expert"])
+            rows = np.flatnonzero(ch[:, e]).astype(np.int64)
+            src = get(op["input"])  # [L, hidden]
+            # The arithmetization needs a power-of-two height; pad with zeros. Every op
+            # downstream maps a zero row to a zero row, and the combine reads only the
+            # real rows, so the padding is inert.
+            pad = max(1, int(2 ** np.ceil(np.log2(max(len(rows), 1)))))
+            out = np.zeros((pad, src.shape[1]), dtype=np.int64)
+            if len(rows):
+                out[: len(rows)] = src[rows]
+            env[op["output"]] = out
+            selections[op["output"]] = [int(r) for r in rows]
+        elif kind == "moe_combine":
+            # out[p] = sum over the experts whose gathered row p came from position p.
+            ch = get(op["choice"])
+            terms = [get(t) for t in op["terms"]]
+            acc = np.zeros((ch.shape[0], terms[0].shape[1]), dtype=np.int64)
+            for e, term in enumerate(terms):
+                rows = np.flatnonzero(ch[:, e]).astype(np.int64)
+                if rows.size:
+                    # The gathered cell is padded to a power of two; only the real rows
+                    # belong to positions.
+                    acc[rows] += term[: rows.size]
+            env[op["output"]] = acc
         elif kind == "weighted_sum":
             ch = get(op["choice"])  # [L, E]
             terms = [get(t) for t in op["terms"]]  # each [L, hidden]
@@ -290,7 +346,12 @@ def run(spec, weights, window, output_pos=None, stats=None) -> dict:
         output_pos = len(window) - 1
     logits = env["logits"]  # [L, vocab]
     head_token = int(np.argmax(logits[output_pos]))
-    return {"segments": [{"head_token": head_token, "cells": cells}]}
+    return {
+        "segments": [{"head_token": head_token, "cells": cells}],
+        # Per gathered cell: the source rows it holds, in order. Public data the prover
+        # hands to the verifier, which checks it against the committed choice.
+        "selections": selections,
+    }
 
 
 def main():
@@ -298,7 +359,7 @@ def main():
     p.add_argument("--spec", default="data/olmoe.json")
     p.add_argument("--weights", default="data/weights.json")
     p.add_argument("--prompt", default="1 2 3 4")
-    p.add_argument("--out", default="data/trace.json")
+    p.add_argument("--out", default="data/trace.bin")
     args = p.parse_args()
 
     with open(args.spec) as f:
@@ -309,8 +370,7 @@ def main():
 
     prompt = [int(t) for t in args.prompt.split()]
     trace = run(spec, weights, prompt)
-    with open(args.out, "w") as f:
-        json.dump(trace, f)
+    write_binary_trace(trace, args.out)
     print(f"greedy token = {trace['segments'][0]['head_token']}, "
           f"{len(trace['segments'][0]['cells'])} cells -> {args.out}")
 

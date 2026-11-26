@@ -15,11 +15,11 @@ calibrate:
 
 trace:
 	.venv/bin/python python/run_real.py --spec $(SPEC) --weights $(WEIGHTS) \
-		--prompt $(PROMPT) --window $(WINDOW) --out data/trace.json
+		--prompt $(PROMPT) --window $(WINDOW) --out data/trace.bin
 
 prove:
 	/usr/bin/time -l target/release/cp_prove --spec $(SPEC) --weights $(WEIGHTS) \
-		--trace data/trace.json --prompt data/prompt.json --output data/output.json \
+		--trace data/trace.bin --prompt data/prompt.json --output data/output.json \
 		--fill data/fill.json --out data/proof.bin
 
 verify:

@@ -17,7 +17,7 @@ from run_integer import RECIP_Q, op_role
 SEED_MM = 4
 
 
-def gen_spec(cfg: dict, shifts: dict) -> dict:
+def gen_spec(cfg: dict, shifts: dict, sparse_moe: bool = False) -> dict:
     hidden = cfg["hidden_size"]
     layers = cfg["num_hidden_layers"]
     heads = cfg["num_attention_heads"]
@@ -113,12 +113,22 @@ def gen_spec(cfg: dict, shifts: dict) -> dict:
                     "choice": f"{p}.expert_choice", "k": active})
         cells += [f"{p}.router_logits", f"{p}.expert_choice"]
 
+        # Each expert runs only on the positions that selected it (`sparse_moe`), or on
+        # every position (`weighted_sum` masks afterwards). The former is 8x less work
+        # and 8x less committed data; the arithmetic per row is identical either way.
         terms = []
         for e in range(experts):
             e_ = f"{p}.expert.{e}"
-            ops.append({"op": "matmul", "input": f"{p}.norm_moe",
+            src = f"{p}.norm_moe"
+            if sparse_moe:
+                src = f"{e_}.in"
+                ops.append({"op": "gather", "input": f"{p}.norm_moe",
+                            "choice": f"{p}.expert_choice", "expert": e,
+                            "output": src})
+                cells.append(src)
+            ops.append({"op": "matmul", "input": src,
                         "weight": f"{e_}.gate_proj", "output": f"{e_}.gate"})
-            ops.append({"op": "matmul", "input": f"{p}.norm_moe",
+            ops.append({"op": "matmul", "input": src,
                         "weight": f"{e_}.up_proj", "output": f"{e_}.up"})
             ops.append({"op": "silu", "input": f"{e_}.gate", "output": f"{e_}.act"})
             ops.append({"op": "mul", "a": f"{e_}.act", "b": f"{e_}.up", "output": f"{e_}.h"})
@@ -126,7 +136,8 @@ def gen_spec(cfg: dict, shifts: dict) -> dict:
                         "output": f"{e_}.down"})
             terms.append(f"{e_}.down")
             cells += [f"{e_}.gate", f"{e_}.up", f"{e_}.act", f"{e_}.h", f"{e_}.down"]
-        ops.append({"op": "weighted_sum", "choice": f"{p}.expert_choice",
+        combine = "moe_combine" if sparse_moe else "weighted_sum"
+        ops.append({"op": combine, "choice": f"{p}.expert_choice",
                     "terms": terms, "output": f"{p}.moe"})
         cells.append(f"{p}.moe")
 
@@ -170,6 +181,8 @@ def main() -> None:
     parser.add_argument("--config", default="olmoe/config.json")
     parser.add_argument("--shifts", default="data/shifts.json")
     parser.add_argument("--out", default="data/olmoe.json")
+    parser.add_argument("--dense-moe", action="store_true",
+                        help="run every expert on every position (the pre-sparse layout)")
     args = parser.parse_args()
 
     with open(args.config) as f:
@@ -178,8 +191,12 @@ def main() -> None:
     if os.path.exists(args.shifts):
         with open(args.shifts) as f:
             shifts = json.load(f)
-    spec = gen_spec(cfg, shifts)
+    spec = gen_spec(cfg, shifts, sparse_moe=not args.dense_moe)
     with open(args.out, "w") as f:
         json.dump(spec, f, indent=1)
     print(f"wrote {args.out}: {len(spec['weights'])} weights, "
           f"{len(spec['ops'])} ops, {len(spec['cells'])} cells")
+
+
+if __name__ == "__main__":
+    main()

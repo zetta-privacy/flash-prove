@@ -16,7 +16,6 @@ use flashprove::gkr::driver::{
     ops_per_segment, DriverError, HeadSpec, LookupBounds, ProvedModel, SegmentBundle,
 };
 use flashprove::model::spec::ModelSpec;
-use flashprove::model::Trace;
 use flashprove::pcs::whir_stacked::Params;
 
 #[derive(Parser)]
@@ -56,18 +55,19 @@ fn main() {
     let args = Args::parse();
 
     let spec: ModelSpec = common::load(&args.spec);
-    let weights = common::load_weights_bin(&args.weights);
-    let trace: Trace = common::load(&args.trace);
+    // Only the trace's headers are read here; each segment's cells are then read on
+    // demand, so peak memory is one segment rather than the whole trace.
+    let trace = flashprove::model::trace_file::TraceIndex::read(&args.trace).unwrap_or_else(|e| {
+        panic!("trace {}: {e}", args.trace.display());
+    });
     let x: Vec<usize> = common::load(&args.prompt);
     let y: Vec<usize> = common::load(&args.output);
     let fill: Vec<usize> = common::load(&args.fill);
 
     // Reconstruct the window the engine actually ran: x + y + fill, zero-padded to
     // the embedding row count (the window length).
-    let l = trace.segments[0]
-        .cells
-        .first()
-        .map(|c| c.rows)
+    let l = trace
+        .window_len()
         .unwrap_or(x.len() + y.len() + fill.len());
     let mut window = Vec::with_capacity(l);
     window.extend_from_slice(&x);
@@ -75,26 +75,18 @@ fn main() {
     window.extend_from_slice(&fill);
     window.resize(l, 0);
 
-    let head_token = match trace.segments[0].head_token {
-        Some(h) => h,
-        None => panic!("trace has no head token"),
-    };
-
-    // One map from name to the trace cell; the trace may arrive as a single segment.
-    let by_name: std::collections::HashMap<&str, &flashprove::model::Cell> = trace
-        .segments
-        .iter()
-        .flat_map(|s| s.cells.iter())
-        .map(|c| (c.name.as_str(), c))
-        .collect();
+    let head_token = trace
+        .head_token()
+        .unwrap_or_else(|| panic!("trace has no head token"));
 
     let head_max = {
-        let logits = by_name
-            .get(args.head_cell.as_str())
-            .unwrap_or_else(|| panic!("trace has no `{}` cell", args.head_cell));
+        let logits = trace
+            .cell(&args.head_cell)
+            .unwrap_or_else(|e| panic!("trace cell {}: {e}", args.head_cell));
         logits.values[(logits.rows - 1) * logits.cols + head_token]
     };
-    let bounds = LookupBounds::derive(&spec, &trace);
+    // The bounds scan a handful of cells; they are read one at a time.
+    let bounds = LookupBounds::derive_with(&spec, |name| trace.cell(name).ok());
 
     // Split the op graph into segments and tie every cross-segment input back to the
     // segment that owns it (see `driver::link_schedule`).
@@ -104,8 +96,10 @@ fn main() {
         ops_per_segment(&spec.ops, &segment_cells).unwrap_or_else(|e| panic!("{e:?}"));
     let links = flashprove::gkr::driver::link_schedule(&segment_cells, &per_segment);
     let arity = |name: &str| {
-        let cell = by_name[name];
-        (cell.rows * cell.cols).next_power_of_two().trailing_zeros() as usize
+        let (rows, cols) = trace
+            .shape(name)
+            .unwrap_or_else(|| panic!("trace has no `{name}` cell"));
+        (rows * cols).next_power_of_two().trailing_zeros() as usize
     };
     let openings = flashprove::gkr::driver::link_openings(&links, segment_cells.len(), arity);
 
@@ -125,13 +119,16 @@ fn main() {
             None
         };
         // Own cells plus a copy of every input an earlier segment owns.
-        let mut cells: Vec<flashprove::model::Cell> = segment_cells[s]
-            .iter()
-            .map(|n| (*by_name[n.as_str()]).clone())
-            .collect();
+        let read = |name: &str| {
+            trace
+                .cell(name)
+                .unwrap_or_else(|e| panic!("trace cell {name}: {e}"))
+        };
+        let mut cells: Vec<flashprove::model::Cell> =
+            segment_cells[s].iter().map(|n| read(n)).collect();
         for name in flashprove::gkr::driver::external_inputs(&segment_cells[s], &per_segment[s]) {
             if !segment_cells[s].iter().any(|c| c == &name) {
-                cells.push((*by_name[name.as_str()]).clone());
+                cells.push(read(&name));
             }
         }
         // Outgoing and incoming links: open our own cells (and the copies we hold) at
@@ -146,10 +143,14 @@ fn main() {
             extra.len()
         );
         let t0 = std::time::Instant::now();
+        // One tensor resident at a time: the set reads the weights file on demand.
+        let mut set =
+            flashprove::gkr::driver::WeightSet::from_file(&args.weights, Params::default())
+                .unwrap_or_else(|e| panic!("weights {}: {e}", args.weights.display()));
         let bundle = flashprove::gkr::driver::prove_segment_full(
             &per_segment[s],
             &cells,
-            &weights,
+            &mut set,
             &spec.dims,
             (args.digits, Fp::new(11), Fp::new(5), args.rec_q, args.eps),
             &bounds,

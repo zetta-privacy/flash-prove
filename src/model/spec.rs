@@ -119,6 +119,19 @@ pub enum Op {
         choice: String,
         k: usize,
     },
+    /// The rows of `input` where `choice[·][expert]` is one, in increasing order.
+    Gather {
+        input: String,
+        choice: String,
+        expert: usize,
+        output: String,
+    },
+    /// The MoE combine: each expert's gathered rows added back at their positions.
+    MoeCombine {
+        choice: String,
+        terms: Vec<String>,
+        output: String,
+    },
     /// MoE weighted sum: out[s] = Σ_e choice[s][e] · term_e[s].
     WeightedSum {
         choice: String,

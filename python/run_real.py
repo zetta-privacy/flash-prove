@@ -8,7 +8,7 @@ import struct
 
 import numpy as np
 
-from run_integer import run
+from run_integer import run, write_binary_trace
 
 
 
@@ -37,7 +37,7 @@ def main():
     p.add_argument("--weights", default="data/weights.bin")
     p.add_argument("--prompt", default="1 2 3")
     p.add_argument("--window", type=int, default=1024, help="window length L")
-    p.add_argument("--out", default="data/trace.json")
+    p.add_argument("--out", default="data/trace.bin")
     args = p.parse_args()
 
     spec = json.load(open(args.spec))
@@ -55,7 +55,7 @@ def main():
     window = (x + y + fill) + [0] * (L - len(x) - len(y) - len(fill))
     trace = run(spec, weights, window, output_pos)
 
-    json.dump(trace, open(args.out, "w"))
+    write_binary_trace(trace, args.out)
     json.dump(x, open("data/prompt.json", "w"))
     json.dump(y, open("data/output.json", "w"))
     json.dump(fill, open("data/fill.json", "w"))

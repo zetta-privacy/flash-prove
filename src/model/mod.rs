@@ -1,6 +1,8 @@
 //! The trace and weight types shared by the GKR verifier and the inference engine.
 
 pub mod spec;
+pub mod trace_file;
+pub mod weights;
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Trace {

@@ -44,6 +44,12 @@ impl CommittedConfig {
             .flat_map(|s| s.cells.iter())
             .map(|c| (c.name.as_str(), c))
             .collect();
+        Self::derive_with(spec, |name| cells.get(name).map(|c| (*c).clone()))
+    }
+
+    /// [`Self::derive`] over a cell *provider*, so the prover can read only the cells the
+    /// bounds actually look at instead of holding the whole trace.
+    pub fn derive_with(spec: &ModelSpec, get: impl Fn(&str) -> Option<crate::model::Cell>) -> Self {
 
         let mut silu_lo = i64::MAX;
         let mut silu_hi = i64::MIN;
@@ -53,7 +59,7 @@ impl CommittedConfig {
         let mut score_lo = i64::MAX;
         let mut score_hi = i64::MIN;
 
-        if let Some(c) = cells.get("logits") {
+        if let Some(c) = get("logits") {
             for &v in &c.values {
                 score_lo = score_lo.min(v);
                 score_hi = score_hi.max(v);
@@ -63,7 +69,7 @@ impl CommittedConfig {
         for op in &spec.ops {
             match op {
                 Op::Silu { input, .. } => {
-                    if let Some(c) = cells.get(input.as_str()) {
+                    if let Some(c) = get(input.as_str()) {
                         for &v in &c.values {
                             silu_lo = silu_lo.min(v);
                             silu_hi = silu_hi.max(v);
@@ -71,7 +77,7 @@ impl CommittedConfig {
                     }
                 }
                 Op::CausalSoftmax { input, .. } => {
-                    if let Some(c) = cells.get(input.as_str()) {
+                    if let Some(c) = get(input.as_str()) {
                         let (mut mn, mut mx) = (i64::MAX, i64::MIN);
                         for &v in &c.values {
                             mn = mn.min(v);
@@ -81,7 +87,7 @@ impl CommittedConfig {
                     }
                 }
                 Op::TopK { input, .. } => {
-                    if let Some(c) = cells.get(input.as_str()) {
+                    if let Some(c) = get(input.as_str()) {
                         let (mut mn, mut mx) = (i64::MAX, i64::MIN);
                         for &v in &c.values {
                             mn = mn.min(v);

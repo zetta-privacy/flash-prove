@@ -48,6 +48,13 @@ pub enum SegmentOpProof {
     },
     Mul(MulSegmentProof),
     Reshape(ReshapeSegmentProof),
+    /// A gathered expert input: `out[r][·] = input[idx[r]][·]`.
+    Gather(crate::gkr::segment::GatherSegmentProof),
+    /// The MoE combine: one selection per expert plus the scattered sum.
+    MoeCombine {
+        selections: Vec<crate::gkr::segment::SelectionSegmentProof>,
+        combine: crate::gkr::segment::ScatterAddSegmentProof,
+    },
     /// A shifted `mul`: the raw product `y = a·b` plus `out = requant(y, shift)`.
     MulRq {
         out: usize,
@@ -137,6 +144,8 @@ fn op_name(op: &Op) -> &'static str {
         Op::WeightedV { .. } => "weighted_v",
         Op::Silu { .. } => "silu",
         Op::Mul { .. } => "mul",
+        Op::Gather { .. } => "gather",
+        Op::MoeCombine { .. } => "moe_combine",
         Op::Add { .. } => "add",
         Op::TopK { .. } => "top_k",
         Op::WeightedSum { .. } => "weighted_sum",
@@ -155,6 +164,7 @@ fn op_cells(op: &Op) -> Vec<&str> {
             .chain([output.as_str()])
             .collect(),
         Op::Mul { a, b, output, .. } => vec![a, b, output],
+        Op::Gather { input, choice, output, .. } => vec![input, choice, output],
         Op::Reshape { input, output, .. } => vec![input, output],
         _ => Vec::new(),
     }
@@ -225,7 +235,7 @@ pub fn prove_segment(
 pub fn prove_segment_with_weights(
     ops: &[Op],
     cells: &[Cell],
-    weights: &[WeightMatrix],
+    set: &mut WeightSet,
     dims: &crate::model::spec::Dims,
     (digits, alpha, beta, rec_q, eps): (usize, Fp, Fp, u32, f64),
     bounds: &LookupBounds,
@@ -235,7 +245,7 @@ pub fn prove_segment_with_weights(
     prove_segment_with_head(
         ops,
         cells,
-        weights,
+        set,
         dims,
         (digits, alpha, beta, rec_q, eps),
         bounds,
@@ -387,6 +397,9 @@ impl Shapes {
             | Op::Silu { input, output, .. }
             | Op::CausalSoftmax { input, output } => self.copy_from(input, output),
             Op::Mul { a, output, .. } => self.copy_from(a, output),
+            // A gathered cell's height is data (how many positions selected the expert),
+            // so it is not derivable from the op graph.
+            Op::Gather { .. } | Op::MoeCombine { .. } => Ok(()),
             Op::Add { inputs, output, .. } => {
                 let first = inputs
                     .first()
@@ -457,20 +470,52 @@ impl Shapes {
 /// its own root (WHIR needs the whole stacked witness to open anything in it, so one
 /// global weight root would force every weight resident at once).
 pub struct WeightSet {
-    tensors: std::collections::HashMap<String, WeightMatrix>,
+    /// In-memory tensors (tests, and callers that already hold them).
+    memory: std::collections::HashMap<String, WeightMatrix>,
+    /// The weights file, read one tensor at a time.
+    index: Option<crate::model::weights::WeightIndex>,
     provers: std::collections::HashMap<String, SegmentProver>,
     params: Params,
 }
 
 impl WeightSet {
+    /// A set backed by tensors the caller already holds (cloned: they are small in tests).
     pub fn new(weights: &[WeightMatrix], params: Params) -> Self {
         Self {
-            tensors: weights
+            memory: weights
                 .iter()
                 .map(|w| (w.name.clone(), w.clone()))
                 .collect(),
+            index: None,
             provers: Default::default(),
             params,
+        }
+    }
+
+    /// A set backed by the weights file: each tensor is read when it is committed and
+    /// then dropped, so peak memory is one tensor rather than the whole model.
+    pub fn from_file(path: &std::path::Path, params: Params) -> std::io::Result<Self> {
+        Ok(Self {
+            memory: Default::default(),
+            index: Some(crate::model::weights::WeightIndex::read(path)?),
+            provers: Default::default(),
+            params,
+        })
+    }
+
+    /// `(rows, cols)` of a weight tensor, without reading it.
+    pub fn shape(&self, name: &str) -> Option<(usize, usize)> {
+        match &self.index {
+            Some(i) => i.shape(name),
+            None => self.memory.get(name).map(|w| (w.rows, w.cols)),
+        }
+    }
+
+    /// The tensor's values, read on demand.
+    pub fn tensor(&self, name: &str) -> Option<WeightMatrix> {
+        match &self.index {
+            Some(i) => i.tensor(name).ok(),
+            None => self.memory.get(name).cloned(),
         }
     }
 
@@ -479,11 +524,10 @@ impl WeightSet {
     pub fn get_or_commit(&mut self, name: &str) -> Result<&mut SegmentProver, DriverError> {
         if !self.provers.contains_key(name) {
             let w = self
-                .tensors
-                .get(name)
+                .tensor(name)
                 .ok_or_else(|| DriverError::UnknownCell(name.to_string()))?;
             let t0 = std::time::Instant::now();
-            let prov = weight_prover(w, self.params);
+            let prov = weight_prover(&w, self.params);
             eprintln!(
                 "  weight {name} committed in {:.1}s",
                 t0.elapsed().as_secs_f64()
@@ -506,8 +550,8 @@ impl WeightSet {
     ///
     /// A tensor with no claims has nothing to prove, so it is skipped rather than
     /// producing an empty proof.
-    pub fn prove_all(self) -> Vec<(String, whir_stacked::SegmentCommitment, whir_stacked::Proof)> {
-        self.provers
+    pub fn prove_all(&mut self) -> Vec<(String, whir_stacked::SegmentCommitment, whir_stacked::Proof)> {
+        std::mem::take(&mut self.provers)
             .into_iter()
             .filter(|(_, p)| p.num_claims() > 0)
             .map(|(name, p)| {
@@ -611,6 +655,20 @@ impl LookupBounds {
     /// Derive the bounds from a trace, exactly as [`crate::gkr::bounds::CommittedConfig`] does.
     pub fn derive(spec: &crate::model::spec::ModelSpec, trace: &crate::model::Trace) -> Self {
         let c = crate::gkr::bounds::CommittedConfig::derive(spec, trace);
+        Self::from_config(c)
+    }
+
+    /// [`Self::derive`] over a cell *provider*, so the prover reads only the cells the
+    /// bounds look at rather than the whole trace.
+    pub fn derive_with(
+        spec: &crate::model::spec::ModelSpec,
+        get: impl Fn(&str) -> Option<crate::model::Cell>,
+    ) -> Self {
+        let c = crate::gkr::bounds::CommittedConfig::derive_with(spec, get);
+        Self::from_config(c)
+    }
+
+    fn from_config(c: crate::gkr::bounds::CommittedConfig) -> Self {
         Self {
             silu_lo: c.silu_lo,
             silu_hi: c.silu_hi,
@@ -662,6 +720,7 @@ pub struct SegmentBundle {
 fn op_outputs(op: &Op) -> Vec<&str> {
     match op {
         Op::TopK { output, choice, .. } => vec![output.as_str(), choice.as_str()],
+        Op::Gather { output, .. } | Op::MoeCombine { output, .. } => vec![output.as_str()],
         Op::Add { output, .. }
         | Op::Mul { output, .. }
         | Op::Reshape { output, .. }
@@ -689,6 +748,10 @@ fn op_inputs(op: &Op) -> Vec<&str> {
         | Op::TopK { input, .. }
         | Op::Norm { input, .. }
         | Op::Rope { input, .. } => vec![input.as_str()],
+        Op::Gather { input, choice, .. } => vec![input.as_str(), choice.as_str()],
+        Op::MoeCombine { choice, terms, .. } => std::iter::once(choice.as_str())
+            .chain(terms.iter().map(|s| s.as_str()))
+            .collect(),
         Op::Scores { q, k, .. } => vec![q.as_str(), k.as_str()],
         Op::WeightedV { weights, v, .. } => vec![weights.as_str(), v.as_str()],
         Op::WeightedSum { choice, terms, .. } => std::iter::once(choice.as_str())
@@ -844,7 +907,7 @@ fn matvec(w: &WeightMatrix, x: &[i64]) -> Vec<i64> {
 pub fn prove_segment_with_head(
     ops: &[Op],
     cells: &[Cell],
-    weights: &[WeightMatrix],
+    set: &mut WeightSet,
     dims: &crate::model::spec::Dims,
     params_digits: (usize, Fp, Fp, u32, f64),
     bounds: &LookupBounds,
@@ -855,7 +918,7 @@ pub fn prove_segment_with_head(
     prove_segment_full(
         ops,
         cells,
-        weights,
+        set,
         dims,
         params_digits,
         bounds,
@@ -872,7 +935,7 @@ pub fn prove_segment_with_head(
 pub fn prove_segment_full(
     ops: &[Op],
     cells: &[Cell],
-    weights: &[WeightMatrix],
+    set: &mut WeightSet,
     dims: &crate::model::spec::Dims,
     (digits, alpha, beta, rec_q, eps): (usize, Fp, Fp, u32, f64),
     bounds: &LookupBounds,
@@ -882,8 +945,6 @@ pub fn prove_segment_full(
     extra: &[(String, Vec<Ext>)],
 ) -> Result<SegmentBundle, DriverError> {
     let _ = (dims, window, head);
-    let by_name: std::collections::HashMap<&str, &WeightMatrix> =
-        weights.iter().map(|w| (w.name.as_str(), w)).collect();
 
     // Pass 1: plan every derived cell, keeping the names for the claim pass.
     let mut plan = crate::gkr::plan::Plan::new(cells);
@@ -969,8 +1030,10 @@ pub fn prove_segment_full(
                 output,
                 shift,
             } => {
-                let w = by_name
-                    .get(weight.as_str())
+                // `y = W·x` is recomputed here to plan the derived cell, so the values
+                // are read once (the commit reads them once more; neither keeps them).
+                let w = set
+                    .tensor(weight)
                     .ok_or_else(|| DriverError::UnknownCell(weight.clone()))?;
                 // The input is `(rows, cols)`: a per-token vector when `cols == 1`,
                 // otherwise a `seq × hidden` batch the op applies row by row.
@@ -993,11 +1056,11 @@ pub fn prove_segment_full(
                             w.cols
                         )));
                     }
-                    matvec(w, &xs)
+                    matvec(&w, &xs)
                 } else {
                     let mut y = Vec::with_capacity(in_rows * w.rows);
                     for t in 0..in_rows {
-                        y.extend(matvec(w, &xs[t * in_cols..(t + 1) * in_cols]));
+                        y.extend(matvec(&w, &xs[t * in_cols..(t + 1) * in_cols]));
                     }
                     y
                 };
@@ -1010,6 +1073,74 @@ pub fn prove_segment_full(
                 plan.add_logical(&y_name, y_rows, y_cols, y);
                 let rq = plan.requant(&format!("__mm.{i}.rq"), &y_name, output, k, digits);
                 planned.push(Some(PlannedOp::Matmul { rq }));
+            }
+            Op::Gather {
+                input,
+                choice,
+                expert,
+                output,
+            } => {
+                let Some((rows, cols)) = plan.logical(input) else {
+                    return Err(DriverError::UnknownCell(input.clone()));
+                };
+                let Some((_, experts)) = plan.logical(choice) else {
+                    return Err(DriverError::UnknownCell(choice.clone()));
+                };
+                let Some((orows, ocols)) = plan.logical(output) else {
+                    return Err(DriverError::UnknownCell(output.clone()));
+                };
+                if *expert >= experts || ocols != cols {
+                    return Err(DriverError::ShapeMismatch("gather shape".into()));
+                }
+                // The rows this expert ran on, read straight from the committed choice.
+                let ch = plan.values(choice);
+                let idx: Vec<usize> = (0..rows)
+                    .filter(|p| ch[p * experts + expert] != 0)
+                    .collect();
+                // The cell is padded up to a power of two, so it must hold at least the
+                // real rows (and its extra rows are inert).
+                if idx.len() > orows || orows.count_ones() != 1 {
+                    return Err(DriverError::ShapeMismatch(format!(
+                        "{output}: {orows} rows for {} selected positions",
+                        idx.len()
+                    )));
+                }
+                planned.push(Some(PlannedOp::Gather { idx }));
+            }
+            Op::MoeCombine {
+                choice,
+                terms,
+                output,
+            } => {
+                let Some((rows, experts)) = plan.logical(choice) else {
+                    return Err(DriverError::UnknownCell(choice.clone()));
+                };
+                let Some((mrows, cols)) = plan.logical(output) else {
+                    return Err(DriverError::UnknownCell(output.clone()));
+                };
+                if terms.len() != experts || mrows != rows {
+                    return Err(DriverError::ShapeMismatch("moe_combine shape".into()));
+                }
+                let ch = plan.values(choice);
+                let mut idxs = Vec::with_capacity(experts);
+                for e in 0..experts {
+                    let idx: Vec<usize> = (0..rows)
+                        .filter(|p| ch[p * experts + e] != 0)
+                        .collect();
+                    let (trows, tcols) = plan
+                        .logical(&terms[e])
+                        .ok_or_else(|| DriverError::UnknownCell(terms[e].clone()))?;
+                    if idx.len() > trows || tcols != cols {
+                        return Err(DriverError::ShapeMismatch(format!(
+                            "{}: {} rows, expected {}",
+                            terms[e],
+                            trows,
+                            idx.len()
+                        )));
+                    }
+                    idxs.push(idx);
+                }
+                planned.push(Some(PlannedOp::MoeCombine { idxs }));
             }
             Op::WeightedSum { .. } => planned.push(Some(PlannedOp::WeightedSum)),
             Op::Scores {
@@ -1120,13 +1251,14 @@ pub fn prove_segment_full(
                 planned.push(Some(PlannedOp::WeightedV(per_head)));
             }
             Op::Norm { input, weight, .. } => {
-                let w = by_name
-                    .get(weight.as_str())
-                    .ok_or_else(|| DriverError::UnknownCell(weight.clone()))?;
                 let Some((rows, hidden)) = plan.logical(input) else {
                     return Err(DriverError::UnknownCell(input.clone()));
                 };
-                if hidden != w.values.len() {
+                let w = set
+                    .tensor(weight)
+                    .ok_or_else(|| DriverError::UnknownCell(weight.clone()))?;
+                // γ is stored as a flat `1 × hidden` row.
+                if w.rows * w.cols != hidden {
                     return Err(DriverError::UnknownCell(weight.clone()));
                 }
                 let gamma: Vec<i64> = w.values.iter().map(|&v| v as i64).collect();
@@ -1341,13 +1473,13 @@ pub fn prove_segment_full(
                 let Some((l, hidden)) = plan.logical(output) else {
                     return Err(DriverError::UnknownCell(output.clone()));
                 };
-                let w = by_name
-                    .get(weight.as_str())
-                    .ok_or_else(|| DriverError::UnknownCell(weight.clone()))?;
-                if w.cols != hidden {
+                let Some((vocab, w_cols)) = set.shape(weight) else {
+                    return Err(DriverError::UnknownCell(weight.clone()));
+                };
+                if w_cols != hidden {
                     return Err(DriverError::UnknownCell(weight.clone()));
                 }
-                if window.len() != l || window.iter().any(|&t| t >= w.rows) {
+                if window.len() != l || window.iter().any(|&t| t >= vocab) {
                     return Err(DriverError::Unsupported(
                         "embed: window outside the vocabulary",
                     ));
@@ -1384,7 +1516,6 @@ pub fn prove_segment_full(
     eprintln!("  planned; sealing");
     let mut seg = plan.seal(params);
     eprintln!("  sealed");
-    let mut set = WeightSet::new(weights, params);
     let mut tr = Transcript::new(&new_challenger());
     let mut proofs = Vec::with_capacity(ops.len());
 
@@ -1515,7 +1646,11 @@ pub fn prove_segment_full(
                 },
                 PlannedOp::Matmul { rq },
             ) => {
-                let w = by_name[weight.as_str()];
+                // `y = W·x` is recomputed here to plan the derived cell, so the values
+                // are read once (the commit reads them once more; neither keeps them).
+                let w = set
+                    .tensor(weight)
+                    .ok_or_else(|| DriverError::UnknownCell(weight.clone()))?;
                 let y_id = seg.id(&format!("__mm.{i}.y"));
                 let ci = seg.id(input);
                 let in_cols = seg.cells_meta(ci).logical_cols;
@@ -1565,6 +1700,47 @@ pub fn prove_segment_full(
                 );
                 proofs.push(SegmentOpProof::Matmul { mm, rq });
             }
+            (Op::Gather { input, output, .. }, PlannedOp::Gather { idx }) => {
+                let (ci, co) = (seg.id(input), seg.id(output));
+                let cols = seg.cells_meta(ci).logical_cols;
+                proofs.push(SegmentOpProof::Gather(crate::gkr::segment::claim_gather(
+                    &mut seg, co, ci, cols, &idx, &mut tr,
+                )));
+            }
+            (
+                Op::MoeCombine {
+                    choice,
+                    terms,
+                    output,
+                },
+                PlannedOp::MoeCombine { idxs },
+            ) => {
+                let cc = seg.id(choice);
+                let (rows, experts) = {
+                    let m = seg.cells_meta(cc);
+                    (m.logical_rows, m.logical_cols)
+                };
+                let co = seg.id(output);
+                let cols = seg.cells_meta(co).logical_cols;
+                let mut selections = Vec::with_capacity(experts);
+                for (e, idx) in idxs.iter().enumerate() {
+                    selections.push(crate::gkr::segment::claim_selection(
+                        &mut seg, cc, rows, experts, e, idx, &mut tr,
+                    ));
+                }
+                let pairs: Vec<(usize, Vec<usize>)> = terms
+                    .iter()
+                    .zip(idxs.iter())
+                    .map(|(t, i)| (seg.id(t), i.clone()))
+                    .collect();
+                let combine = crate::gkr::segment::claim_scatter_add(
+                    &mut seg, co, &pairs, cols, &mut tr,
+                );
+                proofs.push(SegmentOpProof::MoeCombine {
+                    selections,
+                    combine,
+                });
+            }
             (
                 Op::WeightedSum {
                     choice,
@@ -1604,7 +1780,10 @@ pub fn prove_segment_full(
                     (m.logical_rows, m.logical_cols)
                 };
                 let gamma_id = seg.id(&format!("__norm.gamma.{i}"));
-                let gamma_pub: Vec<Fp> = by_name[weight.as_str()]
+                let gamma = set
+                    .tensor(weight)
+                    .ok_or_else(|| DriverError::UnknownCell(weight.clone()))?;
+                let gamma_pub: Vec<Fp> = gamma
                     .values
                     .iter()
                     .map(|&v| crate::gkr::segment::signed(v as i64))
@@ -1855,13 +2034,15 @@ pub fn prove_segment_full(
                     let m = seg.cells_meta(co);
                     (m.logical_rows, m.logical_cols)
                 };
-                let w = by_name[weight.as_str()];
+                let (vocab, _) = set
+                    .shape(weight)
+                    .ok_or_else(|| DriverError::UnknownCell(weight.clone()))?;
                 let wp = set.get_or_commit(weight)?;
                 let p = crate::gkr::nonlinear::claim_embed(
                     &mut seg,
                     co,
                     window,
-                    (l, hidden, w.rows),
+                    (l, hidden, vocab),
                     wp,
                     0,
                     weight,
@@ -1960,6 +2141,14 @@ enum PlannedOp {
     Embed,
     /// A shifted `mul`: the raw product plus its requant.
     MulRq(crate::gkr::plan::RequantNames),
+    /// A gathered cell: the source rows it holds.
+    Gather {
+        idx: Vec<usize>,
+    },
+    /// The MoE combine: each expert's gathered rows.
+    MoeCombine {
+        idxs: Vec<Vec<usize>>,
+    },
     /// No derived cells: the op is claimed directly from its trace cells.
     Plain,
 }
@@ -2263,6 +2452,83 @@ pub fn verify_segment_with_head(
                     &bundle.segment.commitment,
                     &claims,
                     p,
+                    &mut tr,
+                ) {
+                    return false;
+                }
+            }
+            (Op::Gather { input, output, .. }, SegmentOpProof::Gather(p)) => {
+                let (Some(ci), Some(co)) = (
+                    bundle.segment.commitment.cell(input),
+                    bundle.segment.commitment.cell(output),
+                ) else {
+                    return false;
+                };
+                if p.out != co || p.src != ci {
+                    return false;
+                }
+                if !crate::gkr::segment::verify_gather(
+                    &bundle.segment.commitment,
+                    &claims,
+                    p,
+                    &mut tr,
+                ) {
+                    return false;
+                }
+            }
+            (
+                Op::MoeCombine {
+                    choice,
+                    terms,
+                    output,
+                },
+                SegmentOpProof::MoeCombine {
+                    selections,
+                    combine,
+                },
+            ) => {
+                let (Some(cc), Some(co)) = (
+                    bundle.segment.commitment.cell(choice),
+                    bundle.segment.commitment.cell(output),
+                ) else {
+                    return false;
+                };
+                let (rows, experts) = {
+                    let m = &bundle.segment.commitment.cells[cc];
+                    (m.logical_rows, m.logical_cols)
+                };
+                if selections.len() != experts || terms.len() != experts || combine.out != co {
+                    return false;
+                }
+                // Each expert's row list must be bound to the choice, and the combine must
+                // use those same rows — otherwise the sum could be over anything.
+                for (e, (sel, (t, (ct, cidx)))) in selections
+                    .iter()
+                    .zip(terms.iter().zip(&combine.terms))
+                    .enumerate()
+                {
+                    if sel.choice != cc
+                        || sel.expert != e
+                        || sel.rows != rows
+                        || sel.experts != experts
+                        || bundle.segment.commitment.cell(t).as_ref() != Some(ct)
+                        || &sel.idx != cidx
+                    {
+                        return false;
+                    }
+                    if !crate::gkr::segment::verify_selection(
+                        &bundle.segment.commitment,
+                        &claims,
+                        sel,
+                        &mut tr,
+                    ) {
+                        return false;
+                    }
+                }
+                if !crate::gkr::segment::verify_scatter_add(
+                    &bundle.segment.commitment,
+                    &claims,
+                    combine,
                     &mut tr,
                 ) {
                     return false;
@@ -2733,6 +2999,8 @@ pub fn ops_per_segment(
             | Op::Matmul { output, .. }
             | Op::Scores { output, .. }
             | Op::CausalSoftmax { output, .. }
+            | Op::Gather { output, .. }
+            | Op::MoeCombine { output, .. }
             | Op::WeightedV { output, .. }
             | Op::Silu { output, .. }
             | Op::WeightedSum { output, .. }
@@ -3085,7 +3353,7 @@ mod tests {
         let bundle = prove_segment_with_weights(
             &ops,
             &cells,
-            &[w.clone()],
+            &mut WeightSet::new(&[w.clone()], Params::default()),
             &dims,
             (1, alpha, beta, 8, 0.0),
             &bounds,
@@ -3148,7 +3416,7 @@ mod tests {
         let bad = prove_segment_with_weights(
             &ops,
             &bad_cells,
-            &[w],
+            &mut WeightSet::new(&[w], Params::default()),
             &dims,
             (1, alpha, beta, 8, 0.0),
             &bounds,
@@ -3228,7 +3496,7 @@ mod tests {
         let bundle = prove_segment_with_weights(
             &ops,
             &cells,
-            &[w.clone()],
+            &mut WeightSet::new(&[w.clone()], Params::default()),
             &dims,
             (1, alpha, beta, 8, 0.0),
             &bounds,
@@ -3272,7 +3540,7 @@ mod tests {
         let bad_bundle = prove_segment_with_weights(
             &ops,
             &[Cell::new("x", 2, 2, x), Cell::new("out", 2, 2, bad)],
-            &[w],
+            &mut WeightSet::new(&[w], Params::default()),
             &dims,
             (1, alpha, beta, 8, 0.0),
             &bounds,
@@ -3378,7 +3646,7 @@ mod tests {
                 prove_segment_full(
                     &per_segment[s],
                     &seg_cells,
-                    &[],
+                    &mut WeightSet::new(&[], Params::default()),
                     &dims,
                     (1, Fp::new(11), Fp::new(5), 8, 0.0),
                     &bounds,
@@ -3509,7 +3777,7 @@ mod tests {
         let bundle = prove_segment_with_weights(
             &ops,
             &cells,
-            &[],
+            &mut WeightSet::new(&[], Params::default()),
             &dims,
             (1, alpha, beta, 8, 0.0),
             &bounds,
@@ -3537,7 +3805,7 @@ mod tests {
         let bad = prove_segment_with_weights(
             &ops,
             &bad_cells,
-            &[],
+            &mut WeightSet::new(&[], Params::default()),
             &dims,
             (1, alpha, beta, 8, 0.0),
             &bounds,
@@ -3619,7 +3887,7 @@ mod tests {
         let bundle = prove_segment_with_weights(
             &ops,
             &cells,
-            &[],
+            &mut WeightSet::new(&[], Params::default()),
             &dims,
             (1, alpha, beta, 8, 0.0),
             &bounds,
@@ -3701,7 +3969,7 @@ mod tests {
         let bundle = prove_segment_with_weights(
             &ops,
             &cells,
-            &weights,
+            &mut WeightSet::new(&weights, Params::default()),
             &dims,
             (digits, alpha, beta, rec_q, eps),
             &bounds,
@@ -3728,7 +3996,7 @@ mod tests {
         let bad = prove_segment_with_weights(
             &ops,
             &bad_cells,
-            &weights,
+            &mut WeightSet::new(&weights, Params::default()),
             &dims,
             (digits, alpha, beta, rec_q, eps),
             &bounds,
@@ -3819,7 +4087,7 @@ mod tests {
         let bundle = prove_segment_with_weights(
             &ops,
             &cells,
-            &[],
+            &mut WeightSet::new(&[], Params::default()),
             &dims,
             (3, alpha, beta, 8, 0.0),
             &bounds,
@@ -3849,7 +4117,7 @@ mod tests {
         let bad_bundle = prove_segment_with_weights(
             &ops,
             &bad_cells,
-            &[],
+            &mut WeightSet::new(&[], Params::default()),
             &dims,
             (3, alpha, beta, 8, 0.0),
             &bounds,
@@ -3917,7 +4185,7 @@ mod tests {
         let bundle = prove_segment_with_weights(
             &ops,
             &cells,
-            &[],
+            &mut WeightSet::new(&[], Params::default()),
             &dims,
             (4, alpha, beta, 8, 0.0),
             &bounds,
@@ -3947,7 +4215,7 @@ mod tests {
         let bad_bundle = prove_segment_with_weights(
             &ops,
             &bad_cells,
-            &[],
+            &mut WeightSet::new(&[], Params::default()),
             &dims,
             (4, alpha, beta, 8, 0.0),
             &bounds,
@@ -4024,7 +4292,7 @@ mod tests {
         let bundle = prove_segment_with_weights(
             &ops,
             &cells,
-            &[],
+            &mut WeightSet::new(&[], Params::default()),
             &dims,
             (digits, alpha, beta, rec_q, eps),
             &bounds,
@@ -4053,7 +4321,7 @@ mod tests {
         let bad_bundle = prove_segment_with_weights(
             &ops,
             &bad_cells,
-            &[],
+            &mut WeightSet::new(&[], Params::default()),
             &dims,
             (digits, alpha, beta, rec_q, eps),
             &bounds,
@@ -4119,7 +4387,7 @@ mod tests {
         let bundle = prove_segment_with_weights(
             &ops,
             &cells,
-            &[],
+            &mut WeightSet::new(&[], Params::default()),
             &dims,
             (1, alpha, beta, 8, 0.0),
             &bounds,
@@ -4181,7 +4449,7 @@ mod tests {
         let bundle = prove_segment_with_weights(
             &ops,
             &cells,
-            &[],
+            &mut WeightSet::new(&[], Params::default()),
             &dims,
             (4, alpha, beta, 8, 0.0),
             &bounds,
@@ -4251,7 +4519,7 @@ mod tests {
         let bundle = prove_segment_with_weights(
             &ops,
             &cells,
-            &weights,
+            &mut WeightSet::new(&weights, Params::default()),
             &dims,
             (1, alpha, beta, 8, 0.0),
             &bounds,
@@ -4306,7 +4574,7 @@ mod tests {
         let bundle = prove_segment_with_head(
             &ops,
             &cells,
-            &[],
+            &mut WeightSet::new(&[], Params::default()),
             &dims,
             (1, alpha, beta, 8, 0.0),
             &bounds,

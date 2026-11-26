@@ -29,7 +29,7 @@
 //! second segment, which the two-pass [`crate::gkr::segment::SegmentCells`] flow
 //! supports.
 
-use crate::field::{eq, Ext, Fp};
+use crate::field::{Ext, Fp};
 use crate::gkr::segment::{
     claim_value_at_id, linear_finish, linear_verify, CellSegment, CellSegmentCommitment,
     MulSegmentProof,
@@ -83,11 +83,7 @@ pub fn verify_eq_public(
     if point != proof.point {
         return false;
     }
-    let expected: Ext = public
-        .iter()
-        .enumerate()
-        .map(|(j, &v)| eq(&point, j) * Ext::from(v))
-        .sum();
+    let expected = crate::field::sumcheck::mle_value(public, &point);
     claim_value_at_id(commitment, claims, proof.cell, &point) == Some(expected)
 }
 

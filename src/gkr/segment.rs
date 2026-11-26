@@ -1328,6 +1328,413 @@ pub fn verify_mul_ones(
     proof.c.is_none() && verify_mul(commitment, claims, proof, tr)
 }
 
+/// `out[r][c] = src[idx[r]][c]`, over a flat cell with row stride `cols`.
+///
+/// This is how the MoE layer runs each expert only on the positions that selected it:
+/// the expert's cells hold those rows and nothing else, and this claim ties them back
+/// to `norm_moe`. One random weight per (row, column) turns the matrix equality into a
+/// single inner-product identity; the source side scatters the weights into `idx`'s
+/// rows, so only the gathered entries are touched.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct GatherSegmentProof {
+    pub out: usize,
+    pub src: usize,
+    /// Entries per row in both cells.
+    pub cols: usize,
+    /// The gathered rows, in the destination's row order.
+    pub idx: Vec<usize>,
+    pub b_out: Ext,
+    pub c_out: LinearClaimProof,
+    pub b_src: Ext,
+    pub c_src: LinearClaimProof,
+}
+
+/// Claim that `out` is `src`'s rows `idx`, in order.
+pub fn claim_gather(
+    seg: &mut CellSegment,
+    out: usize,
+    src: usize,
+    cols: usize,
+    idx: &[usize],
+    tr: &mut Transcript,
+) -> GatherSegmentProof {
+    // An expert that no position selected gathers zero rows: the claims are then
+    // vacuous (both functionals are empty, so both values are zero).
+    tr.observe_val(Fp::new(out as u64));
+    tr.observe_val(Fp::new(src as u64));
+    for &r in idx {
+        tr.observe_val(Fp::new(r as u64));
+    }
+    let rows = idx.len();
+    let n = rows * cols;
+    let h = gather_functional(n, 1usize << seg.cells_meta(out).m(), tr);
+    let scattered = scatter_rows(&h, cols, idx, 1usize << seg.cells_meta(src).m());
+
+    let b_out = seg.claim_linear_id(out, 0, &h, tr);
+    let b_src = seg.claim_linear_id(src, 0, &scattered, tr);
+    GatherSegmentProof {
+        out,
+        src,
+        cols,
+        idx: idx.to_vec(),
+        b_out: b_out.0,
+        c_out: b_out.1,
+        b_src: b_src.0,
+        c_src: b_src.1,
+    }
+}
+
+/// One random weight per entry of an `n`-entry row block, padded to the cell's arity.
+fn gather_functional(n: usize, total: usize, tr: &mut Transcript) -> LinearH {
+    LinearH::Blocks {
+        coins: (0..n.max(2).next_power_of_two().trailing_zeros() as usize)
+            .map(|_| tr.sample_val())
+            .collect(),
+        len: n,
+        weights: vec![Fp::new(1)],
+        total,
+        offset: 0,
+    }
+}
+
+/// `h`'s weights at its rows `idx`, read out into a cell whose rows are local.
+///
+/// The inverse direction of [`scatter_rows`]: used by the combine, where one expert's
+/// cell holds its gathered rows *locally* (`j = 0..rows_e`) and each local row came from
+/// position `idx[j]` of the output.
+fn gather_rows(h: &LinearH, cols: usize, idx: &[usize], total: usize) -> LinearH {
+    let dense = h.dense();
+    let mut entries = Vec::with_capacity(idx.len() * cols);
+    for (j, &row) in idx.iter().enumerate() {
+        for c in 0..cols {
+            entries.push((j * cols + c, dense[row * cols + c]));
+        }
+    }
+    LinearH::Sparse { entries, len: total }
+}
+
+/// `h`'s weights placed at rows `idx` of a larger cell, entry `idx[r]·cols + c`.
+fn scatter_rows(h: &LinearH, cols: usize, idx: &[usize], total: usize) -> LinearH {
+    let dense = h.dense();
+    let mut entries = Vec::with_capacity(idx.len() * cols);
+    for (r, &row) in idx.iter().enumerate() {
+        for c in 0..cols {
+            entries.push((row * cols + c, dense[r * cols + c]));
+        }
+    }
+    LinearH::Sparse { entries, len: total }
+}
+
+/// Verify a [`GatherSegmentProof`].
+pub fn verify_gather(
+    commitment: &CellSegmentCommitment,
+    claims: &crate::gkr::segment::Claims<'_>,
+    proof: &GatherSegmentProof,
+    tr: &mut Transcript,
+) -> bool {
+    let (Some(m_out), Some(m_src)) = (
+        commitment.cells.get(proof.out),
+        commitment.cells.get(proof.src),
+    ) else {
+        return false;
+    };
+    let rows = proof.idx.len();
+    if proof.cols == 0
+        || rows > m_out.logical_rows
+        || m_out.logical_cols != proof.cols
+        || m_src.logical_cols != proof.cols
+        || proof.idx.iter().any(|&r| r >= m_src.logical_rows)
+    {
+        return false;
+    }
+    tr.observe_val(Fp::new(proof.out as u64));
+    tr.observe_val(Fp::new(proof.src as u64));
+    for &r in &proof.idx {
+        tr.observe_val(Fp::new(r as u64));
+    }
+    let n = rows * proof.cols;
+    let h = gather_functional(n, 1usize << m_out.m(), tr);
+    let scattered = scatter_rows(&h, proof.cols, &proof.idx, 1usize << m_src.m());
+
+    let Some((z, cf)) = linear_verify(&proof.c_out, proof.b_out, tr) else {
+        return false;
+    };
+    let Some(v) = claim_value_at_id(commitment, claims, proof.out, &z) else {
+        return false;
+    };
+    if !linear_finish(&h, &z, cf, v) {
+        return false;
+    }
+    let Some((z, cf)) = linear_verify(&proof.c_src, proof.b_src, tr) else {
+        return false;
+    };
+    let Some(v) = claim_value_at_id(commitment, claims, proof.src, &z) else {
+        return false;
+    };
+    linear_finish(&scattered, &z, cf, v) && proof.b_out == proof.b_src
+}
+
+/// `out = Σ_e rows idx_e of term_e`, scattered back into place.
+///
+/// The MoE combine: each expert contributed only the positions that selected it, and
+/// this adds those contributions back at the right rows. One random weight per entry
+/// of `out` gives one inner-product identity, so the verifier pays one claim for `out`
+/// and one per expert over its *gathered* rows — `Σ_e rows_e = k·L` rows in total
+/// instead of `64·L`.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ScatterAddSegmentProof {
+    pub out: usize,
+    /// `(term cell, its row list)`, one per expert.
+    pub terms: Vec<(usize, Vec<usize>)>,
+    pub cols: usize,
+    pub b_out: Ext,
+    pub c_out: LinearClaimProof,
+    /// One entry per expert, in the same order as `terms`.
+    pub b_terms: Vec<(Ext, LinearClaimProof)>,
+}
+
+/// Claim the scattered sum.
+pub fn claim_scatter_add(
+    seg: &mut CellSegment,
+    out: usize,
+    terms: &[(usize, Vec<usize>)],
+    cols: usize,
+    tr: &mut Transcript,
+) -> ScatterAddSegmentProof {
+    tr.observe_val(Fp::new(out as u64));
+    for (t, idx) in terms {
+        tr.observe_val(Fp::new(*t as u64));
+        for &r in idx {
+            tr.observe_val(Fp::new(r as u64));
+        }
+    }
+    let rows = 1usize << seg.cells_meta(out).m();
+    let n = seg.cells_meta(out).logical_rows * cols;
+    let f = gather_functional(n, rows, tr);
+    let b_out = seg.claim_linear_id(out, 0, &f, tr);
+    let mut b_terms = Vec::with_capacity(terms.len());
+    for (t, idx) in terms {
+        let gathered = gather_rows(&f, cols, idx, 1usize << seg.cells_meta(*t).m());
+        let b = seg.claim_linear_id(*t, 0, &gathered, tr);
+        b_terms.push((b.0, b.1));
+    }
+    ScatterAddSegmentProof {
+        out,
+        terms: terms.to_vec(),
+        cols,
+        b_out: b_out.0,
+        c_out: b_out.1,
+        b_terms,
+    }
+}
+
+/// Verify a [`ScatterAddSegmentProof`].
+pub fn verify_scatter_add(
+    commitment: &CellSegmentCommitment,
+    claims: &crate::gkr::segment::Claims<'_>,
+    proof: &ScatterAddSegmentProof,
+    tr: &mut Transcript,
+) -> bool {
+    let Some(m_out) = commitment.cells.get(proof.out) else {
+        return false;
+    };
+    if proof.cols == 0
+        || m_out.logical_cols != proof.cols
+        || proof.terms.len() != proof.b_terms.len()
+    {
+        return false;
+    }
+    for (t, idx) in &proof.terms {
+        let Some(m) = commitment.cells.get(*t) else {
+            return false;
+        };
+        if m.logical_cols != proof.cols
+            || idx.len() > m.logical_rows
+            || idx.iter().any(|&r| r >= m_out.logical_rows)
+        {
+            return false;
+        }
+    }
+    tr.observe_val(Fp::new(proof.out as u64));
+    for (t, idx) in &proof.terms {
+        tr.observe_val(Fp::new(*t as u64));
+        for &r in idx {
+            tr.observe_val(Fp::new(r as u64));
+        }
+    }
+    let rows = 1usize << m_out.m();
+    let f = gather_functional(m_out.logical_rows * proof.cols, rows, tr);
+    let Some((z, cf)) = linear_verify(&proof.c_out, proof.b_out, tr) else {
+        return false;
+    };
+    let Some(v) = claim_value_at_id(commitment, claims, proof.out, &z) else {
+        return false;
+    };
+    if !linear_finish(&f, &z, cf, v) {
+        return false;
+    }
+    let mut sum = Ext::ZERO;
+    for ((t, idx), (b, c)) in proof.terms.iter().zip(&proof.b_terms) {
+        let Some(m) = commitment.cells.get(*t) else {
+            return false;
+        };
+        let gathered = gather_rows(&f, proof.cols, idx, 1usize << m.m());
+        let Some((z, cf)) = linear_verify(c, *b, tr) else {
+            return false;
+        };
+        let Some(v) = claim_value_at_id(commitment, claims, *t, &z) else {
+            return false;
+        };
+        if !linear_finish(&gathered, &z, cf, v) {
+            return false;
+        }
+        sum += *b;
+    }
+    proof.b_out == sum
+}
+
+    /// The rows a gathered expert cell was built from, bound to the committed `choice`.
+    ///
+    /// The list is public (an expert's row set is not secret), so the verifier checks it
+    /// directly: it must be **strictly increasing** (hence distinct and ordered) and it
+    /// must be exactly the positions where `choice[p][expert] = 1`. Two linear claims
+    /// settle the latter — every listed row is selected, and the list is as long as the
+    /// selected set — which together with distinctness give set equality. `choice` is
+    /// stored flat, with row stride `experts`.
+    #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+    pub struct SelectionSegmentProof {
+        pub choice: usize,
+        pub rows: usize,
+        pub experts: usize,
+        /// The expert column this list belongs to.
+        pub expert: usize,
+        /// The gathered rows, strictly increasing.
+        pub idx: Vec<usize>,
+        /// `Σ_{r∈idx} choice[r][expert]`, which must equal `idx.len()`.
+        pub b_rows: Ext,
+        pub c_rows: LinearClaimProof,
+        /// `Σ_p choice[p][expert]`, likewise.
+        pub b_total: Ext,
+        pub c_total: LinearClaimProof,
+    }
+
+    /// The flat indices of one expert column.
+    fn column_indices(
+        rows: usize,
+        experts: usize,
+        expert: usize,
+    ) -> impl Iterator<Item = usize> {
+        (0..rows).map(move |p| p * experts + expert)
+    }
+
+    /// Claim that `idx` lists exactly the rows whose `choice[·][expert]` is one.
+    pub fn claim_selection(
+        seg: &mut CellSegment,
+        choice: usize,
+        rows: usize,
+        experts: usize,
+        expert: usize,
+        idx: &[usize],
+        tr: &mut Transcript,
+    ) -> SelectionSegmentProof {
+        assert!(
+            idx.windows(2).all(|w| w[0] < w[1]),
+            "a selection must be strictly increasing"
+        );
+        tr.observe_val(Fp::new(choice as u64));
+        tr.observe_val(Fp::new(expert as u64));
+        for &r in idx {
+            tr.observe_val(Fp::new(r as u64));
+        }
+        let n = 1usize << seg.cells_meta(choice).m();
+        let listed = LinearH::Sparse {
+            entries: idx
+                .iter()
+                .map(|&r| (r * experts + expert, Fp::new(1)))
+                .collect(),
+            len: n,
+        };
+        let column = LinearH::Sparse {
+            entries: column_indices(rows, experts, expert)
+                .map(|i| (i, Fp::new(1)))
+                .collect(),
+            len: n,
+        };
+        let b_rows = seg.claim_linear_id(choice, 0, &listed, tr);
+        let b_total = seg.claim_linear_id(choice, 0, &column, tr);
+        SelectionSegmentProof {
+            choice,
+            rows,
+            experts,
+            expert,
+            idx: idx.to_vec(),
+            b_rows: b_rows.0,
+            c_rows: b_rows.1,
+            b_total: b_total.0,
+            c_total: b_total.1,
+        }
+    }
+
+    /// Verify a [`SelectionSegmentProof`].
+    pub fn verify_selection(
+        commitment: &CellSegmentCommitment,
+        claims: &crate::gkr::segment::Claims<'_>,
+        proof: &SelectionSegmentProof,
+        tr: &mut Transcript,
+    ) -> bool {
+        let Some(meta) = commitment.cells.get(proof.choice) else {
+            return false;
+        };
+        let n = 1usize << meta.m();
+        let want = Ext::from(Fp::new(proof.idx.len() as u64));
+        if proof.experts == 0
+            || proof.expert >= proof.experts
+            || meta.logical_rows != proof.rows
+            || meta.logical_cols != proof.experts
+            || proof.idx.iter().any(|&r| r >= proof.rows)
+            || !proof.idx.windows(2).all(|w| w[0] < w[1])
+        {
+            return false;
+        }
+        tr.observe_val(Fp::new(proof.choice as u64));
+        tr.observe_val(Fp::new(proof.expert as u64));
+        for &r in &proof.idx {
+            tr.observe_val(Fp::new(r as u64));
+        }
+        let listed = LinearH::Sparse {
+            entries: proof
+                .idx
+                .iter()
+                .map(|&r| (r * proof.experts + proof.expert, Fp::new(1)))
+                .collect(),
+            len: n,
+        };
+        let column = LinearH::Sparse {
+            entries: column_indices(proof.rows, proof.experts, proof.expert)
+                .map(|i| (i, Fp::new(1)))
+                .collect(),
+            len: n,
+        };
+        let Some((z, cf)) = linear_verify(&proof.c_rows, proof.b_rows, tr) else {
+            return false;
+        };
+        let Some(v) = claim_value_at_id(commitment, claims, proof.choice, &z) else {
+            return false;
+        };
+        if !linear_finish(&listed, &z, cf, v) {
+            return false;
+        }
+        let Some((z, cf)) = linear_verify(&proof.c_total, proof.b_total, tr) else {
+            return false;
+        };
+        let Some(v) = claim_value_at_id(commitment, claims, proof.choice, &z) else {
+            return false;
+        };
+        if !linear_finish(&column, &z, cf, v) {
+            return false;
+        }
+        proof.b_rows == want && proof.b_total == want
+    }
 /// A reshape claim: the flat element multiset is unchanged, so the same `r`
 /// linear functional must give the same value on both cells.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -2372,6 +2779,167 @@ mod tests {
             }
         }
         c
+    }
+
+    #[test]
+    fn selection_binds_rows_to_the_choice() {
+        use crate::pcs::transcript::{new_challenger, Transcript};
+        use crate::pcs::whir_stacked::Params;
+
+        // Four positions, two experts, laid out flat the way the trace stores cells:
+        // expert 0 selected by rows 0 and 2, expert 1 by rows 1 and 3.
+        let (rows, experts) = (4usize, 2usize);
+        let choice: Vec<i64> = vec![1, 0, 0, 1, 1, 0, 0, 1];
+        let cells = vec![Cell::new("choice", rows, experts, choice.clone())];
+
+        let mut seg = crate::gkr::plan::Plan::new(&cells).seal(Params::default());
+        let com = seg.commitment();
+        let c_choice = seg.id("choice");
+        let mut tr = Transcript::new(&new_challenger());
+        let proof = claim_selection(&mut seg, c_choice, rows, experts, 0, &[0, 2], &mut tr);
+        let claims = seg.claims().to_vec();
+        let wproof = seg.prove(&mut new_challenger());
+        assert!(verify(&com, &Claims::new(&claims), &wproof, &mut new_challenger()));
+        let mut vtr = Transcript::new(&new_challenger());
+        assert!(verify_selection(&com, &Claims::new(&claims), &proof, &mut vtr));
+
+        // A listed row that is not selected, and a list shorter than the selected set.
+        for listed in [vec![0usize, 1], vec![0]] {
+            let mut bad = crate::gkr::plan::Plan::new(&cells).seal(Params::default());
+            let bad_com = bad.commitment();
+            let mut btr = Transcript::new(&new_challenger());
+            let bad_proof = claim_selection(&mut bad, c_choice, rows, experts, 0, &listed, &mut btr);
+            let bad_claims = bad.claims().to_vec();
+            let _ = bad.prove(&mut new_challenger());
+            let mut vtr = Transcript::new(&new_challenger());
+            assert!(
+                !verify_selection(&bad_com, &Claims::new(&bad_claims), &bad_proof, &mut vtr),
+                "{listed:?}"
+            );
+        }
+
+        // A list that is not strictly increasing.
+        let mut unsorted = crate::gkr::plan::Plan::new(&cells).seal(Params::default());
+        let unsorted_com = unsorted.commitment();
+        let mut btr = Transcript::new(&new_challenger());
+        let mut p2 = claim_selection(&mut unsorted, c_choice, rows, experts, 0, &[0, 2], &mut btr);
+        p2.idx = vec![2, 0];
+        let u_claims = unsorted.claims().to_vec();
+        let _ = unsorted.prove(&mut new_challenger());
+        let mut vtr = Transcript::new(&new_challenger());
+        assert!(!verify_selection(&unsorted_com, &Claims::new(&u_claims), &p2, &mut vtr));
+    }
+
+    #[test]
+    fn gather_and_scatter_add_roundtrip() {
+        use crate::pcs::transcript::{new_challenger, Transcript};
+        use crate::pcs::whir_stacked::Params;
+
+        // `src` is four positions of two values; expert 0 ran on rows [0, 2] and expert 1
+        // on rows [1, 3], so each expert cell holds two rows and the combine scatters
+        // them back.
+        let cols = 2usize;
+        let src: Vec<i64> = vec![10, 11, 20, 21, 30, 31, 40, 41];
+        let idx0 = vec![0usize, 2];
+        let idx1 = vec![1usize, 3];
+        let gathered = |idx: &[usize]| -> Vec<i64> {
+            idx.iter()
+                .flat_map(|&r| [src[r * cols], src[r * cols + 1]])
+                .collect()
+        };
+        let (g0, g1) = (gathered(&idx0), gathered(&idx1));
+        let mut moe = vec![0i64; src.len()];
+        for (j, &r) in idx0.iter().enumerate() {
+            moe[r * cols] += g0[j * cols];
+            moe[r * cols + 1] += g0[j * cols + 1];
+        }
+        for (j, &r) in idx1.iter().enumerate() {
+            moe[r * cols] += g1[j * cols];
+            moe[r * cols + 1] += g1[j * cols + 1];
+        }
+
+        let cells = vec![
+            Cell::new("src", 4, cols, src.clone()),
+            Cell::new("g0", 2, cols, g0.clone()),
+            Cell::new("g1", 2, cols, g1.clone()),
+            Cell::new("moe", 4, cols, moe.clone()),
+        ];
+        let mut seg = crate::gkr::plan::Plan::new(&cells).seal(Params::default());
+        let com = seg.commitment();
+        let (c_src, c_g0, c_g1, c_moe) = (
+            seg.id("src"),
+            seg.id("g0"),
+            seg.id("g1"),
+            seg.id("moe"),
+        );
+
+        let mut tr = Transcript::new(&new_challenger());
+        let gather0 = claim_gather(&mut seg, c_g0, c_src, cols, &idx0, &mut tr);
+        let gather1 = claim_gather(&mut seg, c_g1, c_src, cols, &idx1, &mut tr);
+        let combine = claim_scatter_add(
+            &mut seg,
+            c_moe,
+            &[(c_g0, idx0.clone()), (c_g1, idx1.clone())],
+            cols,
+            &mut tr,
+        );
+        let claims = seg.claims().to_vec();
+        let wproof = seg.prove(&mut new_challenger());
+        assert!(verify(&com, &Claims::new(&claims), &wproof, &mut new_challenger()));
+        // One transcript for all three: they were claimed in this order.
+        let claims = Claims::new(&claims);
+        let mut vtr = Transcript::new(&new_challenger());
+        assert!(verify_gather(&com, &claims, &gather0, &mut vtr));
+        assert!(verify_gather(&com, &claims, &gather1, &mut vtr));
+        assert!(verify_scatter_add(&com, &claims, &combine, &mut vtr));
+
+        // A gather that mixes up the rows is rejected.
+        let mut bad = {
+            let cells = vec![
+                Cell::new("src", 4, cols, src.clone()),
+                Cell::new("g0", 2, cols, gathered(&[2, 0])),
+                Cell::new("moe", 4, cols, moe.clone()),
+            ];
+            crate::gkr::plan::Plan::new(&cells).seal(Params::default())
+        };
+        let bad_com = bad.commitment();
+        let mut btr = Transcript::new(&new_challenger());
+        let bad_gather = claim_gather(&mut bad, c_g0, c_src, cols, &idx0, &mut btr);
+        let bad_claims = bad.claims().to_vec();
+        let _ = bad.prove(&mut new_challenger());
+        let mut vtr = Transcript::new(&new_challenger());
+        assert!(!verify_gather(&bad_com, &Claims::new(&bad_claims), &bad_gather, &mut vtr));
+
+        // A combine whose output misses one expert's contribution is rejected.
+        let mut bad_moe = moe.clone();
+        bad_moe[3] += 1;
+        let mut bad = {
+            let cells = vec![
+                Cell::new("g0", 2, cols, g0),
+                Cell::new("g1", 2, cols, g1),
+                Cell::new("moe", 4, cols, bad_moe),
+            ];
+            crate::gkr::plan::Plan::new(&cells).seal(Params::default())
+        };
+        let bad_com = bad.commitment();
+        let (b_g0, b_g1, b_moe) = (bad.id("g0"), bad.id("g1"), bad.id("moe"));
+        let mut btr = Transcript::new(&new_challenger());
+        let bad_combine = claim_scatter_add(
+            &mut bad,
+            b_moe,
+            &[(b_g0, idx0), (b_g1, idx1)],
+            cols,
+            &mut btr,
+        );
+        let bad_claims = bad.claims().to_vec();
+        let _ = bad.prove(&mut new_challenger());
+        let mut vtr = Transcript::new(&new_challenger());
+        assert!(!verify_scatter_add(
+            &bad_com,
+            &Claims::new(&bad_claims),
+            &bad_combine,
+            &mut vtr
+        ));
     }
 
     #[test]

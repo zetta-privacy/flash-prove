@@ -344,11 +344,8 @@ impl SegmentProver {
                     col.resize(n, F::ZERO);
                     crate::backend::mle_eval(&col, &padded_point)
                 } else {
-                    t.column(c)
-                        .values()
-                        .enumerate()
-                        .map(|(row, v)| crate::field::eq(&padded_point, row) * EF::from(v))
-                        .sum()
+                    let col: Vec<F> = t.column(c).values().collect();
+                    crate::field::sumcheck::mle_value(&col, &padded_point)
                 }
             })
             .collect();
