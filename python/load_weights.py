@@ -121,6 +121,12 @@ def main():
                     # trim the checkpoint tensor to it and drop everything else.
                     if name in spec_shapes:
                         rows, cols = spec_shapes[name]
+                        if vals.shape[0] < rows:
+                            # The vocabulary is padded to a power of two; the extra rows
+                            # are zero and never selected.
+                            padded = np.zeros((rows, vals.shape[1]), dtype=vals.dtype)
+                            padded[: vals.shape[0]] = vals
+                            vals = padded
                         vals = vals[:rows, :cols]
                     nb = name.encode("utf-8")
                     rows, cols = vals.shape

@@ -26,6 +26,10 @@ def gen_spec(cfg: dict, shifts: dict, sparse_moe: bool = True) -> dict:
     active = cfg["num_experts_per_tok"]
     intermediate = cfg["intermediate_size"]
     vocab = cfg["vocab_size"]
+    # The matrix-product claim addresses a weight table as `2^ln × 2^lm`, so a
+    # vocabulary that is not a power of two (50304 = 2^7 · 393) is padded up. The
+    # padding rows are zero, which also makes `head_max ≥ 0` for the row range check.
+    vocab_pad = 1 << (vocab - 1).bit_length()
     theta = cfg["rope_theta"]
 
     dims = {
@@ -40,8 +44,8 @@ def gen_spec(cfg: dict, shifts: dict, sparse_moe: bool = True) -> dict:
     }
 
     weights = []
-    weights.append({"name": "embed_tokens", "rows": vocab, "cols": hidden})
-    weights.append({"name": "lm_head", "rows": vocab, "cols": hidden})
+    weights.append({"name": "embed_tokens", "rows": vocab_pad, "cols": hidden})
+    weights.append({"name": "lm_head", "rows": vocab_pad, "cols": hidden})
     weights.append({"name": "norm", "rows": 1, "cols": hidden})
 
     for l in range(layers):

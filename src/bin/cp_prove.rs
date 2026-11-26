@@ -49,6 +49,9 @@ struct Args {
     /// The cell holding the last logits row (the head's input).
     #[arg(long, default_value = "logits")]
     head_cell: String,
+    /// Prove only this segment (debugging; the output file holds one segment).
+    #[arg(long)]
+    only: Option<usize>,
 }
 
 fn main() {
@@ -113,6 +116,9 @@ fn main() {
         .unwrap_or_else(|e| panic!("weights {}: {e}", args.weights.display()));
     let mut segments: Vec<SegmentBundle> = Vec::with_capacity(segment_cells.len());
     for s in 0..segment_cells.len() {
+        if args.only.is_some_and(|o| o != s) {
+            continue;
+        }
         let head = if s == head_segment {
             Some(HeadSpec {
                 logits: args.head_cell.clone(),

@@ -79,7 +79,9 @@ impl Plan {
 
     /// A trace cell's integer values (what the op arithmetic reads).
     pub fn values(&self, name: &str) -> &[i64] {
-        &self.trace[name]
+        self.trace
+            .get(name)
+            .unwrap_or_else(|| panic!("the segment plan holds no cell `{name}`"))
     }
 
     /// Add a derived cell. First-writer-wins by name.

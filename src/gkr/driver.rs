@@ -736,6 +736,22 @@ fn op_outputs(op: &Op) -> Vec<&str> {
     }
 }
 
+/// The cells an op touches: its inputs, and its outputs too.
+///
+/// Outputs matter because a segment boundary can fall between an op's two outputs (an
+/// `top_k` writes both its logits and its choice indicator); the op is then assigned to
+/// the segment of its first output, and the other one has to be copied in — and tied by
+/// a link — exactly like an ordinary cross-segment input.
+fn op_touch<'a>(op: &'a Op) -> Vec<&'a str> {
+    let mut v = op_inputs(op);
+    for name in op_outputs(op) {
+        if !v.contains(&name) {
+            v.push(name);
+        }
+    }
+    v
+}
+
 /// The cells an op reads (weights are committed separately, not as cells).
 fn op_inputs(op: &Op) -> Vec<&str> {
     match op {
@@ -827,7 +843,7 @@ pub fn link_schedule(segment_cells: &[Vec<String>], per_segment: &[Vec<Op>]) -> 
         let own = &segment_cells[to];
         let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
         for op in ops {
-            for name in op_inputs(op) {
+            for name in op_touch(op) {
                 if own.iter().any(|c| c == name) || !seen.insert(name) {
                     continue;
                 }
@@ -874,7 +890,7 @@ pub fn link_openings(
 pub fn external_inputs(own: &[String], ops: &[Op]) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for op in ops {
-        for name in op_inputs(op) {
+        for name in op_touch(op) {
             if own.iter().any(|c| c == name) {
                 continue;
             }
@@ -1657,8 +1673,11 @@ pub fn prove_segment_full(
                 let in_rows = seg.cells_meta(ci).logical_rows;
                 // `(ln, lm, lp)` — arities of (output, contraction, batch). A per-token
                 // input has no batch axis, so it needs no transposed views.
+                // The weight's own table is padded up to a power of two, so its row
+                // arity is the *padded* row count — `lm_head` has 50304 rows, which is
+                // not one, and the claim addresses the table as `2^ln × 2^lm`.
                 let (ln, lm) = (
-                    w.rows.trailing_zeros() as usize,
+                    w.rows.next_power_of_two().trailing_zeros() as usize,
                     w.cols.trailing_zeros() as usize,
                 );
                 let lp = if in_cols == 1 {
@@ -2947,6 +2966,12 @@ pub fn verify_segment_with_head(
             let m = &bundle.segment.commitment.cells[logits];
             (m.logical_rows, m.logical_cols)
         };
+        // The vocabulary is padded to a power of two, and the padding rows carry zero
+        // logits, so they can tie the maximum. A token index in the padding is not a
+        // token, so reject it.
+        if h.token >= dims.vocab {
+            return false;
+        }
         let table = bounds.head_table(h.max, alpha, beta);
         if !crate::gkr::head::verify_head(
             &bundle.segment.commitment,
