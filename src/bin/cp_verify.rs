@@ -133,8 +133,16 @@ fn main() -> ExitCode {
         args.rec_q,
         args.eps,
     );
+    let links_ok = std::cell::Cell::new(true);
     let mut ok = true;
     let outcomes: Vec<(usize, bool, f64)> = std::thread::scope(|scope| {
+        // The links only need the commitments, so they run alongside the segments
+        // instead of after them.
+        let links_handle = args.only.is_none().then(|| {
+            let (file, spec) = (&file, &spec);
+            let segments = args.segments;
+            scope.spawn(move || flashprove::gkr::driver::verify_links(file, spec, segments))
+        });
         let mut handles = Vec::with_capacity(file.segments.len());
         for (s, bundle) in file.segments.iter().enumerate() {
             if args.only.is_some_and(|o| o != s) {
@@ -167,7 +175,13 @@ fn main() -> ExitCode {
                 (s, this, t0.elapsed().as_secs_f64())
             }));
         }
-        handles.into_iter().map(|h| h.join().unwrap()).collect()
+        let mut all: Vec<(usize, bool, f64)> =
+            handles.into_iter().map(|h| h.join().unwrap()).collect();
+        if let Some(h) = links_handle {
+            links_ok.set(h.join().unwrap());
+        }
+        all.sort_by_key(|t| t.0);
+        all
     });
     for (s, this, secs) in outcomes {
         eprintln!(
@@ -183,14 +197,13 @@ fn main() -> ExitCode {
         );
     }
 
-    // Every cross-segment copy must equal the cell it copies.
-    if args.only.is_none() {
-        let links = flashprove::gkr::driver::verify_links(&file, &spec, args.segments);
-        if !links {
-            eprintln!("links: REJECT");
-        }
-        ok &= links;
+    // Every cross-segment copy must equal the cell it copies (checked above, in
+    // parallel with the segments).
+    let links = links_ok.get();
+    if !links {
+        eprintln!("links: REJECT");
     }
+    ok &= links;
 
     println!("{}", if ok { "accept" } else { "reject" });
     if ok {

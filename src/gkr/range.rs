@@ -24,7 +24,7 @@
 use crate::field::{Ext, Fp};
 use crate::gkr::logup::{claim_logup, verify_logup, LogUpSegmentProof};
 use crate::gkr::segment::{
-    claim_value_at_id, linear_finish, linear_verify, CellClaim, CellSegment, CellSegmentCommitment,
+    claim_value_at_id, linear_finish, linear_verify, CellSegment, CellSegmentCommitment,
     View,
 };
 use crate::pcs::linear_claim::{LinearClaimProof, LinearH};
@@ -179,21 +179,33 @@ pub struct DecompCells {
 ///   h[j·n + i] = radix^j · r_i      (zero on the padding)
 /// ```
 /// so one linear claim over `all_digits` replaces the per-digit claims.
-fn reconstruct_h(decomp: Decomp, n: usize, m_all: usize, r: &[Fp]) -> LinearH {
-    let mut h = vec![Fp::ZERO; 1usize << m_all];
-    for j in 0..decomp.digits {
-        let w = decomp.weight(j);
-        for (i, &ri) in r.iter().enumerate().take(n) {
-            h[j * n + i] = w * ri;
-        }
+fn reconstruct_h(decomp: Decomp, n: usize, m_all: usize, coins: &[Fp]) -> LinearH {
+    LinearH::Blocks {
+        coins: coins.to_vec(),
+        len: n,
+        weights: (0..decomp.digits).map(|j| decomp.weight(j)).collect(),
+        total: 1usize << m_all,
+        offset: 0,
     }
-    LinearH::Dense(h)
 }
 
 /// `shift · Σ_j radix^j · Σ_i r_i`, the public offset `reconstruct_h` introduces.
-fn reconstruct_offset(decomp: Decomp, n: usize, r: &[Fp]) -> Fp {
+fn reconstruct_offset(decomp: Decomp, n: usize, coins: &[Fp]) -> Fp {
+    // `Σ_i r_i` over the tensor: the full cube sums to `Π_k ((1 − c_k) + c_k) = 1`,
+    // and a ragged length truncates it, which only happens in tests.
+    let r_sum: Fp = if n.is_power_of_two() {
+        Fp::new(1)
+    } else {
+        LinearH::Tensor {
+            coins: coins.to_vec(),
+            len: n,
+        }
+        .dense()
+        .iter()
+        .copied()
+        .sum()
+    };
     let shift = Fp::new(decomp.shift() as u64);
-    let r_sum: Fp = r.iter().take(n).copied().sum();
     let w_sum: Fp = (0..decomp.digits).map(|j| decomp.weight(j)).sum();
     shift * w_sum * r_sum
 }
@@ -228,20 +240,26 @@ pub fn claim_decomp(
     tr.observe_val(Fp::new(cells.value as u64));
     tr.observe_val(Fp::new(cells.all_digits as u64));
 
-    let (mut r, coins) = crate::pcs::linear_claim::sample_coins(n, tr);
-    r.resize(d, Fp::ZERO);
-    let h = LinearH::Dense(r.clone());
+    let coins = crate::pcs::linear_claim::sample(n, tr).coins().to_vec();
+    // One block: the tensor over `n` values, zero-padded to the value cell's arity.
+    let h = LinearH::Blocks {
+        coins: coins.clone(),
+        len: n,
+        weights: vec![Fp::new(1)],
+        total: d,
+        offset: 0,
+    };
 
     let b_value = seg.claim_linear_id(cells.value, 0, &h, tr);
     let b_words = seg.claim_linear_id(
         cells.all_digits,
         0,
-        &reconstruct_h(decomp, n, m_all, &r),
+        &reconstruct_h(decomp, n, m_all, &coins),
         tr,
     );
     debug_assert_eq!(
         b_words.0,
-        b_value.0 + Ext::from(reconstruct_offset(decomp, n, &r)),
+        b_value.0 + Ext::from(reconstruct_offset(decomp, n, &coins)),
         "digits reconstruct the value"
     );
 
@@ -269,7 +287,7 @@ pub fn claim_decomp(
 /// Verify a [`DecompSegmentProof`].
 pub fn verify_decomp(
     commitment: &CellSegmentCommitment,
-    claims: &[CellClaim],
+    claims: &crate::gkr::segment::Claims<'_>,
     proof: &DecompSegmentProof,
     (n, _digits): (usize, usize),
     tr: &mut Transcript,
@@ -292,12 +310,19 @@ pub fn verify_decomp(
 
     tr.observe_val(Fp::new(cells.value as u64));
     tr.observe_val(Fp::new(cells.all_digits as u64));
-    let (mut r, coins) = crate::pcs::linear_claim::sample_coins(n, tr);
-    r.resize(d, Fp::ZERO);
-    if coins != proof.r {
+    // Sample first: the transcript must advance exactly as the prover's did, and the
+    // sample is what the proof's coins are checked against.
+    if crate::pcs::linear_claim::sample(n, tr).coins() != proof.r {
         return false;
     }
-    let h = LinearH::Dense(r.clone());
+    let r = proof.r.clone();
+    let h = LinearH::Blocks {
+        coins: r.clone(),
+        len: n,
+        weights: vec![Fp::new(1)],
+        total: d,
+        offset: 0,
+    };
 
     let Some((z, cf)) = linear_verify(&proof.b_value.1, proof.b_value.0, tr) else {
         return false;
@@ -463,7 +488,7 @@ pub fn claim_row_max(
 #[allow(clippy::too_many_arguments)]
 pub fn verify_row_max(
     commitment: &CellSegmentCommitment,
-    claims: &[CellClaim],
+    claims: &crate::gkr::segment::Claims<'_>,
     proof: &RowMaxProof,
     (row, n): (usize, usize),
     prefix: usize,
@@ -551,6 +576,7 @@ pub fn verify_row_max(
 
 #[cfg(test)]
 mod tests {
+    use crate::gkr::segment::Claims;
     use super::*;
     use crate::gkr::segment::{verify, SegmentCells};
     use crate::pcs::transcript::new_challenger;
@@ -627,11 +653,11 @@ mod tests {
         let proof = claim_decomp(&mut seg, cells, decomp, (n, decomp.digits), &mut tr);
         let claims = seg.claims().to_vec();
         let wproof = seg.prove(&mut new_challenger());
-        if !verify(&com, &claims, &wproof, &mut new_challenger()) {
+        if !verify(&com, &Claims::new(&claims), &wproof, &mut new_challenger()) {
             return false;
         }
         let mut vtr = Transcript::new(&new_challenger());
-        verify_decomp(&com, &claims, &proof, (n, decomp.digits), &mut vtr)
+        verify_decomp(&com, &Claims::new(&claims), &proof, (n, decomp.digits), &mut vtr)
     }
 
     #[test]
@@ -765,11 +791,11 @@ mod tests {
         let proof = claim_row_max(&mut seg, cells2, (row, n), prefix, m, tstar, &mut tr);
         let claims = seg.claims().to_vec();
         let wproof = seg.prove(&mut new_challenger());
-        assert!(verify(&com, &claims, &wproof, &mut new_challenger()));
+        assert!(verify(&com, &Claims::new(&claims), &wproof, &mut new_challenger()));
         let mut vtr = Transcript::new(&new_challenger());
         assert!(verify_row_max(
             &com,
-            &claims,
+            &Claims::new(&claims),
             &proof,
             (row, n),
             prefix,
@@ -782,7 +808,7 @@ mod tests {
         let mut vtr = Transcript::new(&new_challenger());
         assert!(!verify_row_max(
             &com,
-            &claims,
+            &Claims::new(&claims),
             &bad,
             (row, n),
             prefix,

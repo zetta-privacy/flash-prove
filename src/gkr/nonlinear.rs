@@ -20,7 +20,7 @@ use crate::gkr::logup::{claim_eq_public, verify_eq_public, EqPublicProof};
 use crate::gkr::requant::{claim_requant, verify_requant, RequantCells, RequantSegmentProof};
 use crate::gkr::segment::{
     claim_mul, claim_sum_squares, claim_value_at_id, linear_finish, linear_verify, verify_mul,
-    verify_sum_squares, CellClaim, CellSegment, CellSegmentCommitment, MulSegmentProof,
+    verify_sum_squares, CellSegment, CellSegmentCommitment, MulSegmentProof,
     SumSquaresProof, View,
 };
 use crate::pcs::linear_claim::{LinearClaimProof, LinearH};
@@ -159,7 +159,7 @@ pub fn claim_norm_row(
 #[allow(clippy::too_many_arguments)]
 pub fn verify_norm_row(
     commitment: &CellSegmentCommitment,
-    claims: &[CellClaim],
+    claims: &crate::gkr::segment::Claims<'_>,
     proof: &NormRowProof,
     (row, hidden): (usize, usize),
     (n, k, digits): (usize, usize, usize),
@@ -243,7 +243,7 @@ pub fn verify_norm_row(
 #[allow(clippy::too_many_arguments)]
 fn replay(
     commitment: &CellSegmentCommitment,
-    claims: &[CellClaim],
+    claims: &crate::gkr::segment::Claims<'_>,
     cell: usize,
     view: &View,
     m_x: usize,
@@ -380,7 +380,7 @@ pub fn claim_rope(
 #[allow(clippy::too_many_arguments)]
 pub fn verify_rope(
     commitment: &CellSegmentCommitment,
-    claims: &[CellClaim],
+    claims: &crate::gkr::segment::Claims<'_>,
     proof: &RopeSegmentProof,
     (rows, heads, d): (usize, usize, usize),
     theta: f64,
@@ -579,7 +579,7 @@ pub fn claim_softmax_row(
 #[allow(clippy::too_many_arguments)]
 pub fn verify_softmax_row(
     commitment: &CellSegmentCommitment,
-    claims: &[CellClaim],
+    claims: &crate::gkr::segment::Claims<'_>,
     proof: &SoftmaxRowProof,
     (unit, n, l): (usize, usize, usize),
     (exp_lo, tstar): (i64, usize),
@@ -848,7 +848,7 @@ pub fn claim_embed(
 #[allow(clippy::too_many_arguments)]
 pub fn verify_embed(
     commitment: &CellSegmentCommitment,
-    claims: &[CellClaim],
+    claims: &crate::gkr::segment::Claims<'_>,
     w_com: &crate::pcs::whir_stacked::SegmentCommitment,
     w_proof: &crate::pcs::whir_stacked::Proof,
     proof: &EmbedSegmentProof,
@@ -917,6 +917,7 @@ pub fn verify_embed(
 
 #[cfg(test)]
 mod tests {
+    use crate::gkr::segment::Claims;
     use super::*;
     use crate::gkr::range::Decomp;
     use crate::gkr::segment::{verify, SegmentCells};
@@ -1069,11 +1070,11 @@ mod tests {
         );
         let claims = seg.claims().to_vec();
         let wproof = seg.prove(&mut new_challenger());
-        assert!(verify(&com, &claims, &wproof, &mut new_challenger()));
+        assert!(verify(&com, &Claims::new(&claims), &wproof, &mut new_challenger()));
         let mut vtr = Transcript::new(&new_challenger());
         assert!(verify_norm_row(
             &com,
-            &claims,
+            &Claims::new(&claims),
             &proof,
             (row, hidden),
             (hidden, k, 2),
@@ -1216,11 +1217,11 @@ mod tests {
         let _ = (alpha, beta, table, big_n);
         let claims = seg.claims().to_vec();
         let wproof = seg.prove(&mut new_challenger());
-        assert!(verify(&com, &claims, &wproof, &mut new_challenger()));
+        assert!(verify(&com, &Claims::new(&claims), &wproof, &mut new_challenger()));
         let mut vtr = Transcript::new(&new_challenger());
         assert!(verify_softmax_row(
             &com,
-            &claims,
+            &Claims::new(&claims),
             &proof,
             (0, n, l),
             (exp_lo, 0),
@@ -1229,7 +1230,7 @@ mod tests {
         ));
         assert!(verify_requant(
             &com,
-            &claims,
+            &Claims::new(&claims),
             &rq_proof,
             (n, k, digits),
             &mut vtr

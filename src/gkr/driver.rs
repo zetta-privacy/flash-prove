@@ -272,6 +272,7 @@ pub fn verify_segment_with_weights(
 
 /// Verify a segment against the op list it was proved for.
 pub fn verify_segment(ops: &[Op], out: &SegmentOutput) -> bool {
+    let claims = crate::gkr::segment::Claims::new(&out.claims);
     if out.ops.len() != ops.len() {
         return false;
     }
@@ -295,7 +296,7 @@ pub fn verify_segment(ops: &[Op], out: &SegmentOutput) -> bool {
                 if p.out != out_id || p.inputs.iter().map(|t| t.0).ne(want.iter().copied()) {
                     return false;
                 }
-                if !verify_add(&out.commitment, &out.claims, p, &mut tr) {
+                if !verify_add(&out.commitment, &claims, p, &mut tr) {
                     return false;
                 }
             }
@@ -306,7 +307,7 @@ pub fn verify_segment(ops: &[Op], out: &SegmentOutput) -> bool {
                 if (p.a, p.b, p.c) != (ca, cb, Some(cc)) {
                     return false;
                 }
-                if !verify_mul(&out.commitment, &out.claims, p, &mut tr) {
+                if !verify_mul(&out.commitment, &claims, p, &mut tr) {
                     return false;
                 }
             }
@@ -317,7 +318,7 @@ pub fn verify_segment(ops: &[Op], out: &SegmentOutput) -> bool {
                 if (p.input, p.output) != (ci, co) {
                     return false;
                 }
-                if !verify_reshape(&out.commitment, &out.claims, p, &mut tr) {
+                if !verify_reshape(&out.commitment, &claims, p, &mut tr) {
                     return false;
                 }
             }
@@ -326,12 +327,7 @@ pub fn verify_segment(ops: &[Op], out: &SegmentOutput) -> bool {
     }
 
     // The op claims are only sound if the segment's own openings check out.
-    crate::gkr::segment::verify(
-        &out.commitment,
-        &out.claims,
-        &out.proof,
-        &mut new_challenger(),
-    )
+    crate::gkr::segment::verify(&out.commitment, &claims, &out.proof, &mut new_challenger())
 }
 
 /// Output shapes, threaded op to op exactly as the arithmetization resolves them.
@@ -2019,6 +2015,9 @@ pub fn verify_segment_with_head(
     head: Option<&HeadSpec>,
 ) -> bool {
     let _ = (dims, window, head);
+    // One `cell -> claims` index for the whole segment: value lookups were scanning
+    // every claim in the list.
+    let claims = crate::gkr::segment::Claims::new(&bundle.segment.claims);
     // Debug switch: check only the first `FLASHPROVE_VERIFY_OPS` ops. Prover and
     // verifier advance the transcript identically over a prefix, so this isolates
     // which op a rejection comes from.
@@ -2065,7 +2064,7 @@ pub fn verify_segment_with_head(
                 let table = bounds.silu_table(alpha, beta);
                 if !crate::gkr::logup::verify_lookup2(
                     &bundle.segment.commitment,
-                    &bundle.segment.claims,
+                    &claims,
                     p,
                     &table,
                     (rows, bounds.silu_big_n()),
@@ -2129,7 +2128,7 @@ pub fn verify_segment_with_head(
                 };
                 if !crate::gkr::segment::verify_matmul_weight(
                     &bundle.segment.commitment,
-                    &bundle.segment.claims,
+                    &claims,
                     w_com,
                     w_proof,
                     &crate::gkr::segment::View::Whole,
@@ -2141,7 +2140,7 @@ pub fn verify_segment_with_head(
                 }
                 if !crate::gkr::requant::verify_requant(
                     &bundle.segment.commitment,
-                    &bundle.segment.claims,
+                    &claims,
                     rq,
                     (co_elems, *shift as usize, digits),
                     &mut tr,
@@ -2165,7 +2164,7 @@ pub fn verify_segment_with_head(
                 }
                 if !crate::gkr::segment::verify_add(
                     &bundle.segment.commitment,
-                    &bundle.segment.claims,
+                    &claims,
                     p,
                     &mut tr,
                 ) {
@@ -2198,7 +2197,7 @@ pub fn verify_segment_with_head(
                 }
                 if !crate::gkr::segment::verify_add(
                     &bundle.segment.commitment,
-                    &bundle.segment.claims,
+                    &claims,
                     add,
                     &mut tr,
                 ) {
@@ -2210,7 +2209,7 @@ pub fn verify_segment_with_head(
                 let n = ym.logical_rows * ym.logical_cols;
                 if !crate::gkr::requant::verify_requant(
                     &bundle.segment.commitment,
-                    &bundle.segment.claims,
+                    &claims,
                     rq,
                     (n, *k as usize, digits),
                     &mut tr,
@@ -2239,7 +2238,7 @@ pub fn verify_segment_with_head(
                 }
                 if !crate::gkr::segment::verify_mul(
                     &bundle.segment.commitment,
-                    &bundle.segment.claims,
+                    &claims,
                     p,
                     &mut tr,
                 ) {
@@ -2267,7 +2266,7 @@ pub fn verify_segment_with_head(
                 }
                 if !crate::gkr::segment::verify_mul(
                     &bundle.segment.commitment,
-                    &bundle.segment.claims,
+                    &claims,
                     mul,
                     &mut tr,
                 ) {
@@ -2279,7 +2278,7 @@ pub fn verify_segment_with_head(
                 let n = ym.logical_rows * ym.logical_cols;
                 if !crate::gkr::requant::verify_requant(
                     &bundle.segment.commitment,
-                    &bundle.segment.claims,
+                    &claims,
                     rq,
                     (n, *k as usize, digits),
                     &mut tr,
@@ -2299,7 +2298,7 @@ pub fn verify_segment_with_head(
                 }
                 if !crate::gkr::segment::verify_reshape(
                     &bundle.segment.commitment,
-                    &bundle.segment.claims,
+                    &claims,
                     p,
                     &mut tr,
                 ) {
@@ -2337,7 +2336,7 @@ pub fn verify_segment_with_head(
                     }
                     if !crate::gkr::segment::verify_weighted_sum(
                         &bundle.segment.commitment,
-                        &bundle.segment.claims,
+                        &claims,
                         row,
                         &mut tr,
                     ) {
@@ -2385,7 +2384,7 @@ pub fn verify_segment_with_head(
                     }
                     if !crate::gkr::nonlinear::verify_norm_row(
                         &bundle.segment.commitment,
-                        &bundle.segment.claims,
+                        &claims,
                         rp,
                         (row, hidden),
                         (hidden, crate::model::spec::RECIP_Q as usize, digits),
@@ -2420,7 +2419,7 @@ pub fn verify_segment_with_head(
                     }
                     if !crate::gkr::attention::verify_weighted_v(
                         &bundle.segment.commitment,
-                        &bundle.segment.claims,
+                        &claims,
                         hp,
                         (log_l, log_d, log_h),
                         hi,
@@ -2472,7 +2471,7 @@ pub fn verify_segment_with_head(
                     }
                     if !crate::gkr::attention::verify_scores(
                         &bundle.segment.commitment,
-                        &bundle.segment.claims,
+                        &claims,
                         hp,
                         (log_l, log_d, log_h),
                         hi,
@@ -2516,7 +2515,7 @@ pub fn verify_segment_with_head(
                 // The op-wide requant, claimed before the units (same order on both sides).
                 if !crate::gkr::requant::verify_requant(
                     &bundle.segment.commitment,
-                    &bundle.segment.claims,
+                    &claims,
                     requant,
                     (total, crate::model::spec::RECIP_Q as usize, digits),
                     &mut tr,
@@ -2530,7 +2529,7 @@ pub fn verify_segment_with_head(
                     }
                     if !crate::gkr::nonlinear::verify_softmax_row(
                         &bundle.segment.commitment,
-                        &bundle.segment.claims,
+                        &claims,
                         rp,
                         (unit, n, unit / h),
                         (bounds.exp_lo, rp.row_max.tstar),
@@ -2542,7 +2541,7 @@ pub fn verify_segment_with_head(
                 }
                 if !crate::gkr::logup::verify_lookup2(
                     &bundle.segment.commitment,
-                    &bundle.segment.claims,
+                    &claims,
                     lookup,
                     &bounds.exp_table(alpha, beta),
                     (total, bounds.exp_big_n()),
@@ -2552,7 +2551,7 @@ pub fn verify_segment_with_head(
                 }
                 if !crate::gkr::logup::verify_lookup2(
                     &bundle.segment.commitment,
-                    &bundle.segment.claims,
+                    &claims,
                     over_lookup,
                     &crate::gkr::nonlinear::max_table(bounds.exp_lo, alpha, beta),
                     (total, crate::gkr::nonlinear::max_big_n(bounds.exp_lo)),
@@ -2626,7 +2625,7 @@ pub fn verify_segment_with_head(
                 for (row, rp) in row_proofs.iter().enumerate() {
                     if !crate::gkr::selection::verify_top_k_row(
                         &bundle.segment.commitment,
-                        &bundle.segment.claims,
+                        &claims,
                         cells,
                         rp,
                         (row, e, *k),
@@ -2638,7 +2637,7 @@ pub fn verify_segment_with_head(
                 let table = bounds.sign_table(alpha, beta);
                 if !crate::gkr::logup::verify_lookup2(
                     &bundle.segment.commitment,
-                    &bundle.segment.claims,
+                    &claims,
                     lookup,
                     &table,
                     (rows * e, bounds.sign_big_n()),
@@ -2660,7 +2659,7 @@ pub fn verify_segment_with_head(
                 }
                 if !crate::gkr::nonlinear::verify_rope(
                     &bundle.segment.commitment,
-                    &bundle.segment.claims,
+                    &claims,
                     rp,
                     (rows, dims.heads, d),
                     *theta,
@@ -2692,7 +2691,7 @@ pub fn verify_segment_with_head(
                 };
                 if !crate::gkr::nonlinear::verify_embed(
                     &bundle.segment.commitment,
-                    &bundle.segment.claims,
+                    &claims,
                     w_com,
                     w_proof,
                     p,
@@ -2722,7 +2721,7 @@ pub fn verify_segment_with_head(
         let table = bounds.head_table(h.max, alpha, beta);
         if !crate::gkr::head::verify_head(
             &bundle.segment.commitment,
-            &bundle.segment.claims,
+            &claims,
             hp,
             (logits, rows - 1, n, h.token),
             (&table, bounds.score_big_n()),
@@ -2737,7 +2736,7 @@ pub fn verify_segment_with_head(
     let t_pcs = std::time::Instant::now();
     let ok = crate::gkr::segment::verify(
         &bundle.segment.commitment,
-        &bundle.segment.claims,
+        &claims,
         &bundle.segment.proof,
         &mut new_challenger(),
     );
@@ -2819,6 +2818,12 @@ pub fn verify_links(
     let Ok(per_segment) = ops_per_segment(&spec.ops, &plan) else {
         return false;
     };
+    // Index each segment's claims once; a link opens one cell in each.
+    let indexes: Vec<crate::gkr::segment::Claims<'_>> = file
+        .segments
+        .iter()
+        .map(|b| crate::gkr::segment::Claims::new(&b.segment.claims))
+        .collect();
     for link in link_schedule(&plan, &per_segment) {
         let (Some(a), Some(b)) = (file.segments.get(link.from), file.segments.get(link.to)) else {
             return false;
@@ -2836,13 +2841,13 @@ pub fn verify_links(
         let point = link_point(link.to, &link.name, m);
         let va = crate::gkr::segment::claim_value_at_id(
             &a.segment.commitment,
-            &a.segment.claims,
+            &indexes[link.from],
             ca,
             &point,
         );
         let vb = crate::gkr::segment::claim_value_at_id(
             &b.segment.commitment,
-            &b.segment.claims,
+            &indexes[link.to],
             cb,
             &point,
         );

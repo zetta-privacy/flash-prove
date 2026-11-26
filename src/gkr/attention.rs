@@ -22,7 +22,7 @@
 use crate::field::{Ext, Fp};
 use crate::gkr::requant::{claim_requant, verify_requant, RequantCells, RequantSegmentProof};
 use crate::gkr::segment::{
-    claim_matmul, claim_value_at_id, linear_finish, linear_verify, verify_matmul, CellClaim,
+    claim_matmul, claim_value_at_id, linear_finish, linear_verify, verify_matmul,
     CellSegment, CellSegmentCommitment, MatmulSegmentProof, View,
 };
 use crate::pcs::transcript::Transcript;
@@ -167,7 +167,7 @@ pub fn claim_scores(
 #[allow(clippy::too_many_arguments)]
 pub fn verify_scores(
     commitment: &CellSegmentCommitment,
-    claims: &[CellClaim],
+    claims: &crate::gkr::segment::Claims<'_>,
     proof: &ScoresSegmentProof,
     (log_l, log_d, log_h): (usize, usize, usize),
     head: usize,
@@ -355,7 +355,7 @@ pub fn claim_weighted_v(
 #[allow(clippy::too_many_arguments)]
 pub fn verify_weighted_v(
     commitment: &CellSegmentCommitment,
-    claims: &[CellClaim],
+    claims: &crate::gkr::segment::Claims<'_>,
     proof: &WeightedVSegmentProof,
     (log_l, log_d, log_h): (usize, usize, usize),
     head: usize,
@@ -422,6 +422,7 @@ pub fn verify_weighted_v(
 
 #[cfg(test)]
 mod tests {
+    use crate::gkr::segment::Claims;
     use super::*;
     use crate::gkr::range::Decomp;
     use crate::gkr::segment::{verify, SegmentCells};
@@ -588,11 +589,11 @@ mod tests {
         );
         let claims = seg.claims().to_vec();
         let wproof = seg.prove(&mut new_challenger());
-        assert!(verify(&com, &claims, &wproof, &mut new_challenger()));
+        assert!(verify(&com, &Claims::new(&claims), &wproof, &mut new_challenger()));
         let mut vtr = Transcript::new(&new_challenger());
         assert!(verify_weighted_v(
             &com,
-            &claims,
+            &Claims::new(&claims),
             &proof,
             dims,
             hi,
@@ -662,11 +663,11 @@ mod tests {
         );
         let bad_claims = bad.claims().to_vec();
         let bad_w = bad.prove(&mut new_challenger());
-        assert!(verify(&bad_com, &bad_claims, &bad_w, &mut new_challenger()));
+        assert!(verify(&bad_com, &Claims::new(&bad_claims), &bad_w, &mut new_challenger()));
         let mut vtr = Transcript::new(&new_challenger());
         assert!(!verify_weighted_v(
             &bad_com,
-            &bad_claims,
+            &Claims::new(&bad_claims),
             &bad_proof,
             dims,
             hi,
@@ -799,11 +800,11 @@ mod tests {
         );
         let claims = seg.claims().to_vec();
         let wproof = seg.prove(&mut new_challenger());
-        assert!(verify(&com, &claims, &wproof, &mut new_challenger()));
+        assert!(verify(&com, &Claims::new(&claims), &wproof, &mut new_challenger()));
         let mut vtr = Transcript::new(&new_challenger());
         assert!(verify_scores(
             &com,
-            &claims,
+            &Claims::new(&claims),
             &proof,
             dims,
             hi,
@@ -872,11 +873,11 @@ mod tests {
         );
         let bad_claims = bad.claims().to_vec();
         let bad_w = bad.prove(&mut new_challenger());
-        assert!(verify(&bad_com, &bad_claims, &bad_w, &mut new_challenger()));
+        assert!(verify(&bad_com, &Claims::new(&bad_claims), &bad_w, &mut new_challenger()));
         let mut vtr = Transcript::new(&new_challenger());
         assert!(!verify_scores(
             &bad_com,
-            &bad_claims,
+            &Claims::new(&bad_claims),
             &bad_proof,
             dims,
             hi,

@@ -10,7 +10,6 @@ use std::time::Instant;
 use flashprove::field::{Ext, Fp};
 use flashprove::pcs::transcript::new_challenger;
 use flashprove::pcs::whir_stacked::{verify, Committer, Params};
-use p3_field::PrimeCharacteristicRing;
 
 fn column(m: usize, seed: u64) -> Vec<Fp> {
     let n = 1usize << m;

@@ -31,7 +31,7 @@ fn main() {
             mb(sz(&seg.head)),
             mb(sz(&b.weights)),
         );
-        if s == 0 {
+        if s == 0 || s == 8 {
             for (k, o) in seg.ops.iter().enumerate().take(3) {
                 println!("    op {k}: {}", mb(sz(o)));
             }

@@ -366,6 +366,7 @@ impl RequantNames {
 
 #[cfg(test)]
 mod tests {
+    use crate::gkr::segment::Claims;
     use super::*;
     use crate::gkr::requant::{claim_requant, verify_requant};
     use crate::gkr::segment::verify;
@@ -393,11 +394,11 @@ mod tests {
         let proof = claim_requant(&mut seg, rc, (x.len(), k, 1), &mut tr);
         let claims = seg.claims().to_vec();
         let wproof = seg.prove(&mut new_challenger());
-        assert!(verify(&com, &claims, &wproof, &mut new_challenger()));
+        assert!(verify(&com, &Claims::new(&claims), &wproof, &mut new_challenger()));
         let mut vtr = Transcript::new(&new_challenger());
         assert!(verify_requant(
             &com,
-            &claims,
+            &Claims::new(&claims),
             &proof,
             (x.len(), k, 1),
             &mut vtr

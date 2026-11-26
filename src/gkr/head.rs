@@ -18,7 +18,7 @@ use crate::field::arith::bool_point;
 use crate::field::{Ext, Fp};
 use crate::gkr::logup::{claim_lookup2, verify_lookup2, Lookup2Cells, Lookup2SegmentProof};
 use crate::gkr::segment::{
-    claim_value_at_id, linear_finish, linear_verify, CellClaim, CellSegment, CellSegmentCommitment,
+    claim_value_at_id, linear_finish, linear_verify, CellSegment, CellSegmentCommitment,
     View,
 };
 use crate::pcs::transcript::Transcript;
@@ -140,7 +140,7 @@ pub fn claim_head(
 #[allow(clippy::too_many_arguments)]
 pub fn verify_head(
     commitment: &CellSegmentCommitment,
-    claims: &[CellClaim],
+    claims: &crate::gkr::segment::Claims<'_>,
     proof: &HeadSegmentProof,
     (logits, row, n, head_token): (usize, usize, usize, usize),
     (table, big_n): (&[Fp], usize),
@@ -220,6 +220,7 @@ pub fn verify_head(
 
 #[cfg(test)]
 mod tests {
+    use crate::gkr::segment::Claims;
     use super::*;
     use crate::gkr::segment::{verify, SegmentCells};
     use crate::pcs::transcript::new_challenger;
@@ -303,11 +304,11 @@ mod tests {
         );
         let claims = seg.claims().to_vec();
         let wproof = seg.prove(&mut new_challenger());
-        assert!(verify(&com, &claims, &wproof, &mut new_challenger()));
+        assert!(verify(&com, &Claims::new(&claims), &wproof, &mut new_challenger()));
         let mut vtr = Transcript::new(&new_challenger());
         assert!(verify_head(
             &com,
-            &claims,
+            &Claims::new(&claims),
             &proof,
             (lg, row, n, token),
             (&table, big_n),
@@ -324,7 +325,7 @@ mod tests {
         bad.head_token = 0;
         assert!(!verify_head(
             &com,
-            &claims,
+            &Claims::new(&claims),
             &bad,
             (lg, row, n, 0),
             (&table, big_n),

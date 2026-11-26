@@ -13,6 +13,7 @@
 //! * **the claim identity** `⟨r, out⟩ = ⟨e, emb⟩`, checked through two
 //!   independent multilinear sumchecks that each end in one WHIR opening.
 
+use flashprove::gkr::segment::Claims;
 use flashprove::field::{Ext, Fp};
 use flashprove::gkr::segment::{claim_value_at, linear_finish, linear_verify, verify, CellSegment};
 use flashprove::model::{Cell, WeightMatrix};
@@ -109,19 +110,19 @@ fn embed_op_on_stacked_whir() {
     observe_root(&com_c.pcs.root, &mut vch);
     // The segment proofs run on their own fresh transcripts (the prover used one
     // per segment); what binds them to the op is that `tr` observed both roots.
-    assert!(verify(&com_c, &claims_c, &proof_c, &mut new_challenger()));
-    assert!(verify(&com_w, &claims_w, &proof_w, &mut new_challenger()));
+    assert!(verify(&com_c, &Claims::new(&claims_c), &proof_c, &mut new_challenger()));
+    assert!(verify(&com_w, &Claims::new(&claims_w), &proof_w, &mut new_challenger()));
 
     let mut trv = Transcript::new(&vch);
     // Consume the same RLC draws the prover made before the claims.
     let r_v: Vec<Fp> = (0..N_OUT).map(|_| trv.sample_val()).collect();
     assert_eq!(r_v, r, "same RLC vector on both sides");
     let (z_out, c_out) = linear_verify(&proof_out, b_out, &mut trv).expect("out sumcheck");
-    let v_out = claim_value_at(&com_c, &claims_c, "out", &z_out).expect("out opening");
+    let v_out = claim_value_at(&com_c, &Claims::new(&claims_c), "out", &z_out).expect("out opening");
     assert!(linear_finish(&h_out, &z_out, c_out, v_out));
 
     let (z_emb, c_emb) = linear_verify(&proof_emb, b_emb, &mut trv).expect("emb sumcheck");
-    let v_emb = claim_value_at(&com_w, &claims_w, "embed", &z_emb).expect("emb opening");
+    let v_emb = claim_value_at(&com_w, &Claims::new(&claims_w), "embed", &z_emb).expect("emb opening");
     assert!(linear_finish(&h_emb, &z_emb, c_emb, v_emb));
 
     // --- soundness ---------------------------------------------------------
@@ -141,7 +142,7 @@ fn embed_op_on_stacked_whir() {
     // A tampered activation cell no longer verifies.
     let mut bad = claims_c.clone();
     bad[0].values[0] += Ext::ONE;
-    assert!(!verify(&com_c, &bad, &proof_c, &mut new_challenger()));
+    assert!(!verify(&com_c, &Claims::new(&bad), &proof_c, &mut new_challenger()));
 
     // A tampered embedding opening breaks the terminal identity.
     assert!(!linear_finish(&h_emb, &z_emb, c_emb, v_emb + Ext::ONE));

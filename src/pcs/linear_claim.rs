@@ -65,6 +65,24 @@ pub enum LinearH {
     /// to the cell's arity); the padding is zero, so the product form is still right
     /// only when `len == 2^m`, and the padded case falls back to the fold.
     Tensor { coins: Vec<Fp>, len: usize },
+    /// `blocks` contiguous copies of one tensor, each scaled by a public weight:
+    /// entry `j·len + i` is `weights[j] · r[i]`, zero-padded to `total`.
+    ///
+    /// This is the terminal functional of a digit decomposition — one random vector
+    /// over the values, scaled per digit block — and it evaluates in
+    /// `O(log len + blocks · log blocks)` instead of `O(len · blocks)`.
+    Blocks {
+        coins: Vec<Fp>,
+        /// Values per block (a power of two).
+        len: usize,
+        /// The public per-block scale.
+        weights: Vec<Fp>,
+        /// The cell's arity (`offset + len · blocks`, padded up to a power of two).
+        total: usize,
+        /// Where the first block starts, in entries. A multiple of `len`, so the
+        /// blocks land on whole coordinates (a tensor row inside a whole cell).
+        offset: usize,
+    },
 }
 
 impl LinearH {
@@ -73,6 +91,7 @@ impl LinearH {
             Self::Dense(h) => h.len(),
             Self::Block { len, .. } | Self::Sparse { len, .. } | Self::Ones { len } => *len,
             Self::Tensor { len, .. } => *len,
+            Self::Blocks { total, .. } => *total,
         }
     }
 
@@ -82,7 +101,7 @@ impl LinearH {
     /// instead of `2^m`.
     pub fn coins(&self) -> &[Fp] {
         match self {
-            Self::Tensor { coins, .. } => coins,
+            Self::Tensor { coins, .. } | Self::Blocks { coins, .. } => coins,
             _ => &[],
         }
     }
@@ -134,6 +153,30 @@ impl LinearH {
                 v.resize(*len, Fp::ZERO);
                 v
             }
+            Self::Blocks {
+                coins,
+                len,
+                weights,
+                total,
+                offset,
+            } => {
+                let base = Self::Tensor {
+                    coins: coins.clone(),
+                    len: *len,
+                }
+                .dense();
+                let mut h = Fp::zero_vec(*total);
+                for (j, &w) in weights.iter().enumerate() {
+                    let off = offset + j * len;
+                    if off + len > *total {
+                        break;
+                    }
+                    for i in 0..*len {
+                        h[off + i] = w * base[i];
+                    }
+                }
+                h
+            }
         }
     }
 
@@ -167,6 +210,41 @@ impl LinearH {
                     // Short vector padded with zeros: the product form does not apply.
                     fold_eval(&self.dense(), z)
                 }
+            }
+            Self::Blocks {
+                coins,
+                len,
+                weights,
+                total,
+                offset,
+            } => {
+                if !len.is_power_of_two() {
+                    // A ragged block length truncates the tensor, so the product form
+                    // does not apply; fold the explicit vector instead.
+                    return fold_eval(&self.dense(), z);
+                }
+                let low = (len.trailing_zeros() as usize).min(z.len());
+                let (z_low, z_high) = z.split_at(low);
+                // `Σ_j w_j·eq(z_high, offset/len + j)`: only the blocks inside the cell
+                // count, and the offset must be whole blocks.
+                debug_assert_eq!(offset % len, 0, "block offset must be a multiple of len");
+                let first = offset / len;
+                let mut scaled = Ext::ZERO;
+                for (j, &w) in weights.iter().enumerate() {
+                    if (offset + j * len) >= *total {
+                        break;
+                    }
+                    scaled += Ext::from(w) * eq(z_high, first + j);
+                }
+                let base: Ext = coins
+                    .iter()
+                    .take(low)
+                    .zip(z_low)
+                    .map(|(&c, &zk)| {
+                        (Ext::ONE - Ext::from(c)) * (Ext::ONE - zk) + Ext::from(c) * zk
+                    })
+                    .product();
+                base * scaled
             }
         }
     }
@@ -350,6 +428,35 @@ mod tests {
                 .map(|(j, &x)| eq(&z, j) * Ext::from(x))
                 .sum();
             assert_eq!(h.eval_at(&z), want, "n={n}");
+        }
+    }
+
+    #[test]
+    fn blocks_eval_matches_dense() {
+        for (n, digits) in [(2usize, 2usize), (4, 2), (4, 3), (2, 5), (8, 2)] {
+            let total = (n * digits).next_power_of_two();
+            let mut tr = tr();
+            let coins: Vec<Fp> = (0..n.trailing_zeros() as usize)
+                .map(|_| tr.sample_val())
+                .collect();
+            let weights: Vec<Fp> = (0..digits).map(|j| Fp::new(1 << j)).collect();
+            let h = LinearH::Blocks {
+                coins,
+                len: n,
+                weights,
+                total,
+                offset: 0,
+            };
+            let d = h.dense();
+            assert_eq!(d.len(), total);
+            let m = total.trailing_zeros() as usize;
+            let z: Vec<Ext> = (0..m).map(|i| Ext::from(Fp::new(i as u64 + 3))).collect();
+            let want: Ext = d
+                .iter()
+                .enumerate()
+                .map(|(j, &x)| eq(&z, j) * Ext::from(x))
+                .sum();
+            assert_eq!(h.eval_at(&z), want, "n={n} digits={digits}");
         }
     }
 

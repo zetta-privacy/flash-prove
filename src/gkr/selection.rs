@@ -16,7 +16,7 @@
 use crate::field::{Ext, Fp};
 use crate::gkr::logup::Lookup2Cells;
 use crate::gkr::segment::{
-    claim_value_at_id, linear_finish, linear_verify, CellClaim, CellSegment, CellSegmentCommitment,
+    claim_value_at_id, linear_finish, linear_verify, CellSegment, CellSegmentCommitment,
     View,
 };
 use crate::pcs::transcript::Transcript;
@@ -142,7 +142,7 @@ pub fn claim_top_k_row(
 /// Verify a [`TopKRowProof`].
 pub fn verify_top_k_row(
     commitment: &CellSegmentCommitment,
-    claims: &[CellClaim],
+    claims: &crate::gkr::segment::Claims<'_>,
     cells: &TopKCells,
     proof: &TopKRowProof,
     (row, e, k): (usize, usize, usize),
@@ -250,6 +250,7 @@ fn fp_i64(x: i64) -> Fp {
 
 #[cfg(test)]
 mod tests {
+    use crate::gkr::segment::Claims;
     use super::*;
     use crate::gkr::logup::{claim_lookup2, verify_lookup2};
     use crate::gkr::segment::{verify, SegmentCells};
@@ -364,15 +365,15 @@ mod tests {
 
         let claims = seg.claims().to_vec();
         let wproof = seg.prove(&mut new_challenger());
-        assert!(verify(&com, &claims, &wproof, &mut new_challenger()));
+        assert!(verify(&com, &Claims::new(&claims), &wproof, &mut new_challenger()));
 
         let mut vtr = Transcript::new(&new_challenger());
         for row in 0..rows {
-            assert!(verify_top_k_row(&com, &claims, &tc, &proofs[row], (row, e, k), &mut vtr));
+            assert!(verify_top_k_row(&com, &Claims::new(&claims), &tc, &proofs[row], (row, e, k), &mut vtr));
         }
         assert!(verify_lookup2(
             &com,
-            &claims,
+            &Claims::new(&claims),
             &lk,
             &table,
             (rows * e, big_n),
@@ -383,6 +384,6 @@ mod tests {
         let mut bad = proofs[0].clone();
         bad.adj_at_tstar += Ext::ONE;
         let mut vtr = Transcript::new(&new_challenger());
-        assert!(!verify_top_k_row(&com, &claims, &tc, &bad, (0, e, k), &mut vtr));
+        assert!(!verify_top_k_row(&com, &Claims::new(&claims), &tc, &bad, (0, e, k), &mut vtr));
     }
 }

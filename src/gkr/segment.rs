@@ -500,7 +500,7 @@ pub fn linear_finish(h: &LinearH, z: &[Ext], claim: Ext, v_at_z: Ext) -> bool {
 /// find the opening the prover recorded for the reduced sumcheck point.
 pub fn claim_value_at(
     commitment: &CellSegmentCommitment,
-    claims: &[CellClaim],
+    claims: &crate::gkr::segment::Claims<'_>,
     name: &str,
     point: &[Ext],
 ) -> Option<Ext> {
@@ -511,17 +511,57 @@ pub fn claim_value_at(
 /// Same, addressed by cell id.
 pub fn claim_value_at_id(
     commitment: &CellSegmentCommitment,
-    claims: &[CellClaim],
+    claims: &crate::gkr::segment::Claims<'_>,
     cell: usize,
     point: &[Ext],
 ) -> Option<Ext> {
     claim_value_at_col(commitment, claims, cell, 0, point)
 }
 
+/// A segment's claim list plus the `cell → claims` index the verifier looks values up
+/// through.
+///
+/// Lookups were a linear scan of every claim, which is quadratic in a segment with
+/// tens of thousands of them; the index makes them proportional to the claims on the
+/// one cell being opened.
+pub struct Claims<'a> {
+    raw: &'a [CellClaim],
+    by_cell: Vec<Vec<usize>>,
+}
+
+impl<'a> Claims<'a> {
+    pub fn new(raw: &'a [CellClaim]) -> Self {
+        let mut by_cell: Vec<Vec<usize>> = Vec::new();
+        for (i, c) in raw.iter().enumerate() {
+            if by_cell.len() <= c.cell {
+                by_cell.resize(c.cell + 1, Vec::new());
+            }
+            by_cell[c.cell].push(i);
+        }
+        Self { raw, by_cell }
+    }
+
+    pub fn as_slice(&self) -> &'a [CellClaim] {
+        self.raw
+    }
+
+    /// The claim indices recorded on `cell`.
+    pub fn on(&self, cell: usize) -> &[usize] {
+        self.by_cell.get(cell).map(|v| v.as_slice()).unwrap_or(&[])
+    }
+}
+
+impl std::ops::Deref for Claims<'_> {
+    type Target = [CellClaim];
+    fn deref(&self) -> &[CellClaim] {
+        self.raw
+    }
+}
+
 /// The value a claim recorded for `cell`'s column `col` at `point`.
 pub fn claim_value_at_col(
     commitment: &CellSegmentCommitment,
-    claims: &[CellClaim],
+    claims: &crate::gkr::segment::Claims<'_>,
     cell: usize,
     col: usize,
     point: &[Ext],
@@ -531,16 +571,20 @@ pub fn claim_value_at_col(
     }
     if !profile::enabled() {
         return claims
+            .on(cell)
             .iter()
-            .find(|c| c.cell == cell && c.point == point && c.cols.as_slice() == [col])
+            .map(|&i| &claims.as_slice()[i])
+            .find(|c| c.point == point && c.cols.as_slice() == [col])
             .map(|c| c.values[0]);
     }
     let mut scanned = 0u64;
     let found = claims
+        .on(cell)
         .iter()
+        .map(|&i| &claims.as_slice()[i])
         .find(|c| {
             scanned += 1;
-            c.cell == cell && c.point == point && c.cols.as_slice() == [col]
+            c.point == point && c.cols.as_slice() == [col]
         })
         .map(|c| c.values[0]);
     profile::lookup(scanned);
@@ -747,7 +791,7 @@ pub fn claim_add(
 /// Verify a [`AddSegmentProof`].
 pub fn verify_add(
     commitment: &CellSegmentCommitment,
-    claims: &[CellClaim],
+    claims: &crate::gkr::segment::Claims<'_>,
     proof: &AddSegmentProof,
     tr: &mut Transcript,
 ) -> bool {
@@ -851,7 +895,7 @@ pub fn claim_sum_squares(seg: &mut CellSegment, x: usize, tr: &mut Transcript) -
 /// Verify a [`SumSquaresProof`].
 pub fn verify_sum_squares(
     commitment: &CellSegmentCommitment,
-    claims: &[CellClaim],
+    claims: &crate::gkr::segment::Claims<'_>,
     proof: &SumSquaresProof,
     tr: &mut Transcript,
 ) -> bool {
@@ -986,7 +1030,7 @@ pub fn claim_mul_weight(
 #[allow(clippy::too_many_arguments)]
 pub fn verify_mul_weight(
     commitment: &CellSegmentCommitment,
-    claims: &[CellClaim],
+    claims: &crate::gkr::segment::Claims<'_>,
     w_com: &whir_stacked::SegmentCommitment,
     w_proof: &whir_stacked::Proof,
     proof: &MulWeightProof,
@@ -1210,7 +1254,7 @@ pub fn claim_matmul_weight(
 #[allow(clippy::too_many_arguments)]
 pub fn verify_matmul_weight(
     commitment: &CellSegmentCommitment,
-    claims: &[CellClaim],
+    claims: &crate::gkr::segment::Claims<'_>,
     w_com: &whir_stacked::SegmentCommitment,
     w_proof: &whir_stacked::Proof,
     w_view: &View,
@@ -1432,7 +1476,7 @@ pub fn claim_matmul_weight_chunked(
 /// Verify a [`MatmulChunkedProof`]; `parts[i]` is chunk `i`'s `(commitment, proof)`.
 pub fn verify_matmul_weight_chunked(
     commitment: &CellSegmentCommitment,
-    claims: &[CellClaim],
+    claims: &crate::gkr::segment::Claims<'_>,
     parts: &[(&whir_stacked::SegmentCommitment, &whir_stacked::Proof)],
     proof: &MatmulChunkedProof,
     tr: &mut Transcript,
@@ -1532,6 +1576,62 @@ pub struct MulSegmentProof {
     pub a_val: Ext,
     pub b_val: Ext,
     pub rounds: Vec<RoundPoly3>,
+    /// The point the `b` operand was opened at, when it is a broadcast vector and
+    /// so is not evaluated at `istar`. `None` for the ordinary pointwise claim.
+    #[serde(default)]
+    pub b_point: Option<Vec<Ext>>,
+}
+
+/// How a short vector `b` is repeated to the length of `a` in a broadcast product.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum Broadcast {
+    /// `b[x mod 2^l]` — one `b` entry every `2^l` indices (γ repeated across the
+    /// rows of a normalisation).
+    Repeat { l: usize },
+    /// `b[(x >> block) * stride + offset]` — one `b` entry per `2^block` indices
+    /// (one column of the choice cell, spread across the hidden axis).
+    Block {
+        block: usize,
+        stride: usize,
+        offset: usize,
+    },
+}
+
+impl Broadcast {
+    /// The `b` index that multiplies position `x`.
+    pub fn index(&self, x: usize) -> usize {
+        match *self {
+            Self::Repeat { l } => x & ((1usize << l) - 1),
+            Self::Block {
+                block,
+                stride,
+                offset,
+            } => ((x >> block) * stride) + offset,
+        }
+    }
+
+    /// The point at which `b̃(istar)` is read, given the sumcheck's terminal point.
+    ///
+    /// Both shapes make `Σ_x eq(istar, x)·b[bcast x]` collapse to a *point* opening of
+    /// `b`: for `Repeat` the high coordinates sum to one (`Σ_t eq(z, t) = 1`), and for
+    /// `Block` the spread-out index is pinned to `offset` by a Boolean sub-point.
+    pub fn b_point(&self, istar: &[Ext]) -> Vec<Ext> {
+        match *self {
+            Self::Repeat { l } => istar[..l.min(istar.len())].to_vec(),
+            Self::Block {
+                block,
+                stride,
+                offset,
+            } => {
+                let mut p = istar[block.min(istar.len())..].to_vec();
+                p.extend(crate::field::arith::bool_point(
+                    offset,
+                    stride.trailing_zeros() as usize,
+                ));
+                p
+            }
+        }
+    }
 }
 
 /// Claim `c[i] = a[i]·b[i]` pointwise.
@@ -1624,16 +1724,20 @@ fn claim_mul_impl(
         a_val,
         b_val,
         rounds,
+        b_point: None,
     }
 }
 
 /// Verify a [`MulSegmentProof`].
 pub fn verify_mul(
     commitment: &CellSegmentCommitment,
-    claims: &[CellClaim],
+    claims: &crate::gkr::segment::Claims<'_>,
     proof: &MulSegmentProof,
     tr: &mut Transcript,
 ) -> bool {
+    if proof.b_point.is_some() {
+        return false;
+    }
     let (a, b, d) = (proof.a, proof.b, proof.d);
     let Some(ma) = commitment.cells.get(a) else {
         return false;
@@ -1693,10 +1797,143 @@ pub fn verify_mul(
         && claim_value_at_id(commitment, claims, b, &istar) == Some(proof.b_val)
 }
 
+/// Claim `c[x] = a[x] · b[broadcast x]`, where `b` is a short vector repeated to
+/// `a`'s length by `bcast`.
+///
+/// The sumcheck is the ordinary product one; the only difference is that `b` is
+/// expanded on the prover side and opened at the *reduced* point
+/// [`Broadcast::b_point`], which is all the verifier needs — that reduction is what
+/// lets one claim cover a whole cell instead of one claim per row.
+pub fn claim_mul_broadcast(
+    seg: &mut CellSegment,
+    (a, b, c): (usize, usize, usize),
+    bcast: Broadcast,
+    tr: &mut Transcript,
+) -> MulSegmentProof {
+    let d = seg.cells[a].m();
+    assert_eq!(seg.cells[c].m(), d, "mul operands must share an arity");
+    for id in [a, b, c] {
+        tr.observe_val(Fp::new(id as u64));
+    }
+
+    let to_ext = |v: Vec<Fp>| -> Vec<Ext> { v.into_iter().map(Ext::from).collect() };
+    let af = to_ext(seg.values(a, 0));
+    let cf = to_ext(seg.values(c, 0));
+    let braw: Vec<Ext> = to_ext(seg.values(b, 0));
+    let n = 1usize << d;
+    let bf: Vec<Ext> = (0..n).map(|x| braw[bcast.index(x)]).collect();
+
+    let r: Vec<Ext> = (0..d).map(|_| tr.sample_ext()).collect();
+    let c_val = mle_eval(&cf, &r);
+
+    let mut rounds = Vec::with_capacity(d);
+    let mut istar = Vec::with_capacity(d);
+    for j in 0..d {
+        let round = round_poly3_mul(&af, &bf, &r, d, j, &istar);
+        for coeff in &round.0 {
+            tr.observe_ext(*coeff);
+        }
+        let rj = tr.sample_ext();
+        rounds.push(round);
+        istar.push(rj);
+    }
+
+    let b_point = bcast.b_point(&istar);
+    let a_val = mle_eval(&af, &istar);
+    let b_val = mle_eval(&braw, &b_point);
+    seg.claim_id(a, &[0], &istar);
+    seg.claim_id(b, &[0], &b_point);
+    seg.claim_id(c, &[0], &r);
+
+    MulSegmentProof {
+        a,
+        b,
+        c: Some(c),
+        d,
+        r,
+        istar,
+        c_val,
+        a_val,
+        b_val,
+        rounds,
+        b_point: Some(b_point),
+    }
+}
+
+/// Verify a [`MulSegmentProof`] whose `b` operand is a broadcast vector.
+pub fn verify_mul_broadcast(
+    commitment: &CellSegmentCommitment,
+    claims: &crate::gkr::segment::Claims<'_>,
+    proof: &MulSegmentProof,
+    bcast: Broadcast,
+    tr: &mut Transcript,
+) -> bool {
+    let Some(b_point) = proof.b_point.as_deref() else {
+        return false;
+    };
+    if b_point != bcast.b_point(&proof.istar).as_slice() {
+        return false;
+    }
+    let (a, b, d) = (proof.a, proof.b, proof.d);
+    let Some(ma) = commitment.cells.get(a) else {
+        return false;
+    };
+    let Some(mb) = commitment.cells.get(b) else {
+        return false;
+    };
+    if ma.m() != d || mb.m() != b_point.len() || proof.rounds.len() != d || proof.r.len() != d
+    {
+        return false;
+    }
+    for id in [a, b] {
+        tr.observe_val(Fp::new(id as u64));
+    }
+    if let Some(c) = proof.c {
+        tr.observe_val(Fp::new(c as u64));
+    }
+
+    let r: Vec<Ext> = (0..d).map(|_| tr.sample_ext()).collect();
+    if r != proof.r {
+        return false;
+    }
+
+    let mut claim = proof.c_val;
+    let mut istar = Vec::with_capacity(d);
+    for round in &proof.rounds {
+        if round.eval(Ext::ZERO) + round.eval(Ext::ONE) != claim {
+            return false;
+        }
+        for coeff in &round.0 {
+            tr.observe_ext(*coeff);
+        }
+        let rj = tr.sample_ext();
+        istar.push(rj);
+        claim = round.eval(rj);
+    }
+    if istar != proof.istar {
+        return false;
+    }
+    let rhs = eq_partial(&proof.r, &istar) * proof.a_val * proof.b_val;
+    if claim != rhs {
+        return false;
+    }
+
+    let target_ok = match proof.c {
+        None => proof.c_val == Ext::ONE,
+        Some(c) => claim_value_at_id(commitment, claims, c, &proof.r) == Some(proof.c_val),
+    };
+    let a_ok = claim_value_at_id(commitment, claims, a, &istar) == Some(proof.a_val);
+    let b_ok = claim_value_at_id(commitment, claims, b, b_point) == Some(proof.b_val);
+    if !(target_ok && a_ok && b_ok) {
+        return false;
+    }
+    true
+}
+
 /// Verify a [`MulSegmentProof`] whose target is the public all-ones vector.
 pub fn verify_mul_ones(
     commitment: &CellSegmentCommitment,
-    claims: &[CellClaim],
+    claims: &crate::gkr::segment::Claims<'_>,
     proof: &MulSegmentProof,
     tr: &mut Transcript,
 ) -> bool {
@@ -1741,7 +1978,7 @@ pub fn claim_reshape(
 /// Verify a [`ReshapeSegmentProof`].
 pub fn verify_reshape(
     commitment: &CellSegmentCommitment,
-    claims: &[CellClaim],
+    claims: &crate::gkr::segment::Claims<'_>,
     proof: &ReshapeSegmentProof,
     tr: &mut Transcript,
 ) -> bool {
@@ -1815,11 +2052,16 @@ pub fn claim_weighted_sum(
     tr.observe_val(Fp::new(choice as u64));
     tr.observe_val(Fp::new(s as u64));
 
-    let (r, _coins) = crate::pcs::linear_claim::sample_coins(hidden, tr);
-    let row = |len: usize| LinearH::Block {
-        start: s * hidden,
-        values: r.clone(),
-        len,
+    let row_coins = crate::pcs::linear_claim::sample(hidden, tr).coins().to_vec();
+    // The row is the equality tensor placed at the row's offset inside the cell, so
+    // the verifier evaluates it from `log2(hidden)` coins instead of folding a
+    // `hidden`-long vector — one claim per (row, expert) adds up fast.
+    let row = |len: usize| LinearH::Blocks {
+        coins: row_coins.clone(),
+        len: hidden,
+        weights: vec![Fp::new(1)],
+        total: len,
+        offset: s * hidden,
     };
 
     let out_len = 1usize << seg.cells[out].m();
@@ -1860,7 +2102,7 @@ pub fn claim_weighted_sum(
 /// Verify one row of a weighted sum.
 pub fn verify_weighted_sum(
     commitment: &CellSegmentCommitment,
-    claims: &[CellClaim],
+    claims: &crate::gkr::segment::Claims<'_>,
     proof: &WeightedSumRowProof,
     tr: &mut Transcript,
 ) -> bool {
@@ -1882,11 +2124,15 @@ pub fn verify_weighted_sum(
     tr.observe_val(Fp::new(proof.choice as u64));
     tr.observe_val(Fp::new(proof.s as u64));
 
-    let (r, _coins) = crate::pcs::linear_claim::sample_coins(proof.hidden, tr);
-    let row = |cell: usize| LinearH::Block {
-        start: proof.s * proof.hidden,
-        values: r.clone(),
-        len: 1usize << commitment.cells[cell].m(),
+    let row_coins = crate::pcs::linear_claim::sample(proof.hidden, tr)
+        .coins()
+        .to_vec();
+    let row = |cell: usize| LinearH::Blocks {
+        coins: row_coins.clone(),
+        len: proof.hidden,
+        weights: vec![Fp::new(1)],
+        total: 1usize << commitment.cells[cell].m(),
+        offset: proof.s * proof.hidden,
     };
 
     let Some((z, cf)) = linear_verify(&proof.c_out, proof.b_out, tr) else {
@@ -2190,7 +2436,7 @@ pub fn claim_matmul(
 /// Verify a [`MatmulSegmentProof`] against the segment's recorded openings.
 pub fn verify_matmul(
     commitment: &CellSegmentCommitment,
-    claims: &[CellClaim],
+    claims: &crate::gkr::segment::Claims<'_>,
     cells: (usize, usize, usize),
     views: (&View, &View, &View),
     proof: &MatmulSegmentProof,
@@ -2254,7 +2500,7 @@ pub fn verify_matmul(
 /// Verify a cell segment against `claims` (in the prover's record order).
 pub fn verify(
     commitment: &CellSegmentCommitment,
-    claims: &[CellClaim],
+    claims: &crate::gkr::segment::Claims<'_>,
     proof: &whir_stacked::Proof,
     ch: &mut Challenger,
 ) -> bool {
@@ -2299,7 +2545,7 @@ pub fn claim_of<'a>(
 /// Values of every named cell claim, keyed by name; the **last** claim on a cell wins.
 pub fn values_by_name<'a>(
     commitment: &'a CellSegmentCommitment,
-    claims: &[CellClaim],
+    claims: &crate::gkr::segment::Claims<'_>,
 ) -> HashMap<&'a str, Vec<Ext>> {
     claims
         .iter()
@@ -2314,6 +2560,7 @@ pub fn values_by_name<'a>(
 
 #[cfg(test)]
 mod tests {
+    use crate::gkr::segment::Claims;
     use super::*;
     use crate::pcs::transcript::new_challenger;
     use rand::rngs::StdRng;
@@ -2368,19 +2615,19 @@ mod tests {
         let claims = seg.claims().to_vec();
         let proof = seg.prove(&mut new_challenger());
         let mut vch = new_challenger();
-        assert!(verify(&ca, &claims, &proof, &mut vch));
+        assert!(verify(&ca, &Claims::new(&claims), &proof, &mut vch));
 
         // Flipping one column value is rejected.
         let mut bad = claims.clone();
         bad[0].values[1] += Ext::ONE;
         let mut vch = new_challenger();
-        assert!(!verify(&ca, &bad, &proof, &mut vch));
+        assert!(!verify(&ca, &Claims::new(&bad), &proof, &mut vch));
 
         // A column-count mismatch fails closed (no panic).
         let mut bad = claims.clone();
         bad[1].values.push(Ext::ONE);
         let mut vch = new_challenger();
-        assert!(!verify(&ca, &bad, &proof, &mut vch));
+        assert!(!verify(&ca, &Claims::new(&bad), &proof, &mut vch));
     }
 
     #[test]
@@ -2400,10 +2647,10 @@ mod tests {
         let claims = seg.claims().to_vec();
         let proof = seg.prove(&mut new_challenger());
         let mut vch = new_challenger();
-        assert!(verify(&ca, &claims, &proof, &mut vch));
-        assert_eq!(claim_of(&ca, &claims, "a").unwrap().values.len(), 2);
+        assert!(verify(&ca, &Claims::new(&claims), &proof, &mut vch));
+        assert_eq!(claim_of(&ca, &Claims::new(&claims), "a").unwrap().values.len(), 2);
         assert_eq!(claims[1].values.len(), 4);
-        assert_eq!(values_by_name(&ca, &claims)["a"].len(), 4);
+        assert_eq!(values_by_name(&ca, &Claims::new(&claims))["a"].len(), 4);
     }
 
     #[test]
@@ -2438,7 +2685,7 @@ mod tests {
         let claims = seg.claims().to_vec();
         let proof = seg.prove(&mut new_challenger());
         let mut vch = new_challenger();
-        assert!(verify(&c0, &claims, &proof, &mut vch));
+        assert!(verify(&c0, &Claims::new(&claims), &proof, &mut vch));
     }
 
     #[test]
@@ -2474,16 +2721,16 @@ mod tests {
         let claims = seg.claims().to_vec();
         let proof = seg.prove(&mut new_challenger());
         let mut vch = new_challenger();
-        assert!(verify(&com, &claims, &proof, &mut vch));
+        assert!(verify(&com, &Claims::new(&claims), &proof, &mut vch));
 
         // Replay both sumchecks against the recorded point openings.
         let mut trv = Transcript::new(&new_challenger());
         let (zr, cr) = linear_verify(&proof_row, b_row, &mut trv).expect("row sumcheck");
-        let vr = claim_value_at(&com, &claims, "row", &zr).expect("row opening");
+        let vr = claim_value_at(&com, &Claims::new(&claims), "row", &zr).expect("row opening");
         assert!(linear_finish(&h_row, &zr, cr, vr));
 
         let (zf, cf) = linear_verify(&proof_full, b_full, &mut trv).expect("full sumcheck");
-        let vf = claim_value_at(&com, &claims, "full", &zf).expect("full opening");
+        let vf = claim_value_at(&com, &Claims::new(&claims), "full", &zf).expect("full opening");
         assert!(linear_finish(&e_full, &zf, cf, vf));
 
         // A wrong opened value breaks the terminal identity.
@@ -2539,7 +2786,7 @@ mod tests {
 
         let started = std::time::Instant::now();
         let mut vch = new_challenger();
-        assert!(verify(&commitment, &claims, &proof, &mut vch));
+        assert!(verify(&commitment, &Claims::new(&claims), &proof, &mut vch));
         println!("verify: {:?}", started.elapsed());
     }
 
@@ -2581,12 +2828,12 @@ mod tests {
 
         let claims = seg.claims().to_vec();
         let wproof = seg.prove(&mut new_challenger());
-        assert!(verify(&com, &claims, &wproof, &mut new_challenger()));
+        assert!(verify(&com, &Claims::new(&claims), &wproof, &mut new_challenger()));
 
         let mut vtr = Transcript::new(&new_challenger());
         assert!(verify_matmul(
             &com,
-            &claims,
+            &Claims::new(&claims),
             (a, b, c),
             (&whole.0, &whole.1, &whole.2),
             &proof,
@@ -2607,11 +2854,11 @@ mod tests {
         );
         let bad_claims = bad_seg.claims().to_vec();
         let bad_w = bad_seg.prove(&mut new_challenger());
-        assert!(verify(&bad_com, &bad_claims, &bad_w, &mut new_challenger()));
+        assert!(verify(&bad_com, &Claims::new(&bad_claims), &bad_w, &mut new_challenger()));
         let mut vtr = Transcript::new(&new_challenger());
         assert!(!verify_matmul(
             &bad_com,
-            &bad_claims,
+            &Claims::new(&bad_claims),
             (a, b, c),
             (&whole.0, &whole.1, &whole.2),
             &bad_proof,
@@ -2683,11 +2930,11 @@ mod tests {
         );
         let claims = seg.claims().to_vec();
         let wproof = seg.prove(&mut new_challenger());
-        assert!(verify(&com, &claims, &wproof, &mut new_challenger()));
+        assert!(verify(&com, &Claims::new(&claims), &wproof, &mut new_challenger()));
         let mut vtr = Transcript::new(&new_challenger());
         assert!(verify_matmul(
             &com,
-            &claims,
+            &Claims::new(&claims),
             (ck, cq, cd),
             (&vk, &vq, &vd),
             &proof,
@@ -2713,11 +2960,11 @@ mod tests {
         );
         let bad_claims = bad.claims().to_vec();
         let bad_w = bad.prove(&mut new_challenger());
-        assert!(verify(&bad_com, &bad_claims, &bad_w, &mut new_challenger()));
+        assert!(verify(&bad_com, &Claims::new(&bad_claims), &bad_w, &mut new_challenger()));
         let mut vtr = Transcript::new(&new_challenger());
         assert!(!verify_matmul(
             &bad_com,
-            &bad_claims,
+            &Claims::new(&bad_claims),
             (ck, cq, cd),
             (&vk, &vq, &vd),
             &bad_proof,
@@ -2737,6 +2984,69 @@ mod tests {
             }
         }
         c
+    }
+
+    #[test]
+    fn broadcast_mul_roundtrip_and_soundness() {
+        use crate::pcs::transcript::{new_challenger, Transcript};
+        use crate::pcs::whir_stacked::Params;
+
+        // `a` is 64 long; `b` is 4 long and repeated. The expected products are
+        // written out by hand so the test does not just re-run the index map.
+        let a: Vec<i64> = vec![3, -5, 7, 11, 13, -17, 19, 23, 29, -31, 37, 41, 43, -47, 53, 59, 3, -5, 7, 11, 13, -17, 19, 23, 29, -31, 37, 41, 43, -47, 53, 59, 3, -5, 7, 11, 13, -17, 19, 23, 29, -31, 37, 41, 43, -47, 53, 59, 3, -5, 7, 11, 13, -17, 19, 23, 29, -31, 37, 41, 43, -47, 53, 59];
+        let b: Vec<i64> = vec![2, 3, 5, 7];
+        let cases: Vec<(Broadcast, Vec<i64>)> = vec![
+            // b[x mod 4]
+            (Broadcast::Repeat { l: 2 }, vec![6, -15, 35, 77, 26, -51, 95, 161, 58, -93, 185, 287, 86, -141, 265, 413, 6, -15, 35, 77, 26, -51, 95, 161, 58, -93, 185, 287, 86, -141, 265, 413, 6, -15, 35, 77, 26, -51, 95, 161, 58, -93, 185, 287, 86, -141, 265, 413, 6, -15, 35, 77, 26, -51, 95, 161, 58, -93, 185, 287, 86, -141, 265, 413]),
+            // b[x >> 4]: b[j] on the j-th block of sixteen
+            (
+                Broadcast::Block {
+                    block: 4,
+                    stride: 1,
+                    offset: 0,
+                },
+                vec![6, -10, 14, 22, 26, -34, 38, 46, 58, -62, 74, 82, 86, -94, 106, 118, 9, -15, 21, 33, 39, -51, 57, 69, 87, -93, 111, 123, 129, -141, 159, 177, 15, -25, 35, 55, 65, -85, 95, 115, 145, -155, 185, 205, 215, -235, 265, 295, 21, -35, 49, 77, 91, -119, 133, 161, 203, -217, 259, 287, 301, -329, 371, 413],
+            ),
+        ];
+
+        for (bcast, c) in cases {
+            let cells = vec![
+                Cell::new("a", 64, 1, a.clone()),
+                Cell::new("b", 4, 1, b.clone()),
+                Cell::new("c", 64, 1, c.clone()),
+            ];
+            let mut seg = CellSegment::seal(&cells, Params::default());
+            let com = seg.commitment();
+            let (ca, cb, cc) = (seg.id("a"), seg.id("b"), seg.id("c"));
+            let mut tr = Transcript::new(&new_challenger());
+            let proof = claim_mul_broadcast(&mut seg, (ca, cb, cc), bcast, &mut tr);
+            let claims = seg.claims().to_vec();
+            let wproof = seg.prove(&mut new_challenger());
+            assert!(
+                verify(&com, &Claims::new(&claims), &wproof, &mut new_challenger()),
+                "{bcast:?}"
+            );
+            let mut vtr = Transcript::new(&new_challenger());
+            assert!(
+                verify_mul_broadcast(&com, &Claims::new(&claims), &proof, bcast, &mut vtr),
+                "{bcast:?}"
+            );
+
+            // One wrong product entry must be rejected.
+            let mut bad_cells = cells.clone();
+            bad_cells[2].values[5] += 1;
+            let mut bad = CellSegment::seal(&bad_cells, Params::default());
+            let com_bad = bad.commitment();
+            let mut btr = Transcript::new(&new_challenger());
+            let bad_proof = claim_mul_broadcast(&mut bad, (ca, cb, cc), bcast, &mut btr);
+            let claims_bad = bad.claims().to_vec();
+            let _ = bad.prove(&mut new_challenger());
+            let mut vtr = Transcript::new(&new_challenger());
+            assert!(
+                !verify_mul_broadcast(&com_bad, &Claims::new(&claims_bad), &bad_proof, bcast, &mut vtr),
+                "{bcast:?}"
+            );
+        }
     }
 
     #[test]
@@ -2766,10 +3076,10 @@ mod tests {
 
         let claims = seg.claims().to_vec();
         let wproof = seg.prove(&mut new_challenger());
-        assert!(verify(&com, &claims, &wproof, &mut new_challenger()));
+        assert!(verify(&com, &Claims::new(&claims), &wproof, &mut new_challenger()));
 
         let mut vtr = Transcript::new(&new_challenger());
-        assert!(verify_add(&com, &claims, &proof, &mut vtr));
+        assert!(verify_add(&com, &Claims::new(&claims), &proof, &mut vtr));
 
         // A wrong sum is rejected at the sumcheck's first round.
         let mut wrong = out.clone();
@@ -2784,9 +3094,9 @@ mod tests {
         );
         let bad_claims = bad.claims().to_vec();
         let bad_w = bad.prove(&mut new_challenger());
-        assert!(verify(&bad_com, &bad_claims, &bad_w, &mut new_challenger()));
+        assert!(verify(&bad_com, &Claims::new(&bad_claims), &bad_w, &mut new_challenger()));
         let mut vtr = Transcript::new(&new_challenger());
-        assert!(!verify_add(&bad_com, &bad_claims, &bad_proof, &mut vtr));
+        assert!(!verify_add(&bad_com, &Claims::new(&bad_claims), &bad_proof, &mut vtr));
     }
 
     #[test]
@@ -2820,10 +3130,10 @@ mod tests {
 
         let claims = seg.claims().to_vec();
         let wproof = seg.prove(&mut new_challenger());
-        assert!(verify(&com, &claims, &wproof, &mut new_challenger()));
+        assert!(verify(&com, &Claims::new(&claims), &wproof, &mut new_challenger()));
 
         let mut vtr = Transcript::new(&new_challenger());
-        assert!(verify_weighted_sum(&com, &claims, &proof, &mut vtr));
+        assert!(verify_weighted_sum(&com, &Claims::new(&claims), &proof, &mut vtr));
 
         // A wrong combine is rejected.
         let mut wrong = out.clone();
@@ -2842,11 +3152,11 @@ mod tests {
         );
         let bad_claims = bad.claims().to_vec();
         let bad_w = bad.prove(&mut new_challenger());
-        assert!(verify(&bad_com, &bad_claims, &bad_w, &mut new_challenger()));
+        assert!(verify(&bad_com, &Claims::new(&bad_claims), &bad_w, &mut new_challenger()));
         let mut vtr = Transcript::new(&new_challenger());
         assert!(!verify_weighted_sum(
             &bad_com,
-            &bad_claims,
+            &Claims::new(&bad_claims),
             &bad_proof,
             &mut vtr
         ));
@@ -2869,9 +3179,9 @@ mod tests {
 
         let claims = seg.claims().to_vec();
         let wproof = seg.prove(&mut new_challenger());
-        assert!(verify(&com, &claims, &wproof, &mut new_challenger()));
+        assert!(verify(&com, &Claims::new(&claims), &wproof, &mut new_challenger()));
         let mut vtr = Transcript::new(&new_challenger());
-        assert!(verify_reshape(&com, &claims, &proof, &mut vtr));
+        assert!(verify_reshape(&com, &Claims::new(&claims), &proof, &mut vtr));
 
         let mut wrong = vals.clone();
         wrong[5] += 1;
@@ -2881,9 +3191,9 @@ mod tests {
         let bad_claims = bad.claims().to_vec();
         let bad_w = bad.prove(&mut new_challenger());
         let mut vtr = Transcript::new(&new_challenger());
-        assert!(!verify_reshape(&bad_com, &bad_claims, &bad_proof, &mut vtr));
+        assert!(!verify_reshape(&bad_com, &Claims::new(&bad_claims), &bad_proof, &mut vtr));
         // The tampered segment still proves its own (wrong) data.
-        assert!(verify(&bad_com, &bad_claims, &bad_w, &mut new_challenger()));
+        assert!(verify(&bad_com, &Claims::new(&bad_claims), &bad_w, &mut new_challenger()));
     }
 
     #[test]
@@ -2912,9 +3222,9 @@ mod tests {
 
         let claims = seg.claims().to_vec();
         let wproof = seg.prove(&mut new_challenger());
-        assert!(verify(&com, &claims, &wproof, &mut new_challenger()));
+        assert!(verify(&com, &Claims::new(&claims), &wproof, &mut new_challenger()));
         let mut vtr = Transcript::new(&new_challenger());
-        assert!(verify_mul(&com, &claims, &proof, &mut vtr));
+        assert!(verify_mul(&com, &Claims::new(&claims), &proof, &mut vtr));
 
         // One wrong product entry breaks the claim.
         let mut wrong = c.clone();
@@ -2928,9 +3238,9 @@ mod tests {
         );
         let bad_claims = bad.claims().to_vec();
         let bad_w = bad.prove(&mut new_challenger());
-        assert!(verify(&bad_com, &bad_claims, &bad_w, &mut new_challenger()));
+        assert!(verify(&bad_com, &Claims::new(&bad_claims), &bad_w, &mut new_challenger()));
         let mut vtr = Transcript::new(&new_challenger());
-        assert!(!verify_mul(&bad_com, &bad_claims, &bad_proof, &mut vtr));
+        assert!(!verify_mul(&bad_com, &Claims::new(&bad_claims), &bad_proof, &mut vtr));
 
         // The zero-sum trap: two compensating errors keep `Σ(a·b − c) = 0`, so a
         // zero-sum formulation would accept them. Only `c̃(r) = Σ eq(r,i)a_i b_i`
@@ -2950,13 +3260,13 @@ mod tests {
         let trap_w = trap.prove(&mut new_challenger());
         assert!(verify(
             &trap_com,
-            &trap_claims,
+            &Claims::new(&trap_claims),
             &trap_w,
             &mut new_challenger()
         ));
         let mut vtr = Transcript::new(&new_challenger());
         assert!(
-            !verify_mul(&trap_com, &trap_claims, &trap_proof, &mut vtr),
+            !verify_mul(&trap_com, &Claims::new(&trap_claims), &trap_proof, &mut vtr),
             "an equal-sum tamper must be rejected"
         );
     }
@@ -2974,9 +3284,9 @@ mod tests {
 
         let claims = seg.claims().to_vec();
         let wproof = seg.prove(&mut new_challenger());
-        assert!(verify(&com, &claims, &wproof, &mut new_challenger()));
+        assert!(verify(&com, &Claims::new(&claims), &wproof, &mut new_challenger()));
         let mut vtr = Transcript::new(&new_challenger());
-        assert!(verify_sum_squares(&com, &claims, &proof, &mut vtr));
+        assert!(verify_sum_squares(&com, &Claims::new(&claims), &proof, &mut vtr));
 
         // A tampered vector yields a different sum, which the op's reciprocal
         // consistency check would catch; and a proof with a wrong claimed sum is
@@ -2993,7 +3303,7 @@ mod tests {
         // the sum it reports, which the norm op's reciprocal check consumes.
         assert!(verify_sum_squares(
             &bad_com,
-            &bad_claims,
+            &Claims::new(&bad_claims),
             &bad_proof,
             &mut vtr
         ));
@@ -3001,7 +3311,7 @@ mod tests {
         let mut off_by_one = proof.clone();
         off_by_one.sum += Ext::ONE;
         let mut vtr = Transcript::new(&new_challenger());
-        assert!(!verify_sum_squares(&com, &claims, &off_by_one, &mut vtr));
+        assert!(!verify_sum_squares(&com, &Claims::new(&claims), &off_by_one, &mut vtr));
     }
 
     #[test]
@@ -3047,18 +3357,18 @@ mod tests {
 
         let claims = seg.claims().to_vec();
         let wproof = seg.prove(&mut new_challenger());
-        assert!(verify(&com, &claims, &wproof, &mut new_challenger()));
+        assert!(verify(&com, &Claims::new(&claims), &wproof, &mut new_challenger()));
 
         // Verifier side.
         let mut vtr = Transcript::new(&new_challenger());
-        assert!(verify_sum_squares(&com, &claims, &ss, &mut vtr));
-        assert!(verify_mul(&com, &claims, &mul, &mut vtr));
+        assert!(verify_sum_squares(&com, &Claims::new(&claims), &ss, &mut vtr));
+        assert!(verify_mul(&com, &Claims::new(&claims), &mul, &mut vtr));
         vtr.observe_val(Fp::new(id_h as u64));
         vtr.observe_val(Fp::new(id_y as u64));
         let vr: Vec<Ext> = (0..d).map(|_| vtr.sample_ext()).collect();
         assert_eq!(vr, r);
-        let vh = claim_value_at_id(&com, &claims, id_h, &r).unwrap();
-        let vy = claim_value_at_id(&com, &claims, id_y, &r).unwrap();
+        let vh = claim_value_at_id(&com, &Claims::new(&claims), id_h, &r).unwrap();
+        let vy = claim_value_at_id(&com, &Claims::new(&claims), id_y, &r).unwrap();
         assert_eq!(vy, Ext::from(Fp::new(inv_q as u64)) * vh);
 
         // A segment whose `y` is not `inv_q · h` breaks the op's check.
@@ -3084,8 +3394,8 @@ mod tests {
         bad.claim_id(id_h, &[0], &br);
         bad.claim_id(id_y, &[0], &br);
         let bclaims = bad.claims().to_vec();
-        let bh = claim_value_at_id(&bad_com, &bclaims, id_h, &br).unwrap();
-        let by = claim_value_at_id(&bad_com, &bclaims, id_y, &br).unwrap();
+        let bh = claim_value_at_id(&bad_com, &Claims::new(&bclaims), id_h, &br).unwrap();
+        let by = claim_value_at_id(&bad_com, &Claims::new(&bclaims), id_y, &br).unwrap();
         assert_ne!(by, Ext::from(Fp::new(inv_q as u64)) * bh);
     }
 
@@ -3111,19 +3421,19 @@ mod tests {
         assert_ne!(c0.pcs.root, c1.pcs.root);
 
         let mut vch = new_challenger();
-        assert!(verify(&c0, &claims0, &p0, &mut vch));
+        assert!(verify(&c0, &Claims::new(&claims0), &p0, &mut vch));
         let mut vch = new_challenger();
-        assert!(verify(&c1, &claims1, &p1, &mut vch));
+        assert!(verify(&c1, &Claims::new(&claims1), &p1, &mut vch));
 
         // Each proof is bound to its own root.
         let mut vch = new_challenger();
-        assert!(!verify(&c1, &claims0, &p0, &mut vch));
+        assert!(!verify(&c1, &Claims::new(&claims0), &p0, &mut vch));
         let mut vch = new_challenger();
-        assert!(!verify(&c0, &claims1, &p1, &mut vch));
+        assert!(!verify(&c0, &Claims::new(&claims1), &p1, &mut vch));
 
         // An empty claim list fails closed instead of verifying vacuously.
         let mut vch = new_challenger();
-        assert!(!verify(&c0, &[], &p0, &mut vch));
+        assert!(!verify(&c0, &Claims::new(&[]), &p0, &mut vch));
     }
 
     #[test]
@@ -3162,10 +3472,10 @@ mod tests {
         let wproof = seg.prove(&mut new_challenger());
         let wt_proof = w_prov.prove(&mut new_challenger());
 
-        assert!(verify(&com, &claims, &wproof, &mut new_challenger()));
+        assert!(verify(&com, &Claims::new(&claims), &wproof, &mut new_challenger()));
         let mut vtr = Transcript::new(&new_challenger());
         assert!(verify_mul_weight(
-            &com, &claims, &w_com, &wt_proof, &proof, &mut vtr
+            &com, &Claims::new(&claims), &w_com, &wt_proof, &proof, &mut vtr
         ));
 
         // A product that is not `a ⊙ w` is rejected by the sumcheck.
@@ -3197,7 +3507,7 @@ mod tests {
         let mut vtr = Transcript::new(&new_challenger());
         assert!(!verify_mul_weight(
             &bad_com,
-            &bad_claims,
+            &Claims::new(&bad_claims),
             &w_com,
             &wt_proof,
             &bad_proof,
@@ -3254,11 +3564,11 @@ mod tests {
         let wproof = seg.prove(&mut new_challenger());
         let wt_proof = w_prov.prove(&mut new_challenger());
 
-        assert!(verify(&com, &claims, &wproof, &mut new_challenger()));
+        assert!(verify(&com, &Claims::new(&claims), &wproof, &mut new_challenger()));
         let mut vtr = Transcript::new(&new_challenger());
         assert!(verify_matmul_weight(
             &com,
-            &claims,
+            &Claims::new(&claims),
             &w_com,
             &wt_proof,
             &View::Whole,
@@ -3298,7 +3608,7 @@ mod tests {
         let mut vtr = Transcript::new(&new_challenger());
         assert!(!verify_matmul_weight(
             &bad_com,
-            &bad_claims,
+            &Claims::new(&bad_claims),
             &w_com,
             &wt_proof,
             &View::Whole,
@@ -3358,11 +3668,11 @@ mod tests {
         let wproof = seg.prove(&mut new_challenger());
         let wt_proof = w_prov.prove(&mut new_challenger());
 
-        assert!(verify(&com, &claims, &wproof, &mut new_challenger()));
+        assert!(verify(&com, &Claims::new(&claims), &wproof, &mut new_challenger()));
         let mut vtr = Transcript::new(&new_challenger());
         assert!(verify_matmul_weight(
             &com,
-            &claims,
+            &Claims::new(&claims),
             &w_com,
             &wt_proof,
             &view,
@@ -3375,7 +3685,7 @@ mod tests {
         let mut vtr = Transcript::new(&new_challenger());
         assert!(!verify_matmul_weight(
             &com,
-            &claims,
+            &Claims::new(&claims),
             &w_com,
             &wt_proof,
             &View::Whole,
@@ -3441,10 +3751,10 @@ mod tests {
             .map(|(c, p)| (c, p))
             .collect();
 
-        assert!(verify(&com, &claims, &wproof, &mut new_challenger()));
+        assert!(verify(&com, &Claims::new(&claims), &wproof, &mut new_challenger()));
         let mut vtr = Transcript::new(&new_challenger());
         assert!(verify_matmul_weight_chunked(
-            &com, &claims, &parts, &proof, &mut vtr
+            &com, &Claims::new(&claims), &parts, &proof, &mut vtr
         ));
 
         // A proof that composed the chunks with a plain sum instead of eq weights
@@ -3453,14 +3763,14 @@ mod tests {
         bad.a_val += Ext::ONE;
         let mut vtr = Transcript::new(&new_challenger());
         assert!(!verify_matmul_weight_chunked(
-            &com, &claims, &parts, &bad, &mut vtr
+            &com, &Claims::new(&claims), &parts, &bad, &mut vtr
         ));
 
         // Dropping a chunk root is rejected.
         let mut vtr = Transcript::new(&new_challenger());
         assert!(!verify_matmul_weight_chunked(
             &com,
-            &claims,
+            &Claims::new(&claims),
             &parts[..1],
             &proof,
             &mut vtr

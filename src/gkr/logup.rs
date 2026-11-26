@@ -31,7 +31,7 @@
 
 use crate::field::{eq, Ext, Fp};
 use crate::gkr::segment::{
-    claim_value_at_id, linear_finish, linear_verify, CellClaim, CellSegment, CellSegmentCommitment,
+    claim_value_at_id, linear_finish, linear_verify, CellSegment, CellSegmentCommitment,
     MulSegmentProof,
 };
 use crate::pcs::linear_claim::{LinearClaimProof, LinearH};
@@ -66,7 +66,7 @@ pub fn claim_eq_public(
 /// Verify [`EqPublicProof`] against the verifier's own copy of the public vector.
 pub fn verify_eq_public(
     commitment: &CellSegmentCommitment,
-    claims: &[CellClaim],
+    claims: &crate::gkr::segment::Claims<'_>,
     proof: &EqPublicProof,
     public: &[Fp],
     tr: &mut Transcript,
@@ -174,7 +174,7 @@ pub fn claim_lookup2(
 /// Verify a [`Lookup2SegmentProof`].
 pub fn verify_lookup2(
     commitment: &CellSegmentCommitment,
-    claims: &[CellClaim],
+    claims: &crate::gkr::segment::Claims<'_>,
     proof: &Lookup2SegmentProof,
     public_ft: &[Fp],
     (n, big_n): (usize, usize),
@@ -307,7 +307,7 @@ pub fn claim_logup(
 /// Verify a [`LogUpSegmentProof`].
 pub fn verify_logup(
     commitment: &CellSegmentCommitment,
-    claims: &[CellClaim],
+    claims: &crate::gkr::segment::Claims<'_>,
     proof: &LogUpSegmentProof,
     public_ft: &[Fp],
     (n, big_n): (usize, usize),
@@ -446,9 +446,9 @@ pub fn claim_link(
 #[allow(clippy::too_many_arguments)]
 pub fn verify_link(
     commit_in: &CellSegmentCommitment,
-    claims_in: &[CellClaim],
+    claims_in: &crate::gkr::segment::Claims<'_>,
     commit_derived: &CellSegmentCommitment,
-    claims_derived: &[CellClaim],
+    claims_derived: &crate::gkr::segment::Claims<'_>,
     proof: &LookupLink,
     x: usize,
     fq: usize,
@@ -488,6 +488,7 @@ pub fn verify_link(
 
 #[cfg(test)]
 mod tests {
+    use crate::gkr::segment::Claims;
     use super::*;
     use crate::gkr::segment::{verify, SegmentCells};
     use crate::pcs::transcript::new_challenger;
@@ -586,11 +587,11 @@ mod tests {
 
         let claims = seg.claims().to_vec();
         let wproof = seg.prove(&mut new_challenger());
-        if !verify(&com, &claims, &wproof, &mut new_challenger()) {
+        if !verify(&com, &Claims::new(&claims), &wproof, &mut new_challenger()) {
             return false;
         }
         let mut vtr = Transcript::new(&new_challenger());
-        verify_logup(&com, &claims, &proof, &pub_ft, (n, big_n), &mut vtr)
+        verify_logup(&com, &Claims::new(&claims), &proof, &pub_ft, (n, big_n), &mut vtr)
     }
 
     #[test]
@@ -655,9 +656,9 @@ mod tests {
         );
         let claims = seg.claims().to_vec();
         let wproof = seg.prove(&mut new_challenger());
-        assert!(verify(&com, &claims, &wproof, &mut new_challenger()));
+        assert!(verify(&com, &Claims::new(&claims), &wproof, &mut new_challenger()));
         let mut vtr = Transcript::new(&new_challenger());
-        assert!(!verify_logup(&com, &claims, &proof, &ft, (3, 4), &mut vtr));
+        assert!(!verify_logup(&com, &Claims::new(&claims), &proof, &ft, (3, 4), &mut vtr));
     }
 
     #[test]
@@ -742,11 +743,11 @@ mod tests {
             let proof = claim_lookup2(&mut seg, lc, (alpha, beta), &public_ft, (n, big_n), &mut tr);
             let claims = seg.claims().to_vec();
             let wproof = seg.prove(&mut new_challenger());
-            if !verify(&com, &claims, &wproof, &mut new_challenger()) {
+            if !verify(&com, &Claims::new(&claims), &wproof, &mut new_challenger()) {
                 return false;
             }
             let mut vtr = Transcript::new(&new_challenger());
-            verify_lookup2(&com, &claims, &proof, &public_ft, (n, big_n), &mut vtr)
+            verify_lookup2(&com, &Claims::new(&claims), &proof, &public_ft, (n, big_n), &mut vtr)
         };
 
         assert!(run(build(&out, None)), "honest graph lookup verifies");
@@ -791,10 +792,10 @@ mod tests {
         let mut vtr = Transcript::new(&vch);
         let vf = sample_fingerprint(&mut vtr);
         assert_eq!(vf, f, "verifier derives the same challenge");
-        assert!(verify(&com_a, &claims_a, &proof_a, &mut new_challenger()));
-        assert!(verify(&com_b, &claims_b, &proof_b, &mut new_challenger()));
+        assert!(verify(&com_a, &Claims::new(&claims_a), &proof_a, &mut new_challenger()));
+        assert!(verify(&com_b, &Claims::new(&claims_b), &proof_b, &mut new_challenger()));
         assert!(verify_link(
-            &com_a, &claims_a, &com_b, &claims_b, &link, xa, fqb, vf.alpha, &mut vtr
+            &com_a, &Claims::new(&claims_a), &com_b, &Claims::new(&claims_b), &link, xa, fqb, vf.alpha, &mut vtr
         ));
 
         let mut bad = link.clone();
@@ -804,7 +805,7 @@ mod tests {
         let mut vtr = Transcript::new(&vch);
         let _ = sample_fingerprint(&mut vtr);
         assert!(!verify_link(
-            &com_a, &claims_a, &com_b, &claims_b, &bad, xa, fqb, f.alpha, &mut vtr
+            &com_a, &Claims::new(&claims_a), &com_b, &Claims::new(&claims_b), &bad, xa, fqb, f.alpha, &mut vtr
         ));
     }
 }

@@ -21,12 +21,12 @@
 use crate::field::{Ext, Fp};
 use crate::gkr::range::{claim_decomp, verify_decomp, Decomp, DecompCells, DecompSegmentProof};
 use crate::gkr::segment::{
-    claim_mul, claim_value_at_id, linear_finish, linear_verify, verify_mul, CellClaim, CellSegment,
+    claim_mul, claim_value_at_id, linear_finish, linear_verify, verify_mul, CellSegment,
     CellSegmentCommitment, MulSegmentProof,
 };
 use crate::pcs::linear_claim::{LinearClaimProof, LinearH};
-use crate::pcs::transcript::Transcript;
 use p3_field::PrimeCharacteristicRing;
+use crate::pcs::transcript::Transcript;
 
 /// The cells a requant occupies inside the segment.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -93,8 +93,7 @@ pub fn claim_requant(
     let mul_sx = claim_mul(seg, (c.s, c.x, c.sx), tr);
     let mul_sout = claim_mul(seg, (c.s, c.out, c.sout), tr);
 
-    let m = seg.cells_meta(c.x).m();
-    let d = 1usize << m;
+    let d = 1usize << seg.cells_meta(c.x).m();
     let (mut r, coins) = crate::pcs::linear_claim::sample_coins(n, tr);
     r.resize(d, Fp::ZERO);
     let h = LinearH::Dense(r.clone());
@@ -140,7 +139,7 @@ pub fn claim_requant(
 /// Verify a [`RequantSegmentProof`].
 pub fn verify_requant(
     commitment: &CellSegmentCommitment,
-    claims: &[CellClaim],
+    claims: &crate::gkr::segment::Claims<'_>,
     proof: &RequantSegmentProof,
     (n, k, digits): (usize, usize, usize),
     tr: &mut Transcript,
@@ -226,7 +225,9 @@ fn sum_rlc(r: &[Fp]) -> Ext {
 
 #[cfg(test)]
 mod tests {
+    use crate::gkr::segment::Claims;
     use super::*;
+    use p3_field::PrimeCharacteristicRing;
     use crate::gkr::segment::{verify, SegmentCells};
     use crate::model::spec::requant as requant_i64;
     use crate::pcs::transcript::new_challenger;
@@ -352,11 +353,11 @@ mod tests {
         let proof = claim_requant(&mut seg, cells, (n, k, digits), &mut tr);
         let claims = seg.claims().to_vec();
         let wproof = seg.prove(&mut new_challenger());
-        if !verify(&com, &claims, &wproof, &mut new_challenger()) {
+        if !verify(&com, &Claims::new(&claims), &wproof, &mut new_challenger()) {
             return false;
         }
         let mut vtr = Transcript::new(&new_challenger());
-        verify_requant(&com, &claims, &proof, (n, k, digits), &mut vtr)
+        verify_requant(&com, &Claims::new(&claims), &proof, (n, k, digits), &mut vtr)
     }
 
     #[test]
